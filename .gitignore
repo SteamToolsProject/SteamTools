@@ -1,0 +1,85 @@
+# ----- 构建产物 -----
+/target/
+**/target/
+/build/
+**/build/
+/out/
+/dist/
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.o
+*.a
+
+# ----- Rust -----
+Cargo.lock
+!**/*/Cargo.lock
+.cargo/config.toml.local
+
+# ----- IDE / OS -----
+.vs/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ----- 参考树（只读对照，不入库）-----
+.example/
+
+# ----- 文档 / 计划 / ADR（本机开发用，不入库）-----
+/docs/
+
+# ----- Agent / 副驾驶 / 本机 AI（全部不入库）-----
+/AGENTS.md
+/.ai/
+/.github/
+.claude/
+.claudecode/
+.cursor/
+.continue/
+.windsurf/
+.aider*
+.codex/
+.gemini/
+.agent/
+.agents/
+.specstory/
+.history/
+.chat/
+.copilot/
+**/__pycache__/
+*.agent.md.bak
+*.prompt.md.bak
+.repomix*
+repomix-output.*
+
+# ----- 日志与本机运行时 -----
+*.log
+/opensteamtool/
+/.deps/
+.env
+.env.*
+!.env.example
+
+# ----- 密钥 / 本机路径 -----
+*.pem
+*.key
+local.toml
+opensteamtool.toml
+**/tickets.txt
+**/*appticket*
+**/*eticket*
+
+# ----- 生成物 -----
+**/generated/
+*.pb.cc
+*.pb.h
