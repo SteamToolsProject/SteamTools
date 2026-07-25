@@ -18,12 +18,13 @@
 
 ## 当前状态
 
-- [x] workspace：`ost-core` / `ost-platform` / `ost-host` / loaders
+- [x] workspace：`stt-core` / `stt-platform` / `stt-config` / `stt-host` / loaders
 - [x] M1 代码：双 loader + `SteamTools.dll` + `steamtools/host.log`（待本机 Steam 冒烟）
+- [x] M2 代码：`steamtools.toml`、工具开关、mlua 核心 API、Catalog Mock、epoch 订阅
 
 ```powershell
 cargo test
-cargo build -p ost-host -p ost-loader-dwmapi -p ost-loader-xinput --release
+cargo build -p stt-host -p stt-loader-dwmapi -p stt-loader-xinput --release
 ```
 
 产物：`SteamTools.dll`、`dwmapi.dll`、`xinput1_4.dll` → 复制到 Steam 根（见本机 `docs/plan/smoke-m1.md`）。
@@ -31,9 +32,9 @@ cargo build -p ost-host -p ost-loader-dwmapi -p ost-loader-xinput --release
 ## 架构（目标）
 
 ```text
-loader (dwmapi/xinput) → ost-host
-  → ost-config (TOML + mlua) / ost-metadata / ost-platform
-  → ost-core ← ost-hook ← ost-steamui + ost-steamclient
+loader (dwmapi/xinput) → stt-host
+  → stt-config (TOML + mlua) / stt-metadata / stt-platform
+  → stt-core ← stt-hook ← stt-steamui + stt-steamclient
 ```
 
 - **steamui**：库体验与配置 UX  
