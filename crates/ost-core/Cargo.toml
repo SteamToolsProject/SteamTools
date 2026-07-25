@@ -1,0 +1,9 @@
+[package]
+name = "ost-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pure config/state model for SteamTools (no Windows FFI)"
+
+[dependencies]
