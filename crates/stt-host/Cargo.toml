@@ -1,5 +1,5 @@
 [package]
-name = "ost-host"
+name = "stt-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,5 +15,6 @@ name = "SteamTools"
 non_snake_case = "allow"
 
 [dependencies]
-ost-core = { workspace = true }
-ost-platform = { workspace = true }
+stt-core = { workspace = true }
+stt-platform = { workspace = true }
+stt-config = { workspace = true }
