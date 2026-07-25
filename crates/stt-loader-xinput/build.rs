@@ -1,4 +1,4 @@
-// Export map lives here (like ost-loader-dwmapi). Written to a temp .def
+// Export map lives here (like stt-loader-dwmapi). Written to a temp .def
 // because MSVC needs fixed ordinals / NONAME; plain /EXPORT loses them
 // against rustc's auto-generated def.
 
