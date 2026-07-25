@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ost-core",
+    "crates/ost-platform",
+    "crates/ost-host",
+    "crates/ost-loader-dwmapi",
+    "crates/ost-loader-xinput",
+]
+default-members = [
+    "crates/ost-core",
+    "crates/ost-platform",
+    "crates/ost-host",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "local"
+publish = false
+
+[workspace.dependencies]
+ost-core = { path = "crates/ost-core" }
+ost-platform = { path = "crates/ost-platform" }
