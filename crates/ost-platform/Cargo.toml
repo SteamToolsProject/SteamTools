@@ -1,0 +1,16 @@
+[package]
+name = "ost-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Windows platform helpers for SteamTools"
+
+[dependencies]
+# Win32_Security is required for CreateThread in windows 0.58.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
