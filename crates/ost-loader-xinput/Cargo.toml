@@ -1,0 +1,11 @@
+[package]
+name = "ost-loader-xinput"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "xinput1_4.dll proxy that loads SteamTools.dll"
+
+[lib]
+crate-type = ["cdylib"]
+name = "xinput1_4"
