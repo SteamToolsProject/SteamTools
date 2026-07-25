@@ -1,0 +1,21 @@
+[package]
+name = "stt-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Host TOML, tool registry, Lua DSL, catalog trait"
+
+[features]
+default = ["lua"]
+lua = ["dep:mlua"]
+
+[dependencies]
+stt-core = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+mlua = { version = "0.10", features = ["lua54", "vendored"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
