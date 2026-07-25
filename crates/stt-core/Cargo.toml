@@ -1,5 +1,5 @@
 [package]
-name = "ost-core"
+name = "stt-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

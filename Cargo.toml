@@ -1,16 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ost-core",
-    "crates/ost-platform",
-    "crates/ost-host",
-    "crates/ost-loader-dwmapi",
-    "crates/ost-loader-xinput",
+    "crates/stt-core",
 ]
 default-members = [
-    "crates/ost-core",
-    "crates/ost-platform",
-    "crates/ost-host",
+    "crates/stt-core",
 ]
 
 [workspace.package]
@@ -21,5 +15,4 @@ repository = "local"
 publish = false
 
 [workspace.dependencies]
-ost-core = { path = "crates/ost-core" }
-ost-platform = { path = "crates/ost-platform" }
+stt-core = { path = "crates/stt-core" }
