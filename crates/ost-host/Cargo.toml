@@ -1,0 +1,19 @@
+[package]
+name = "ost-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "SteamTools host cdylib (SteamTools.dll)"
+
+[lib]
+# Product DLL filename on disk.
+crate-type = ["cdylib", "rlib"]
+name = "SteamTools"
+
+[lints.rust]
+non_snake_case = "allow"
+
+[dependencies]
+ost-core = { workspace = true }
+ost-platform = { workspace = true }
