@@ -4,11 +4,15 @@ members = [
     "crates/stt-core",
     "crates/stt-platform",
     "crates/stt-config",
+    "crates/stt-host",
+    "crates/stt-loader-dwmapi",
+    "crates/stt-loader-xinput",
 ]
 default-members = [
     "crates/stt-core",
     "crates/stt-platform",
     "crates/stt-config",
+    "crates/stt-host",
 ]
 
 [workspace.package]
