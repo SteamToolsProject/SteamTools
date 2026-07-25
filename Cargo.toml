@@ -2,9 +2,11 @@
 resolver = "2"
 members = [
     "crates/stt-core",
+    "crates/stt-platform",
 ]
 default-members = [
     "crates/stt-core",
+    "crates/stt-platform",
 ]
 
 [workspace.package]
@@ -16,3 +18,4 @@ publish = false
 
 [workspace.dependencies]
 stt-core = { path = "crates/stt-core" }
+stt-platform = { path = "crates/stt-platform" }
