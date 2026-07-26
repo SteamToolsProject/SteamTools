@@ -1,4 +1,4 @@
-// Link system dwmapi and re-export the public Dwm* entry points.
+// 链接系统 dwmapi, 并转发公开的 Dwm* 入口.
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
@@ -7,7 +7,7 @@ fn main() {
 
     println!("cargo:rustc-link-lib=dylib=dwmapi");
 
-    // Symbols that exist in the public import lib.
+    // 公共导入库里存在的符号.
     let named: &[(&str, u16)] = &[
         ("DwmAttachMilContent", 116),
         ("DwmDefWindowProc", 117),

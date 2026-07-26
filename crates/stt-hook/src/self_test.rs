@@ -1,4 +1,4 @@
-//! Harmless in-process hook: patch a local function, count calls, uninstall.
+//! 无害进程内 hook: 改本地函数, 计数, 再卸掉.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -17,11 +17,11 @@ pub extern "C" fn stt_hook_probe_target(x: u32) -> u32 {
 
 unsafe extern "C" fn stt_hook_probe_detour(x: u32) -> u32 {
     CALLS.fetch_add(1, Ordering::SeqCst);
-    // No trampoline to original; self-test only proves patch + restore.
+    // 无跳回原函数的 trampoline; 自测只证明能补丁与恢复.
     x.wrapping_add(100)
 }
 
-/// Install → call → uninstall a local probe. Returns call count seen by detour.
+/// 安装 -> 调用 -> 卸载本地 probe; 返回 detour 见到的调用次数.
 pub fn run_harmless_self_test() -> Result<u32> {
     let _guard = SELF_TEST_LOCK
         .lock()

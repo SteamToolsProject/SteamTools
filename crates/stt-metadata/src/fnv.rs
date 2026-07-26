@@ -1,4 +1,4 @@
-//! FNV-1a 32-bit (matches upstream OpenSteamTool).
+//! FNV-1a 32 位 (与上游 OpenSteamTool 一致).
 
 pub fn fnv1a32(data: &[u8]) -> u32 {
     let mut h = 0x811c9dc5_u32;

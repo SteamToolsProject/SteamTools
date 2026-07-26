@@ -1,4 +1,4 @@
-//! Shared app/depot state used by the rest of the host.
+//! 宿主共享的 app/depot 状态.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +11,7 @@ pub struct ManifestOverride {
     pub size: u64,
 }
 
-/// Structured result from a catalog provider (or Lua/TOML apply).
+/// 目录源 (或 Lua/TOML 应用) 得到的结构化结果.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogBundle {
     pub apps: Vec<AppId>,
@@ -28,7 +28,7 @@ pub struct AppRules {
     access_tokens: HashMap<AppId, u64>,
     manifest_overrides: HashMap<DepotId, ManifestOverride>,
     purchase_time: HashMap<AppId, u32>,
-    /// Bumps when anything meaningful changes.
+    /// 有实质变更时递增.
     epoch: u64,
 }
 
@@ -121,7 +121,7 @@ impl AppRules {
         self.purchase_time.get(&app_id).copied()
     }
 
-    /// Merge a catalog result into this state (idempotent where possible).
+    /// 合并目录结果; 相同数据尽量不重复 bump.
     pub fn apply_catalog_bundle(&mut self, bundle: &CatalogBundle) {
         let mut changed = false;
 

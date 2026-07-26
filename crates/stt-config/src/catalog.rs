@@ -1,4 +1,4 @@
-//! Catalog provider trait + mock (no network).
+//! 目录源 trait 与 Mock (不联网).
 
 use stt_core::{AppId, CatalogBundle, ManifestOverride};
 
@@ -9,12 +9,12 @@ pub trait CatalogProvider: Send + Sync {
     fn fetch(&self, app_id: AppId) -> Result<CatalogBundle>;
 }
 
-/// In-memory provider for tests and offline UI wiring.
+/// 内存 Mock, 给测试和离线 UI 接线用.
 #[derive(Debug, Clone, Default)]
 pub struct MockCatalogProvider {
-    /// Pre-seeded bundles keyed by app id.
+    /// 按 app id 预置的 bundle.
     pub fixtures: std::collections::HashMap<AppId, CatalogBundle>,
-    /// If set, every fetch returns this error.
+    /// 若设置, 每次 fetch 都返回该错误.
     pub fail_with: Option<String>,
 }
 
@@ -28,8 +28,14 @@ impl MockCatalogProvider {
         self
     }
 
-    /// Convenience: mark app owned with a fake depot key + manifest.
-    pub fn with_simple_app(mut self, app_id: AppId, depot_id: u64, key_hex: &str, gid: u64) -> Self {
+    /// 便捷: 标记拥有, 并塞假 depot key + manifest.
+    pub fn with_simple_app(
+        mut self,
+        app_id: AppId,
+        depot_id: u64,
+        key_hex: &str,
+        gid: u64,
+    ) -> Self {
         let mut bundle = CatalogBundle::default();
         bundle.apps.push(app_id);
         bundle.depot_keys.insert(app_id, key_hex.to_string());

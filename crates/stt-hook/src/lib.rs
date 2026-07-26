@@ -1,4 +1,4 @@
-//! Detour helpers and a process-local self-test hook.
+//! Detour 辅助与进程内自测 hook.
 
 #![cfg(windows)]
 

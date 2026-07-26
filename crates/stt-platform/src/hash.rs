@@ -1,4 +1,4 @@
-//! File SHA-256 (lowercase hex), for pattern cache keys.
+//! 文件 SHA-256 (小写 hex), 用作 pattern 缓存键.
 
 use std::io::Read;
 use std::path::Path;
@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn sha256_empty_known_vector() {
-        // SHA-256("")
+        // SHA-256("") 标准向量
         assert_eq!(
             sha256_bytes(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

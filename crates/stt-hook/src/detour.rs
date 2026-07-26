@@ -1,4 +1,4 @@
-//! Minimal x64 inline JMP detour (no C++ Detours dependency).
+//! 最小 x64 内联 JMP detour (不依赖 C++ Detours).
 
 use std::ptr;
 
@@ -12,7 +12,7 @@ use crate::error::{HookError, Result};
 
 const PATCH_LEN: usize = 12; // mov rax, imm64; jmp rax
 
-/// Absolute 64-bit jump trampoline written over the target prologue.
+/// 写在目标 prologue 上的 64 位绝对跳转.
 #[derive(Debug)]
 pub struct InlineHook {
     target: *mut u8,
@@ -21,13 +21,13 @@ pub struct InlineHook {
     installed: bool,
 }
 
-// Addresses are process-local; hooks are only used on the installing thread set.
+// 地址仅本进程有效; hook 由安装侧线程集使用.
 unsafe impl Send for InlineHook {}
 
 impl InlineHook {
     /// # Safety
-    /// `target` must be a valid executable function entry of at least 12 bytes
-    /// that is safe to patch; `detour` must match the calling convention.
+    /// `target` 须为可执行函数入口且至少 12 字节可安全改写;
+    /// `detour` 须匹配调用约定.
     pub unsafe fn new(
         target: *mut core::ffi::c_void,
         detour: *const core::ffi::c_void,
@@ -58,7 +58,7 @@ impl InlineHook {
     }
 
     /// # Safety
-    /// Same as `new`; must not race other writers to the same page.
+    /// 同 `new`; 不得与其它写者竞态同一页.
     pub unsafe fn attach(&mut self) -> Result<()> {
         if self.installed {
             return Err(HookError::AlreadyInstalled);
@@ -81,7 +81,7 @@ impl InlineHook {
     }
 
     /// # Safety
-    /// Restores the saved prologue; no concurrent execution of the patched region.
+    /// 恢复已保存的 prologue; 补丁区不得并发执行.
     pub unsafe fn detach(&mut self) -> Result<()> {
         if !self.installed {
             return Err(HookError::NotInstalled);
@@ -97,7 +97,7 @@ impl InlineHook {
 impl Drop for InlineHook {
     fn drop(&mut self) {
         if self.installed {
-            // Best-effort restore; ignore errors during unwind/shutdown.
+            // 尽力恢复; 析构/退出时忽略错误.
             let _ = unsafe { self.detach() };
         }
     }
@@ -110,12 +110,12 @@ unsafe fn with_rwx(addr: *mut u8, len: usize, f: impl FnOnce()) -> Result<()> {
     f();
     let mut tmp = PAGE_PROTECTION_FLAGS(0);
     let _ = VirtualProtect(addr as *const _, len, old, &mut tmp);
-    // CPU may have cached the old prologue; force fetch of the new bytes.
+    // CPU 可能缓存了旧 prologue; 强制取新指令.
     let _ = FlushInstructionCache(GetCurrentProcess(), Some(addr as *const _), len);
     Ok(())
 }
 
-/// Transaction-style batch (attach all or none on first failure after detach).
+/// 事务式批量 (失败则回滚已 attach 的).
 #[derive(Default)]
 pub struct HookTransaction {
     hooks: Vec<InlineHook>,
@@ -131,7 +131,7 @@ impl HookTransaction {
     }
 
     /// # Safety
-    /// Each hook's safety requirements apply.
+    /// 各 hook 的 Safety 要求均适用.
     pub unsafe fn commit_attach(&mut self) -> Result<()> {
         for i in 0..self.hooks.len() {
             if let Err(e) = self.hooks[i].attach() {
@@ -145,7 +145,7 @@ impl HookTransaction {
     }
 
     /// # Safety
-    /// Each hook's safety requirements apply.
+    /// 各 hook 的 Safety 要求均适用.
     pub unsafe fn commit_detach(&mut self) -> Result<()> {
         let mut first_err = None;
         for h in self.hooks.iter_mut().rev() {

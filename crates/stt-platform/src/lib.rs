@@ -1,4 +1,4 @@
-//! Small Windows helpers: paths, data dir, threads, hash, modules.
+//! Windows 小工具: 路径, 数据目录, 线程, 哈希, 模块.
 
 #![cfg(windows)]
 
@@ -12,7 +12,9 @@ use windows::Win32::System::LibraryLoader::{DisableThreadLibraryCalls, GetModule
 use windows::Win32::System::Threading::CreateThread;
 
 pub use hash::{sha256_bytes, sha256_file};
-pub use module::{module_handle, module_info, module_path, module_path_by_name, read_module_bytes, ModuleInfo};
+pub use module::{
+    module_handle, module_info, module_path, module_path_by_name, read_module_bytes, ModuleInfo,
+};
 
 pub const DATA_DIR_NAME: &str = "steamtools";
 pub const LEGACY_DATA_DIR_NAME: &str = "opensteamtool";
@@ -71,7 +73,7 @@ pub fn host_log_path(steam_root: &Path) -> PathBuf {
 }
 
 /// # Safety
-/// `hinst` is the module handle from DllMain.
+/// `hinst` 为 DllMain 传入的模块句柄.
 pub unsafe fn disable_thread_library_calls_raw(hinst: *mut core::ffi::c_void) {
     let _ = DisableThreadLibraryCalls(HMODULE(hinst));
 }
@@ -79,7 +81,7 @@ pub unsafe fn disable_thread_library_calls_raw(hinst: *mut core::ffi::c_void) {
 pub type ThreadStart = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
 
 /// # Safety
-/// Same rules as Win32 CreateThread.
+/// 与 Win32 CreateThread 相同约束.
 pub unsafe fn spawn_thread_raw(
     start: ThreadStart,
     parameter: *mut core::ffi::c_void,

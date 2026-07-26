@@ -1,4 +1,4 @@
-//! Debounced file-change detection (poll-based, no extra deps).
+//! 防抖文件变更检测 (轮询, 无额外依赖).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 struct FileStamp {
     mtime: Option<SystemTime>,
     len: Option<u64>,
-    /// Cheap fingerprint so same-length edits still count on coarse FS clocks.
+    /// 廉价内容指纹: 文件系统时间粒度粗时, 同长度修改也能发现.
     content_hash: u64,
 }
 
@@ -49,7 +49,7 @@ struct Tracked {
     pending_since: Option<Instant>,
 }
 
-/// Polls paths; after `debounce` of continuous "dirty", reports changed paths.
+/// 轮询路径; 持续 dirty 满 `debounce` 后报告变更.
 #[derive(Debug)]
 pub struct DebouncedWatcher {
     debounce: Duration,
@@ -81,7 +81,7 @@ impl DebouncedWatcher {
         self.tracked.iter().map(|t| t.path.clone()).collect()
     }
 
-    /// Replace the tracked set (e.g. after rediscovering `.lua` files).
+    /// 替换监视集合 (例如重新发现 `.lua` 之后).
     pub fn set_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         self.tracked = paths
             .into_iter()
@@ -93,7 +93,7 @@ impl DebouncedWatcher {
             .collect();
     }
 
-    /// Call periodically. Returns paths whose change has been stable for `debounce`.
+    /// 周期性调用; 返回已稳定满 `debounce` 的变更路径.
     pub fn poll(&mut self) -> Vec<PathBuf> {
         let now = Instant::now();
         let mut fired = Vec::new();
@@ -119,7 +119,7 @@ impl DebouncedWatcher {
         fired
     }
 
-    /// Force re-read stamps without firing (e.g. after external reload).
+    /// 强制重读戳记且不触发 (例如外部已 reload).
     pub fn resync(&mut self) {
         for t in &mut self.tracked {
             t.stamp = FileStamp::of(&t.path);
@@ -144,7 +144,7 @@ mod tests {
         assert!(w.poll().is_empty());
 
         fs::write(&path, "a = 2\n").unwrap();
-        // Immediate poll: dirty but not yet debounced.
+        // 立刻 poll: 已 dirty 但防抖未满.
         assert!(w.poll().is_empty());
 
         thread::sleep(Duration::from_millis(80));

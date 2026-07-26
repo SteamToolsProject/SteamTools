@@ -1,4 +1,4 @@
-//! Proxy `dwmapi.dll`: forward exports, load host under steam.exe.
+//! 代理 `dwmapi.dll`: 转发导出, 在 steam.exe 下加载宿主.
 
 #![cfg(windows)]
 
@@ -11,7 +11,7 @@ extern "system" {
     fn DisableThreadLibraryCalls(h: *mut core::ffi::c_void) -> i32;
 }
 
-/// False only when we are steam.exe and SteamTools.dll failed to load.
+/// 仅当进程是 steam.exe 且 SteamTools.dll 加载失败时返回 false.
 unsafe fn load_steam_tools_if_steam() -> bool {
     let mut buf = [0u8; 260];
     let len = GetModuleFileNameA(core::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32);
@@ -29,7 +29,7 @@ unsafe fn load_steam_tools_if_steam() -> bool {
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
-// Called by the OS loader, not by Rust callers.
+// 由系统加载器调用, 不是 Rust 侧直接调.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "system" fn DllMain(

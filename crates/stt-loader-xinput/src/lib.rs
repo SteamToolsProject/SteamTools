@@ -1,7 +1,7 @@
-//! Proxy `xinput1_4.dll` and load the host under steam.exe.
+//! 代理 `xinput1_4.dll`, 在 steam.exe 下加载宿主.
 
 #![cfg(windows)]
-// OS-facing exports; safety is the caller's (the game / Steam).
+// 面向 OS 的导出; 安全性由调用方 (游戏 / Steam) 负责.
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::CStr;
@@ -42,7 +42,7 @@ struct RealXInput {
     o108: *mut core::ffi::c_void,
 }
 
-// Loaded once, never mutated after init.
+// 只加载一次, 初始化后不再改.
 unsafe impl Send for RealXInput {}
 unsafe impl Sync for RealXInput {}
 
@@ -280,7 +280,7 @@ pub unsafe extern "system" fn XInputOrdinal108(
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
-// Called by the OS loader, not by Rust callers.
+// 由系统加载器调用, 不是 Rust 侧直接调.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "system" fn DllMain(

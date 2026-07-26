@@ -1,4 +1,4 @@
-//! Scan lua directories and apply scripts into AppRules.
+//! 扫描 lua 目录并把脚本应用到 AppRules.
 
 use std::path::{Path, PathBuf};
 
@@ -16,19 +16,19 @@ pub struct LuaLoadReport {
     pub errors: Vec<String>,
 }
 
-/// Default `<Steam>/config/lua`.
+/// 默认 `<Steam>/config/lua`.
 pub fn default_lua_dir(steam_root: &Path) -> PathBuf {
     steam_root.join("config").join("lua")
 }
 
-/// Extra `[lua].paths` first, then the default dir last (user files win on merge).
+/// 先额外 `[lua].paths`, 默认目录放最后 (合并时用户文件优先).
 pub fn lua_search_dirs(steam_root: &Path, host: &HostConfig) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = host.lua.paths.iter().map(PathBuf::from).collect();
     dirs.push(default_lua_dir(steam_root));
     dirs
 }
 
-/// Sorted `.lua` files directly under `dir` (non-recursive, matches common layout).
+/// `dir` 下一层的 `.lua` (不递归, 对齐常见布局), 排序后返回.
 pub fn list_lua_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let rd = match std::fs::read_dir(dir) {
@@ -60,7 +60,7 @@ pub fn list_lua_files_in_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
     all
 }
 
-/// Apply every `.lua` file under the search dirs into a **fresh** `AppRules`.
+/// 在搜索目录下应用全部 `.lua`, 得到一份**全新**的 `AppRules`.
 pub fn load_lua_directories(steam_root: &Path, host: &HostConfig) -> (AppRules, LuaLoadReport) {
     let dirs = lua_search_dirs(steam_root, host);
     let mut rules = AppRules::new();
@@ -123,7 +123,7 @@ mod tests {
         let def = root.path().join("config").join("lua");
         fs::create_dir_all(&extra).unwrap();
         fs::create_dir_all(&def).unwrap();
-        // default last wins for same depot manifest
+        // 同一 depot 的 manifest: 后加载的默认目录覆盖先加载的
         fs::write(extra.join("x.lua"), "setmanifestid(10, \"1\")\n").unwrap();
         fs::write(def.join("y.lua"), "setmanifestid(10, \"2\")\n").unwrap();
 
