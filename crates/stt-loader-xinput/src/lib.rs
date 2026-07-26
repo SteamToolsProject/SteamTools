@@ -113,6 +113,22 @@ fn real() -> &'static RealXInput {
     REAL.get_or_init(load_real_xinput)
 }
 
+/// 在 CEF 起来前放空文件, 商店注入无需用户手开调试.
+///
+/// 与 `stt_platform::ensure_cef_remote_debugging_flag` 重复是有意的: loader 要赶在
+/// host 加载前落文件, 且按 ADR 0009 保持零依赖, 不为一行 IO 拉进 windows crate.
+fn ensure_cef_remote_debugging_flag(steam_exe: &str) {
+    use std::path::Path;
+    let Some(dir) = Path::new(steam_exe).parent() else {
+        return;
+    };
+    let flag = dir.join(".cef-enable-remote-debugging");
+    if flag.is_file() {
+        return;
+    }
+    let _ = std::fs::File::create(flag);
+}
+
 unsafe fn load_steam_tools_if_steam() -> bool {
     let mut buf = [0u8; 260];
     let len = GetModuleFileNameA(core::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32);
@@ -123,6 +139,7 @@ unsafe fn load_steam_tools_if_steam() -> bool {
             if !name.eq_ignore_ascii_case("steam.exe") {
                 return true;
             }
+            ensure_cef_remote_debugging_flag(s);
         }
     }
     !LoadLibraryA(c"SteamTools.dll".as_ptr().cast()).is_null()
