@@ -2,10 +2,15 @@
 //!
 //! DllMain 只起工作线程, 真正初始化在线程里做.
 
+// crate 名与导出函数名都由产物 DLL 决定 (SteamTools.dll / DllMain), 不能蛇形.
+// 这里只能用 allow: crate 名的 non_snake_case 不被 expect 追踪, 写 expect 反而
+// 会报 unfulfilled_lint_expectations.
+#![allow(non_snake_case)]
+
 use std::path::Path;
 use std::time::Duration;
 
-use stt_config::{ConfigState, HostConfig, ToolId};
+use stt_config::{add_to_library, ConfigState, HostConfig, MockCatalogProvider, ToolId};
 use stt_core::AppRules;
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -119,14 +124,122 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     }
 
     log_module_hashes(steam_root);
-    log_pattern_probe(steam_root);
+    let patterns = log_pattern_probe(steam_root);
+    log_library_ux_plan(steam_root, &state, &patterns);
     match stt_hook::run_harmless_self_test() {
         Ok(n) => append_host_log(steam_root, &format!("hook_self_test=ok calls={n}")),
         Err(e) => append_host_log(steam_root, &format!("hook_self_test=err {e}")),
     }
 
+    if let Ok(inbox) = stt_platform::ensure_inbox_dir(steam_root) {
+        append_host_log(
+            steam_root,
+            &format!(
+                "catalog_add=inbox ready path={} (drop *.txt with one app_id per line)",
+                inbox.display()
+            ),
+        );
+    }
+
+    match stt_platform::write_store_inject_js(steam_root, stt_steamui::STORE_INJECT_JS) {
+        Ok(path) => append_host_log(
+            steam_root,
+            &format!("catalog_add=store_inject ready path={}", path.display()),
+        ),
+        Err(e) => append_host_log(steam_root, &format!("catalog_add=store_inject err {e}")),
+    }
+
+    // 点击回传: 本机 HTTP 桥 (商店页 fetch, 不依赖 CEF 8080).
+    {
+        let root = steam_root.to_path_buf();
+        let state_cb = state.clone();
+        stt_steamui::ensure_click_bridge(move |app_id| {
+            let provider = MockCatalogProvider::new().with_auto_generate(true);
+            match add_to_library(&state_cb, &root, &provider, app_id) {
+                Ok(out) => append_host_log(
+                    &root,
+                    &format!(
+                        "catalog_add=ok source=store_btn app_id={app_id} provider={} lua={} epoch={} owned={}",
+                        out.provider_id,
+                        out.lua_path.display(),
+                        out.epoch,
+                        out.owned_count
+                    ),
+                ),
+                Err(e) => append_host_log(
+                    &root,
+                    &format!("catalog_add=err source=store_btn app_id={app_id} {e}"),
+                ),
+            }
+        });
+        append_host_log(
+            steam_root,
+            &format!(
+                "catalog_add=click_bridge port={}",
+                stt_steamui::click_bridge_port()
+            ),
+        );
+    }
+
+    // 商店页在 steamwebhelper CEF, 不在 steam.exe CHTMLWindow — 主路径 CDP 8080.
+    // native hook 默认关 (STEAMTOOLS_STORE_NATIVE=inject 才开).
+    let native = stt_steamui::try_install_store_native(&state.tools(), &patterns);
+    append_host_log(steam_root, &native.summary_line());
+
+    match stt_platform::ensure_cef_remote_debugging_flag(steam_root) {
+        Ok(true) => append_host_log(
+            steam_root,
+            "catalog_add=store_cdp flag=created (restart Steam once if 8080 was never open)",
+        ),
+        Ok(false) => append_host_log(steam_root, "catalog_add=store_cdp flag=present"),
+        Err(e) => append_host_log(steam_root, &format!("catalog_add=store_cdp flag_err {e}")),
+    }
+    spawn_store_cdp_bridge(steam_root, &state);
+    append_host_log(
+        steam_root,
+        "catalog_add=store_inject path=cdp8080+click_bridge (store lives in steamwebhelper)",
+    );
+
     run_watch_loop(steam_root, &state);
     Ok(())
+}
+
+/// 后台: CEF CDP 向商店页注入按钮; 点击走 click_bridge, pending 队列作兜底.
+fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState) {
+    let root = steam_root.to_path_buf();
+    let state = state.clone();
+    let _ = std::thread::Builder::new()
+        .name("stt-store-cdp".into())
+        .spawn(move || {
+            let provider = MockCatalogProvider::new().with_auto_generate(true);
+            stt_steamui::run_store_cdp_loop_with_js(
+                Duration::from_millis(600),
+                || {
+                    // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
+                    let port = stt_steamui::click_bridge_port();
+                    stt_steamui::cdp_store_inject_js(port)
+                },
+                |app_id| {
+                    match add_to_library(&state, &root, &provider, app_id) {
+                        Ok(out) => append_host_log(
+                            &root,
+                            &format!(
+                                "catalog_add=ok source=store_cdp app_id={app_id} provider={} lua={} epoch={} owned={}",
+                                out.provider_id,
+                                out.lua_path.display(),
+                                out.epoch,
+                                out.owned_count
+                            ),
+                        ),
+                        Err(e) => append_host_log(
+                            &root,
+                            &format!("catalog_add=err source=store_cdp app_id={app_id} {e}"),
+                        ),
+                    }
+                },
+                |line| append_host_log(&root, &line),
+            );
+        });
 }
 
 fn log_module_hashes(steam_root: &Path) {
@@ -143,7 +256,7 @@ fn log_module_hashes(steam_root: &Path) {
     }
 }
 
-fn log_pattern_probe(steam_root: &Path) {
+fn log_pattern_probe(steam_root: &Path) -> stt_metadata::PatternStore {
     let mut store = stt_metadata::PatternStore::new();
     for component in ["steamui", "steamclient"] {
         let dll = if component == "steamui" {
@@ -162,6 +275,15 @@ fn log_pattern_probe(steam_root: &Path) {
                 continue;
             }
         };
+        // steamui: 已知 sha 自动落盘内置 pattern, 用户不用手拷.
+        if component == "steamui" {
+            if let Some(p) = stt_steamui::ensure_builtin_steamui_pattern(steam_root, &sha) {
+                append_host_log(
+                    steam_root,
+                    &format!("pattern_steamui=auto path={} sha={sha}", p.display()),
+                );
+            }
+        }
         let primary = stt_platform::pattern_cache_file(steam_root, component, &sha);
         let legacy = stt_platform::legacy_pattern_cache_file(steam_root, component, &sha);
         match store.load_with_fallback(component, &primary, Some(&legacy)) {
@@ -180,6 +302,104 @@ fn log_pattern_probe(steam_root: &Path) {
             ),
         }
     }
+    store
+}
+
+fn log_library_ux_plan(
+    steam_root: &Path,
+    state: &ConfigState,
+    patterns: &stt_metadata::PatternStore,
+) {
+    let tools = state.tools();
+    let report = stt_steamui::plan_library_ux_install(&tools, patterns, "steamui");
+    append_host_log(steam_root, &report.summary_line());
+    // 配置里已有的 app 取消移除标记 (纯逻辑, 无 detour).
+    let ux = stt_steamui::LibraryUx::new();
+    state.with_rules(|rules| {
+        for app_id in rules.owned_iter() {
+            ux.on_rules_app_present(app_id);
+        }
+    });
+}
+
+/// 处理 steamtools/inbox/*.txt: 每行一个 app_id, 走 Mock AddToLibrary.
+fn process_inbox(
+    steam_root: &Path,
+    state: &ConfigState,
+    provider: &MockCatalogProvider,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    let dir = stt_platform::inbox_dir(steam_root);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_txt = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("txt"));
+        if !is_txt || !seen.insert(path.clone()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            append_host_log(
+                steam_root,
+                &format!("catalog_add=inbox read_err path={}", path.display()),
+            );
+            continue;
+        };
+        let mut any = false;
+        for (lineno, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Ok(app_id) = line.parse::<u32>() else {
+                append_host_log(
+                    steam_root,
+                    &format!(
+                        "catalog_add=inbox bad_line path={} line={} text={line}",
+                        path.display(),
+                        lineno + 1
+                    ),
+                );
+                continue;
+            };
+            any = true;
+            match add_to_library(state, steam_root, provider, app_id) {
+                Ok(out) => append_host_log(
+                    steam_root,
+                    &format!(
+                        "catalog_add=ok app_id={app_id} provider={} lua={} epoch={} owned={}",
+                        out.provider_id,
+                        out.lua_path.display(),
+                        out.epoch,
+                        out.owned_count
+                    ),
+                ),
+                Err(e) => {
+                    append_host_log(steam_root, &format!("catalog_add=err app_id={app_id} {e}"))
+                }
+            }
+        }
+        if !any {
+            append_host_log(
+                steam_root,
+                &format!("catalog_add=inbox empty path={}", path.display()),
+            );
+        }
+        // 处理完挪到 done, 避免反复触发.
+        let done_dir = dir.join("done");
+        let _ = std::fs::create_dir_all(&done_dir);
+        if let Some(name) = path.file_name() {
+            let dest = done_dir.join(name);
+            let _ = std::fs::rename(&path, &dest);
+        }
+    }
 }
 
 fn run_watch_loop(steam_root: &Path, state: &ConfigState) {
@@ -188,12 +408,31 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState) {
         let host = state.host();
         stt_config::lua_files_watcher(steam_root, &host, WATCH_DEBOUNCE)
     };
+    let provider = MockCatalogProvider::new().with_auto_generate(true);
+    let mut inbox_seen: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
 
     // 定期重扫目录, 好把新建的 .lua 纳入监视.
     let mut rescan_ticks: u32 = 0;
+    let mut last_stats = (0u64, 0u64, 0u64, 0usize);
 
     loop {
         std::thread::sleep(WATCH_POLL);
+        process_inbox(steam_root, state, &provider, &mut inbox_seen);
+
+        // 商店注入诊断: 有变化才写 log.
+        let stats = stt_steamui::store_native_stats();
+        if stats != last_stats && (stats.0 > 0 || stats.1 > 0 || stats.2 > 0 || stats.3 > 0) {
+            let ext = stt_steamui::store_native_stats_ext();
+            append_host_log(
+                steam_root,
+                &format!(
+                    "store_native_stats ctor={} exec={} posturl={} inject={} skip={} windows={}",
+                    ext.0, ext.1, ext.2, ext.3, ext.4, ext.5
+                ),
+            );
+            last_stats = stats;
+        }
 
         let mut host_changed = false;
         if let Some(w) = toml_watch.as_mut() {
