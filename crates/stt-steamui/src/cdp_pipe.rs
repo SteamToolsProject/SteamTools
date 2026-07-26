@@ -17,7 +17,11 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use stt_platform::DevToolsPipe;
 
-use crate::cdp_bridge::{is_store_app_url, parse_pending_app_ids, StoreCdpPoll, DRAIN_JS};
+use crate::cdp_bridge::{
+    hosts_nav_entry, is_mount_news, is_store_app_url, log_panel_step, parse_pending_app_ids,
+    wants_panel_tick, StoreCdpPoll, DRAIN_JS,
+};
+use crate::config_panel::{panel_step, EvalTarget, PanelBridge, PanelState, ViewRole};
 
 /// 单次 CDP 调用的等待上限.
 ///
@@ -163,6 +167,9 @@ impl CdpPipeSession {
     ///
     /// `awaitPromise` 必须 false — 与 ws 版同因: 注入脚本不是 Promise,
     /// true 会在 CEF 上一直挂起.
+    ///
+    /// `userGesture` 同样与 ws 版一致: 没有它 `window.open` 会被当成非用户触发的
+    /// 弹窗拦掉, 配置页就开不成真窗口.
     pub fn eval_value(&mut self, session: &str, expression: &str) -> Result<Value, String> {
         let result = self.call(
             "Runtime.evaluate",
@@ -170,6 +177,7 @@ impl CdpPipeSession {
                 "expression": expression,
                 "returnByValue": true,
                 "awaitPromise": false,
+                "userGesture": true,
             })),
             Some(session),
         )?;
@@ -222,9 +230,14 @@ pub fn poll_store_pipe(session: &mut CdpPipeSession, inject_js: &str) -> StoreCd
         match inject_one(session, &t.target_id, inject_js) {
             // 商店首页 / 促销页不是 app 页, 是常态而非错误 — 记 note 会刷屏.
             Ok(Injected::NotAnAppPage) => {}
-            Ok(Injected::Done { mounted, pending }) => {
+            Ok(Injected::Done {
+                mounted,
+                removed,
+                pending,
+            }) => {
                 out.store_pages += 1;
-                if mounted {
+                // 摘按钮不算注入, 否则关掉工具反而在日志里像挂上了.
+                if mounted && !removed {
                     out.injected += 1;
                 }
                 out.pending_app_ids.extend(pending);
@@ -249,6 +262,7 @@ enum Injected {
     NotAnAppPage,
     Done {
         mounted: bool,
+        removed: bool,
         pending: Vec<u32>,
     },
 }
@@ -280,13 +294,68 @@ fn inject_in_session(
     let res = session
         .eval_value(sid, inject_js)
         .map_err(|e| format!("eval inject: {e}"))?;
-    // 短脚本返回 near-cart/moved/fixed/already/no-appid; 大脚本无返回值 (Null).
-    let mounted = res.as_str().is_none_or(|s| !s.starts_with("already"));
+    let mounted = is_mount_news(&res);
+    let removed = res.as_str() == Some("removed");
     let pending = match session.eval_value(sid, DRAIN_JS) {
         Ok(p) => parse_pending_app_ids(&p),
         Err(_) => Vec::new(),
     };
-    Ok(Injected::Done { mounted, pending })
+    Ok(Injected::Done {
+        mounted,
+        removed,
+        pending,
+    })
+}
+
+/// 管道会话上的一个页面; 有了它面板逻辑就能跟端口版共用一份.
+struct PipeEval<'a> {
+    session: &'a mut CdpPipeSession,
+    sid: &'a str,
+}
+
+impl EvalTarget for PipeEval<'_> {
+    fn eval(&mut self, js: &str) -> Result<Value, String> {
+        self.session.eval_value(self.sid, js)
+    }
+}
+
+/// 配置页一轮 (管道通道).
+pub(crate) fn poll_panel_pipe(
+    session: &mut CdpPipeSession,
+    bridge: &mut dyn PanelBridge,
+    state: &mut PanelState,
+    enabled: bool,
+    on_log: &mut dyn FnMut(String),
+) {
+    // 列不出来说明这轮通道不通; 商店那条路已经在报了.
+    let Ok(targets) = session.targets() else {
+        return;
+    };
+    state.begin_round();
+    for t in targets {
+        if t.kind != "page" && t.kind != "iframe" {
+            continue;
+        }
+        if !wants_panel_tick(&t.url, &t.title) {
+            continue;
+        }
+        let Ok(sid) = session.attach(&t.target_id) else {
+            continue;
+        };
+        let role = ViewRole {
+            enabled,
+            hosts_entry: hosts_nav_entry(&t.url, &t.title),
+        };
+        let stepped = {
+            let mut page = PipeEval { session, sid: &sid };
+            panel_step(&t.target_id, &mut page, bridge, state, role)
+        };
+        session.detach(&sid);
+        match stepped {
+            Ok(out) => log_panel_step(&out, &t.title, on_log),
+            Err(e) => on_log(format!("config_ui=page_err {e}")),
+        }
+    }
 }
 
 /// 等 detour 把管道交出来 (webhelper 得先被拉起来).
@@ -316,7 +385,9 @@ pub fn run_store_pipe_loop(
     on_app: &mut dyn FnMut(u32),
     on_log: &mut dyn FnMut(String),
     ready_timeout: Duration,
+    mut panel: Option<&mut dyn PanelBridge>,
 ) -> bool {
+    let mut panel_state = PanelState::default();
     let Some(pipe) = wait_for_pipe(ready_timeout) else {
         on_log("catalog_add=store_cdp pipe_absent (hook never handed one over)".into());
         return false;
@@ -345,10 +416,9 @@ pub fn run_store_pipe_loop(
     let mut last_pages: usize = 0;
     let mut announced = false;
     let mut dead_rounds = 0u32;
-    // "一个商店页都没摸到" 每轮都会复现, 不节流会把 host.log 刷爆 (与 ws 版同策略).
-    let mut last_zero_log = std::time::Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(std::time::Instant::now);
+    // "一个商店页都没摸到" 每轮都会复现: 只在刚进入这个状态时记一次.
+    // 按时间节流不行 — 没开商店页是常态, 定时重记就是每小时几百行长日志.
+    let mut zero_logged = false;
     loop {
         let js = make_js();
         let r = poll_store_pipe(&mut session, &js);
@@ -362,11 +432,14 @@ pub fn run_store_pipe_loop(
                 announced = true;
                 last_pages = r.store_pages;
             }
+            if r.store_pages > 0 {
+                zero_logged = false;
+            }
             for note in &r.notes {
                 if note.starts_with("cdp_store_pages=0") {
-                    if last_zero_log.elapsed() >= Duration::from_secs(10) {
+                    if !zero_logged {
                         on_log(format!("catalog_add={note}"));
-                        last_zero_log = std::time::Instant::now();
+                        zero_logged = true;
                     }
                 } else {
                     on_log(format!("catalog_add={note}"));
@@ -374,6 +447,18 @@ pub fn run_store_pipe_loop(
             }
             for app_id in r.pending_app_ids {
                 on_app(app_id);
+            }
+            // 配置页搭同一趟车; 它出问题也不能连累入库那条路.
+            if let Some(p) = panel.as_mut() {
+                let on = p.enabled();
+                if panel_state.should_run(on) {
+                    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        poll_panel_pipe(&mut session, &mut **p, &mut panel_state, on, on_log);
+                    }));
+                    if ok.is_err() {
+                        on_log("config_ui=poll_panic (bridge kept alive)".into());
+                    }
+                }
             }
         } else {
             dead_rounds += 1;
