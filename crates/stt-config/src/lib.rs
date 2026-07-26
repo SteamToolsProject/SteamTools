@@ -1,6 +1,7 @@
 //! 宿主配置: TOML, 工具注册表, 目录 trait, 可选 Lua DSL.
 
 mod catalog;
+mod catalog_add;
 mod error;
 mod host_toml;
 mod tools;
@@ -12,6 +13,9 @@ mod lua_dsl;
 mod lua_load;
 
 pub use catalog::{CatalogProvider, MockCatalogProvider};
+pub use catalog_add::{
+    add_to_library, catalog_lua_path, format_catalog_lua, write_catalog_lua, AddToLibraryOutcome,
+};
 pub use error::{ConfigError, Result};
 pub use host_toml::{
     HostConfig, LogSection, LuaSection, ManifestSection, ToolsSection, HOST_TOML_NAME,

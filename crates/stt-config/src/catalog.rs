@@ -16,11 +16,18 @@ pub struct MockCatalogProvider {
     pub fixtures: std::collections::HashMap<AppId, CatalogBundle>,
     /// 若设置, 每次 fetch 都返回该错误.
     pub fail_with: Option<String>,
+    /// 无 fixture 时自动生成假 key/manifest (仅开发/狗粮).
+    pub auto_generate: bool,
 }
 
 impl MockCatalogProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_auto_generate(mut self, on: bool) -> Self {
+        self.auto_generate = on;
+        self
     }
 
     pub fn with_fixture(mut self, app_id: AppId, bundle: CatalogBundle) -> Self {
@@ -49,6 +56,22 @@ impl MockCatalogProvider {
         self.fixtures.insert(app_id, bundle);
         self
     }
+
+    fn synthetic(app_id: AppId) -> CatalogBundle {
+        let mut bundle = CatalogBundle::default();
+        bundle.apps.push(app_id);
+        // 64 hex, 确定性假 key (非真实 depot key).
+        let key = format!("{app_id:08x}").repeat(8);
+        bundle.depot_keys.insert(app_id, key);
+        bundle.manifests.insert(
+            u64::from(app_id),
+            ManifestOverride {
+                manifest_gid: u64::from(app_id).saturating_mul(1000).saturating_add(1),
+                size: 0,
+            },
+        );
+        bundle
+    }
 }
 
 impl CatalogProvider for MockCatalogProvider {
@@ -60,10 +83,15 @@ impl CatalogProvider for MockCatalogProvider {
         if let Some(msg) = &self.fail_with {
             return Err(ConfigError::Invalid(msg.clone()));
         }
-        self.fixtures
-            .get(&app_id)
-            .cloned()
-            .ok_or_else(|| ConfigError::Invalid(format!("mock has no fixture for app {app_id}")))
+        if let Some(b) = self.fixtures.get(&app_id) {
+            return Ok(b.clone());
+        }
+        if self.auto_generate {
+            return Ok(Self::synthetic(app_id));
+        }
+        Err(ConfigError::Invalid(format!(
+            "mock has no fixture for app {app_id}"
+        )))
     }
 }
 
