@@ -10,7 +10,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use stt_config::{add_to_library, ConfigState, HostConfig, MockCatalogProvider, ToolId};
+use stt_config::{
+    add_to_library, apply_intent, ConfigIntent, ConfigSnapshot, ConfigState, HostConfig,
+    MockCatalogProvider, ToolId,
+};
 use stt_core::AppRules;
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -29,12 +32,28 @@ pub fn bootstrap_config(steam_root: &Path) -> stt_config::Result<ConfigState> {
 
 fn tools_enabled_line(state: &ConfigState) -> String {
     let tools = state.tools();
-    let enabled: Vec<&str> = [ToolId::CatalogAdd, ToolId::LibraryUx, ToolId::StoreAccel]
-        .into_iter()
+    let enabled: Vec<&str> = ToolId::ALL
+        .iter()
+        .copied()
         .filter(|id| tools.is_enabled(*id))
         .map(ToolId::as_str)
         .collect();
     format!("tools_enabled={}\n", enabled.join(","))
+}
+
+/// 调试通道给谁用: 入库按钮和配置页都靠它, 有一个开着就得装 hook.
+fn needs_cef_channel(state: &ConfigState) -> bool {
+    let tools = state.tools();
+    tools.is_enabled(ToolId::CatalogAdd) || tools.is_enabled(ToolId::ConfigUi)
+}
+
+/// 本会话的通道名, 给日志和配置页显示.
+fn channel_label(use_pipe: bool) -> String {
+    if use_pipe {
+        "pipe".to_owned()
+    } else {
+        stt_steamui::cdp_host_port()
+    }
 }
 
 fn append_host_log(steam_root: &Path, line: &str) {
@@ -87,9 +106,9 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     // 发起调用的模块可能比 host 晚加载, 而 webhelper 约 300ms 就被拉起,
     // 所以这里忙等着补挂; watch 里的 CefRearm 负责后续新模块与 webhelper 重启.
     // 首选 pipe (不开任何端口); 上次证明走不通才回退到端口.
-    let catalog_on = state.tools().is_enabled(ToolId::CatalogAdd);
+    let channel_on = needs_cef_channel(&state);
     let use_pipe = !stt_platform::cef_pipe_fallback_marker(steam_root).is_file();
-    let cef = stt_steamui::wait_cef_debug_hook(catalog_on, use_pipe, Duration::from_millis(2000));
+    let cef = stt_steamui::wait_cef_debug_hook(channel_on, use_pipe, Duration::from_millis(2000));
 
     let lua_report = state.reload_lua_dirs(steam_root);
 
@@ -178,6 +197,18 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     append_host_log(
         steam_root,
         &format!(
+            "config_ui={} channel={} (entry is injected into the client window)",
+            if state.tools().is_enabled(ToolId::ConfigUi) {
+                "on"
+            } else {
+                "off"
+            },
+            channel_label(use_pipe)
+        ),
+    );
+    append_host_log(
+        steam_root,
+        &format!(
             "catalog_add=store_inject channel={} caught_webhelper={} \
              (store lives in steamwebhelper)",
             if use_pipe {
@@ -193,7 +224,60 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 后台: CEF CDP 向商店页注入按钮, 并取回点击排下的 app_id.
+/// 配置页的宿主侧: 出快照, 收意图, 落盘.
+struct HostPanel {
+    steam_root: std::path::PathBuf,
+    state: ConfigState,
+    channel: String,
+    /// 最近一次保存结果, 下一份快照带给页面.
+    note: String,
+    /// 勘察样本只留第一份.
+    recon_done: bool,
+}
+
+impl stt_steamui::PanelBridge for HostPanel {
+    fn enabled(&mut self) -> bool {
+        self.state.tools().is_enabled(ToolId::ConfigUi)
+    }
+
+    fn snapshot(&mut self) -> Option<ConfigSnapshot> {
+        Some(ConfigSnapshot::from_state(
+            &self.state,
+            &self.steam_root,
+            &self.channel,
+            &self.note,
+        ))
+    }
+
+    fn on_intents(&mut self, intents: &[ConfigIntent]) {
+        for intent in intents {
+            match apply_intent(&self.state, &self.steam_root, intent) {
+                Ok(done) => {
+                    append_host_log(&self.steam_root, &format!("config_ui=saved {done}"));
+                    self.note = format!("已保存 {done}");
+                }
+                Err(e) => {
+                    append_host_log(&self.steam_root, &format!("config_ui=err {e}"));
+                    self.note = format!("失败: {e}");
+                }
+            }
+        }
+    }
+
+    fn on_recon(&mut self, sample: &str) {
+        // 每份都写 (后一份是界面渲染完之后取的, 更有用); 日志只提一次.
+        let path = stt_platform::data_dir(&self.steam_root).join("ui-recon.txt");
+        if std::fs::write(&path, sample).is_ok() && !self.recon_done {
+            self.recon_done = true;
+            append_host_log(
+                &self.steam_root,
+                &format!("config_ui=recon path={}", path.display()),
+            );
+        }
+    }
+}
+
+/// 后台: CEF CDP 向商店页注入按钮并取回点击, 顺带把配置页挂进客户端界面.
 ///
 /// `use_pipe` 时先试无端口的管道通道; 它明确走不通才落标记文件并回退到端口,
 /// 这样最多一个会话入库不可用, 不会永久卡死.
@@ -204,8 +288,22 @@ fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState, use_pipe: bool
         .name("stt-store-cdp".into())
         .spawn(move || {
             let provider = MockCatalogProvider::new().with_auto_generate(true);
+            let mut panel = HostPanel {
+                steam_root: root.clone(),
+                state: state.clone(),
+                channel: channel_label(use_pipe),
+                note: String::new(),
+                recon_done: false,
+            };
             // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
-            let mut make_js = stt_steamui::cdp_store_inject_js;
+            // 工具关掉就换成摘按钮的脚本, 让开关当场看得见.
+            let mut make_js = || {
+                if state.tools().is_enabled(ToolId::CatalogAdd) {
+                    stt_steamui::cdp_store_inject_js()
+                } else {
+                    stt_steamui::store_teardown_js()
+                }
+            };
             let mut on_app = |app_id: u32| {
                 match add_to_library(&state, &root, &provider, app_id) {
                     Ok(out) => append_host_log(
@@ -234,6 +332,7 @@ fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState, use_pipe: bool
                     &mut on_app,
                     &mut on_log,
                     Duration::from_secs(30),
+                    Some(&mut panel),
                 );
                 if ok {
                     return; // 通道好使, 循环自己会长驻; 走到这说明 Steam 要退了
@@ -257,9 +356,10 @@ fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState, use_pipe: bool
 
             stt_steamui::run_store_cdp_loop_with_js(
                 Duration::from_millis(600),
-                make_js,
-                on_app,
-                on_log,
+                &mut make_js,
+                &mut on_app,
+                &mut on_log,
+                Some(&mut panel),
             );
         });
 }
@@ -447,11 +547,7 @@ impl CefRearm {
     /// pipe 模式下不存在端口, 早先这里无脑打 `cdp_host_port()`, 结果日志显示
     /// `cdp=127.0.0.1:8080` — 明明走的是管道, 读日志的人会以为端口还开着.
     fn channel_label(&self) -> String {
-        if self.use_pipe {
-            "pipe".to_owned()
-        } else {
-            stt_steamui::cdp_host_port()
-        }
+        channel_label(self.use_pipe)
     }
     /// 这么久还没截到就写诊断 (~20s), 够覆盖冷启动.
     const WARN_AFTER: u32 = 80;
@@ -461,10 +557,7 @@ impl CefRearm {
         if !self.ticks.is_multiple_of(Self::EVERY) {
             return;
         }
-        let r = stt_steamui::install_cef_debug_hook(
-            state.tools().is_enabled(ToolId::CatalogAdd),
-            self.use_pipe,
-        );
+        let r = stt_steamui::install_cef_debug_hook(needs_cef_channel(state), self.use_pipe);
         if r.modules.len() > self.modules {
             self.modules = r.modules.len();
             append_host_log(steam_root, &format!("{} (rearm)", r.summary_line()));
