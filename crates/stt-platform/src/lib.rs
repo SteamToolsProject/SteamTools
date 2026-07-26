@@ -2,6 +2,7 @@
 
 #![cfg(windows)]
 
+mod child_pipe;
 mod hash;
 mod module;
 
@@ -11,9 +12,14 @@ use windows::Win32::Foundation::{HMODULE, MAX_PATH};
 use windows::Win32::System::LibraryLoader::{DisableThreadLibraryCalls, GetModuleFileNameW};
 use windows::Win32::System::Threading::CreateThread;
 
+pub use child_pipe::{
+    crt_fd_block, prepare_devtools_pipe, ChildPipeLaunch, DevToolsPipe, CHILD_READ_FD,
+    CHILD_WRITE_FD, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOW_SIZE,
+};
 pub use hash::{sha256_bytes, sha256_file};
 pub use module::{
-    module_handle, module_info, module_path, module_path_by_name, read_module_bytes, ModuleInfo,
+    enumerate_modules, main_module_base, module_handle, module_info, module_info_by_handle,
+    module_path, module_path_by_name, proc_address, read_module_bytes, ModuleInfo,
 };
 
 pub const DATA_DIR_NAME: &str = "steamtools";
@@ -96,19 +102,19 @@ pub fn write_store_inject_js(steam_root: &Path, source: &str) -> std::io::Result
 }
 
 /// CEF 远程调试开关文件 (Steam 根目录, 空文件即可).
-/// loader 会在 steam.exe 启动时自动创建, 用户无需手开.
+///
+/// 我们**不再创建**它 (ADR 0010): 调试端点改由 CreateProcessW hook 按会话给,
+/// 这里只保留路径, 用来提示用户删掉历史遗留的文件.
 pub fn cef_remote_debugging_flag_path(steam_root: &Path) -> PathBuf {
     steam_root.join(".cef-enable-remote-debugging")
 }
 
-/// 幂等创建开关文件; 返回是否新创建.
-pub fn ensure_cef_remote_debugging_flag(steam_root: &Path) -> std::io::Result<bool> {
-    let path = cef_remote_debugging_flag_path(steam_root);
-    if path.is_file() {
-        return Ok(false);
-    }
-    std::fs::File::create(&path)?;
-    Ok(true)
+/// pipe 通道走不通的标记文件.
+///
+/// 存在即表示上次用 `--remote-debugging-pipe` 没能建立 CDP, 下次直接回退到端口.
+/// 删掉它就会重试 pipe (换了 Steam / CEF 版本后值得一试).
+pub fn cef_pipe_fallback_marker(steam_root: &Path) -> PathBuf {
+    data_dir(steam_root).join("cef_pipe_unsupported")
 }
 
 /// # Safety
