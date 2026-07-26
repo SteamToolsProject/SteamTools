@@ -18,3 +18,5 @@ non_snake_case = "allow"
 stt-core = { workspace = true }
 stt-platform = { workspace = true }
 stt-config = { workspace = true }
+stt-metadata = { workspace = true }
+stt-hook = { workspace = true }
