@@ -23,7 +23,7 @@
 - [x] M2：`steamtools.toml`、工具开关、mlua、Catalog Mock、lua 扫盘/watch
 - [x] M3：SHA-256、pattern TOML、符号解析、可卸载 detour、无害自测 hook
 - [x] M4a：库 UX 状态机 + 可降级安装规划 (尚无业务 detour)
-- [x] M4b：商店「入库」按钮 (CDP 注入 + 本机点击桥) → `config/lua/stt_{app_id}.lua`
+- [x] M4b：商店「入库」按钮 (CDP 注入 + 页内队列回传) → `config/lua/stt_{app_id}.lua`
 - [x] M4c：配置页 (标签行入口 + 面板 → `steamtools.toml` 热生效，本机已冒烟)
 
 ```powershell
