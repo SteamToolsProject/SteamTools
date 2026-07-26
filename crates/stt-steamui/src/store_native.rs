@@ -23,7 +23,6 @@ use stt_hook::TrampolineHook;
 use stt_metadata::PatternStore;
 use stt_platform::module_info;
 
-use crate::click_bridge::{click_bridge_port, store_inject_js_with_bridge};
 use crate::store_inject::STORE_INJECT_JS;
 
 /// pattern: ExecuteJavaScript
@@ -455,9 +454,7 @@ fn try_inject_gated(this: *mut c_void, reason: &str) {
         return;
     }
 
-    let port = click_bridge_port();
-    let js = store_inject_js_with_bridge(port, STORE_INJECT_JS);
-    let mut bytes = js.into_bytes();
+    let mut bytes = STORE_INJECT_JS.as_bytes().to_vec();
     bytes.push(0);
 
     IN_INJECT.with(|c| c.set(true));

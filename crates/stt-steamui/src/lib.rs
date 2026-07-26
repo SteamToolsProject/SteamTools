@@ -8,7 +8,6 @@
 mod cdp_bridge;
 mod cdp_pipe;
 mod cef_debug;
-mod click_bridge;
 mod install;
 mod library_ux;
 mod store_debug;
@@ -23,10 +22,6 @@ pub use cdp_pipe::{poll_store_pipe, run_store_pipe_loop, CdpPipeSession, PipeTar
 pub use cef_debug::{
     cef_debug_rewrites, cef_debug_stats, install_cef_debug_hook, pipe_armed, take_devtools_pipe,
     take_launch_snapshot, wait_cef_debug_hook, CefDebugReport, CefDebugStatus,
-};
-pub use click_bridge::{
-    click_bridge_port, click_bridge_stats, click_bridge_token, ensure_click_bridge,
-    store_inject_js_with_bridge, take_last_rejection,
 };
 pub use install::{
     plan_library_ux_install, LibraryUxInstallReport, LibraryUxInstallStatus,

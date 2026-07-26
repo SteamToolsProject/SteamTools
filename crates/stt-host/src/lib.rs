@@ -158,38 +158,6 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         Err(e) => append_host_log(steam_root, &format!("catalog_add=store_inject err {e}")),
     }
 
-    // 点击回传: 本机 HTTP 桥 (商店页 fetch, 不依赖 CEF 8080).
-    {
-        let root = steam_root.to_path_buf();
-        let state_cb = state.clone();
-        stt_steamui::ensure_click_bridge(move |app_id| {
-            let provider = MockCatalogProvider::new().with_auto_generate(true);
-            match add_to_library(&state_cb, &root, &provider, app_id) {
-                Ok(out) => append_host_log(
-                    &root,
-                    &format!(
-                        "catalog_add=ok source=store_btn app_id={app_id} provider={} lua={} epoch={} owned={}",
-                        out.provider_id,
-                        out.lua_path.display(),
-                        out.epoch,
-                        out.owned_count
-                    ),
-                ),
-                Err(e) => append_host_log(
-                    &root,
-                    &format!("catalog_add=err source=store_btn app_id={app_id} {e}"),
-                ),
-            }
-        });
-        append_host_log(
-            steam_root,
-            &format!(
-                "catalog_add=click_bridge port={}",
-                stt_steamui::click_bridge_port()
-            ),
-        );
-    }
-
     // 商店页在 steamwebhelper CEF, 不在 steam.exe CHTMLWindow — 主路径走 CDP.
     // native hook 默认关 (STEAMTOOLS_STORE_NATIVE=inject 才开).
     let native = stt_steamui::try_install_store_native(&state.tools(), &patterns);
@@ -225,7 +193,7 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 后台: CEF CDP 向商店页注入按钮; 点击走 click_bridge, pending 队列作兜底.
+/// 后台: CEF CDP 向商店页注入按钮, 并取回点击排下的 app_id.
 ///
 /// `use_pipe` 时先试无端口的管道通道; 它明确走不通才落标记文件并回退到端口,
 /// 这样最多一个会话入库不可用, 不会永久卡死.
@@ -236,11 +204,8 @@ fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState, use_pipe: bool
         .name("stt-store-cdp".into())
         .spawn(move || {
             let provider = MockCatalogProvider::new().with_auto_generate(true);
-            let mut make_js = || {
-                // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
-                let port = stt_steamui::click_bridge_port();
-                stt_steamui::cdp_store_inject_js(port)
-            };
+            // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
+            let mut make_js = stt_steamui::cdp_store_inject_js;
             let mut on_app = |app_id: u32| {
                 match add_to_library(&state, &root, &provider, app_id) {
                     Ok(out) => append_host_log(
@@ -546,7 +511,6 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
     // 定期重扫目录, 好把新建的 .lua 纳入监视.
     let mut rescan_ticks: u32 = 0;
     let mut last_stats = (0u64, 0u64, 0u64, 0usize);
-    let mut last_bridge_stats = (0u64, 0u64);
     let mut cef_rearm = CefRearm {
         use_pipe,
         ..CefRearm::default()
@@ -569,20 +533,6 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
                 ),
             );
             last_stats = stats;
-        }
-
-        // 点击桥诊断: conn=0 表示 fetch 压根没到 (浏览器侧拦的), 有 conn 却全被拒
-        // 才是我们判错. 两者修法不同, 必须分得开.
-        let bridge = stt_steamui::click_bridge_stats();
-        if bridge != last_bridge_stats {
-            append_host_log(
-                steam_root,
-                &format!("click_bridge_stats conn={} rejected={}", bridge.0, bridge.1),
-            );
-            if let Some(line) = stt_steamui::take_last_rejection() {
-                append_host_log(steam_root, &format!("click_bridge_rejected {line}"));
-            }
-            last_bridge_stats = bridge;
         }
 
         let mut host_changed = false;

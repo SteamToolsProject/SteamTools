@@ -17,7 +17,10 @@ use crate::store_inject::STORE_INJECT_JS;
 pub(crate) const DRAIN_JS: &str = r#"(function(){var p=window.__SteamToolsPending||[];window.__SteamToolsPending=[];return p;})()"#;
 
 /// CDP 专用短脚本: 大脚本在 CEF evaluate 上偶发挂起; 短脚本狗粮已验证 near-cart 可挂.
-/// `{{PORT}}` 由 host 替换为 click_bridge 端口.
+///
+/// 点击只入 `window.__SteamToolsPending`, 由 [`DRAIN_JS`] 取走 — 商店页的 CSP
+/// `connect-src` 只放行 `127.0.0.1:27060` (Steam 自己占着), 页面发不出到别的
+/// 本机端口的请求, 所以不存在"直接回传"这条路.
 pub const CDP_STORE_INJECT_JS: &str = r##"
 (function(){
   window.__SteamToolsPending = window.__SteamToolsPending || [];
@@ -65,7 +68,6 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
   }
   function enqueue(id){
     window.__SteamToolsPending.push({app_id:Number(id),reason:"store_btn",href:href,ts:Date.now()});
-    try{ fetch("http://127.0.0.1:{{PORT}}/stt/add?token={{TOKEN}}&appid="+id,{method:"POST",mode:"no-cors"}).catch(function(){}); }catch(e){}
   }
   // 用 Steam 自己的按钮类, 与「添加至购物车」同一套渐变/字号/圆角 (蓝色区分是我们的).
   var btn=document.createElement("a");
@@ -90,17 +92,9 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
 })()
 "##;
 
-/// 把 click_bridge 端口与本会话 token 填进 CDP 短脚本.
-pub fn cdp_store_inject_js(port: u16) -> String {
-    cdp_store_inject_js_with(port, crate::click_bridge::click_bridge_token())
-}
-
-/// 纯替换版; 与上面分开是为了能拿真 token 做断言 —
-/// 测试进程里桥不会启动, `click_bridge_token()` 恒为空串, 直接测公开版等于没测.
-fn cdp_store_inject_js_with(port: u16, token: &str) -> String {
-    CDP_STORE_INJECT_JS
-        .replace("{{PORT}}", &port.to_string())
-        .replace("{{TOKEN}}", token)
+/// CDP 短脚本 (已无占位符待填).
+pub fn cdp_store_inject_js() -> String {
+    CDP_STORE_INJECT_JS.to_owned()
 }
 
 /// 一次轮询结果.
@@ -262,7 +256,7 @@ pub fn poll_store_cdp_default() -> StoreCdpPoll {
     poll_store_cdp(&cdp_host_port(), STORE_INJECT_JS)
 }
 
-/// 后台循环: 注入 + 回调 app_id (pending 队列兜底; 点击优先走 click_bridge fetch).
+/// 后台循环: 注入按钮, 并把点击排下的 app_id 回调出去.
 pub fn run_store_cdp_loop(
     poll_every: Duration,
     on_app: impl FnMut(u32),
@@ -271,7 +265,7 @@ pub fn run_store_cdp_loop(
     run_store_cdp_loop_with_js(poll_every, || STORE_INJECT_JS.to_string(), on_app, on_log);
 }
 
-/// 同上, 但每次轮询用 `make_js()` 生成脚本 (可带 click_bridge 端口).
+/// 同上, 但每次轮询用 `make_js()` 现生成脚本.
 pub fn run_store_cdp_loop_with_js(
     poll_every: Duration,
     mut make_js: impl FnMut() -> String,
@@ -824,11 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn cdp_js_has_port_placeholder() {
-        let s = cdp_store_inject_js(12345);
-        assert!(s.contains("12345"));
+    fn cdp_js_renders_the_store_button() {
+        let s = cdp_store_inject_js();
         assert!(s.contains("data-stt-store-btn"));
-        assert!(!s.contains("{{PORT}}"));
         // 兜底按钮要能在购买区渲染好之后搬回购物车旁.
         assert!(s.contains("data-stt-fallback"));
         assert!(s.contains("\"moved \""));
@@ -842,28 +834,11 @@ mod tests {
         assert!(s.contains("margin-left:2px"));
     }
 
-    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
-
+    /// 页面 CSP 只放行 27060, 发不出去; 留着只会每次点击都报一条控制台错误.
     #[test]
-    fn cdp_js_carries_the_session_token() {
-        let s = cdp_store_inject_js_with(12345, TEST_TOKEN);
-        assert!(s.contains(&format!("token={TEST_TOKEN}")), "{s}");
-    }
-
-    #[test]
-    fn cdp_js_leaves_no_token_placeholder() {
-        let s = cdp_store_inject_js_with(12345, TEST_TOKEN);
-        assert!(!s.contains("{{TOKEN}}"), "{s}");
-    }
-
-    /// token 在前、appid 在后, 拼出的 URL 要能被 click_bridge 解析.
-    #[test]
-    fn cdp_js_builds_a_parsable_bridge_url() {
-        let s = cdp_store_inject_js_with(12345, TEST_TOKEN);
-        assert!(
-            s.contains(&format!("/stt/add?token={TEST_TOKEN}&appid=")),
-            "{s}"
-        );
+    fn cdp_js_does_not_call_out_to_a_local_port() {
+        let s = cdp_store_inject_js();
+        assert!(!s.contains("fetch("), "{s}");
     }
 
     #[test]

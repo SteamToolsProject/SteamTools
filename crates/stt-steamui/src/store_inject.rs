@@ -51,9 +51,6 @@ pub const STORE_INJECT_JS: &str = r##"
       ts: Date.now(),
     });
     try {
-      if (window.__SteamToolsEnqueueHook) window.__SteamToolsEnqueueHook(id);
-    } catch (eH) {}
-    try {
       console.log("[SteamTools] queued app_id=" + id + " reason=" + (reason || "click"));
     } catch (e) {}
   }
