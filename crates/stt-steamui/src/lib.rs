@@ -26,8 +26,9 @@ pub use cef_debug::{
     take_launch_snapshot, wait_cef_debug_hook, CefDebugReport, CefDebugStatus,
 };
 pub use config_panel::{
-    panel_update_js, parse_panel_tick, snapshot_json, PanelBridge, PanelState, PanelTick,
-    NAV_TICK_JS, PANEL_JS,
+    managed_apps_js, nav_tick_js, panel_update_js, parse_panel_tick, snapshot_json, PanelBridge,
+    PanelState, PanelTick, ViewRole, LIBRARY_MENU_JS, LIBRARY_MENU_TEARDOWN_JS, NAV_TICK_JS,
+    PANEL_JS,
 };
 pub use install::{
     plan_library_ux_install, LibraryUxInstallReport, LibraryUxInstallStatus,
