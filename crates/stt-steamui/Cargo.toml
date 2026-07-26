@@ -18,6 +18,11 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# examples/cdp_pipe_probe.rs 要自己起一个 Chromium 来验证会话层.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [lints]
 workspace = true
