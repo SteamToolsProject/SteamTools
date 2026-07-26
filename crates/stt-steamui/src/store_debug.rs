@@ -1,15 +1,15 @@
-//! steamwebhelper 的 CEF 调试通道: 本会话端口 + 命令行改写 (纯字符串).
+//! steamwebhelper 的 CEF 调试通道选择与命令行改写 (纯字符串).
 //!
-//! 商店注入靠 CDP, 而 CDP 端点由 steamwebhelper 的 `--remote-debugging-port`
-//! 决定. 与其在 Steam 根目录长期留一个 `.cef-enable-remote-debugging` 开着固定
-//! 8080, 不如在 steam.exe 里 hook `CreateProcessW`, 只给本会话的 webhelper 塞一
-//! 个随机高位端口 (ADR 0010).
+//! 商店注入靠 CDP, 而 CDP 端点由 steamwebhelper 的命令行决定. 与其在 Steam 根
+//! 目录长期留一个 `.cef-enable-remote-debugging` 开着固定 8080, 不如 hook
+//! `CreateProcessW` 自己给参数 (ADR 0010).
 //!
-//! 端口随机化是纵深防御而非墙: 本机进程仍可读命令行. 真正消除端口要靠
-//! `--remote-debugging-pipe` (B 档), 那时只需换掉这里的参数与传输层.
+//! 首选 [`DebugChannel::Pipe`]: 走继承的 fd 3/4, **没有端口可扫、没有 URL 可
+//! 连**, 只有持有管道的父进程能用. [`DebugChannel::Port`] 是它走不通时的回退 —
+//! 端口随机化只是纵深防御, 本机进程照样能读命令行拿到端口.
 
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 /// CEF 未被我们接管时的历史端口 (`.cef-enable-remote-debugging` 时代).
 pub const LEGACY_CDP_PORT: u16 = 8080;
@@ -24,10 +24,25 @@ const WEBHELPER_EXE: &str = "steamwebhelper.exe";
 const STRIP_PREFIXES: &[&str] = &["--remote-debugging-", "--remote-allow-origins"];
 
 static SESSION_PORT: AtomicU16 = AtomicU16::new(0);
+static SESSION_PORT_LIVE: AtomicBool = AtomicBool::new(false);
 
 /// 本会话给 webhelper 分配的调试端口; 0 表示尚未分配 (hook 没装上).
 pub fn cef_debug_port() -> u16 {
     SESSION_PORT.load(Ordering::SeqCst)
+}
+
+/// 会话端口真的写进了某次 webhelper 的命令行.
+///
+/// 分配端口 ≠ 端口会被监听: hook 若没赶上 (或压根没挂到发起调用的模块),
+/// webhelper 用的还是它自己的参数. 在这个标记置位前, CDP 必须去连 8080,
+/// 否则就是对着一个没人监听的随机端口空转 — 实测过的失败形态.
+pub fn mark_session_port_live() {
+    SESSION_PORT_LIVE.store(true, Ordering::SeqCst);
+}
+
+/// 会话端口是否已确认可用.
+pub fn session_port_live() -> bool {
+    SESSION_PORT_LIVE.load(Ordering::SeqCst)
 }
 
 /// 让系统挑一个空闲高位端口并记下来. 立刻释放, 由 CEF 去真正绑定.
@@ -47,9 +62,14 @@ pub fn alloc_cef_debug_port() -> u16 {
     port
 }
 
-/// CDP 连接目标: 优先本会话端口, 没有则退回 8080 (兼容已在跑的 webhelper).
+/// CDP 连接目标: 确认改写成功才用本会话端口, 否则退回 8080
+/// (兼容已在跑的 webhelper / 用户自留的 `.cef-enable-remote-debugging`).
 pub fn cdp_host_port() -> String {
-    host_port_for(cef_debug_port())
+    if session_port_live() {
+        host_port_for(cef_debug_port())
+    } else {
+        host_port_for(0)
+    }
 }
 
 fn host_port_for(port: u16) -> String {
@@ -83,20 +103,36 @@ fn exe_is_webhelper(path: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case(WEBHELPER_EXE))
 }
 
-/// 剥掉调试相关参数再按本会话端口重挂.
+/// webhelper 该开哪种调试通道.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugChannel {
+    /// 完全不开 — `catalog_add` 关掉时如此.
+    None,
+    /// 继承的 fd 3/4, **不开任何端口** (ADR 0010 B 档).
+    Pipe,
+    /// 本会话随机高位端口; pipe 走不通时的回退.
+    Port(u16),
+}
+
+/// 剥掉调试相关参数再按指定通道重挂.
 ///
 /// 先剥后加所以幂等: 重复调用 (或 Steam 自己已经加过) 都不会叠参数.
-/// `port == 0` 表示只剥不加 — 工具关掉时 webhelper 就完全不开调试端点.
-pub fn rewrite_webhelper_cmdline(cmdline: &str, port: u16) -> String {
+/// `STRIP_PREFIXES` 里的 `--remote-debugging-` 同时覆盖 `-port`/`-pipe`,
+/// 所以切换通道时不会两种参数并存.
+pub fn rewrite_webhelper_cmdline(cmdline: &str, channel: DebugChannel) -> String {
     let mut parts: Vec<&str> = split_args(cmdline)
         .into_iter()
         .filter(|tok| !is_stripped_flag(tok))
         .collect();
     let injected;
-    if port != 0 {
-        injected = format!("--remote-debugging-port={port}");
-        parts.push(&injected);
-        parts.push("--remote-debugging-address=127.0.0.1");
+    match channel {
+        DebugChannel::None => {}
+        DebugChannel::Pipe => parts.push("--remote-debugging-pipe"),
+        DebugChannel::Port(port) => {
+            injected = format!("--remote-debugging-port={port}");
+            parts.push(&injected);
+            parts.push("--remote-debugging-address=127.0.0.1");
+        }
     }
     parts.join(" ")
 }
@@ -138,7 +174,8 @@ fn split_args(cmd: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
-    const WEBHELPER: &str = r#""E:\Steam\bin\cef\cef.win64\steamwebhelper.exe" -lang=zh --disable-quick-menu"#;
+    const WEBHELPER: &str =
+        r#""E:\Steam\bin\cef\cef.win64\steamwebhelper.exe" -lang=zh --disable-quick-menu"#;
 
     #[test]
     fn detects_webhelper_from_application_name() {
@@ -175,26 +212,70 @@ mod tests {
     }
 
     #[test]
+    fn pipe_channel_opens_no_port() {
+        let cmd = r#""wh.exe" --remote-debugging-port=8080 --lang=zh"#;
+        let out = rewrite_webhelper_cmdline(cmd, DebugChannel::Pipe);
+        assert!(out.contains("--remote-debugging-pipe"), "{out}");
+        assert!(!out.contains("--remote-debugging-port"), "{out}");
+        assert!(!out.contains("8080"), "{out}");
+    }
+
+    #[test]
+    fn pipe_channel_keeps_other_arguments() {
+        let out = rewrite_webhelper_cmdline(WEBHELPER, DebugChannel::Pipe);
+        assert!(out.contains("--disable-quick-menu"), "{out}");
+    }
+
+    #[test]
+    fn pipe_rewrite_is_idempotent() {
+        let once = rewrite_webhelper_cmdline(WEBHELPER, DebugChannel::Pipe);
+        assert_eq!(rewrite_webhelper_cmdline(&once, DebugChannel::Pipe), once);
+    }
+
+    #[test]
+    fn switching_channels_never_leaves_both_flags() {
+        // 端口模式的产物再按 pipe 改写, 不能两种参数并存.
+        let ported = rewrite_webhelper_cmdline(WEBHELPER, DebugChannel::Port(51234));
+        let piped = rewrite_webhelper_cmdline(&ported, DebugChannel::Pipe);
+        assert!(!piped.contains("--remote-debugging-port"), "{piped}");
+        assert_eq!(
+            piped.matches("--remote-debugging-pipe").count(),
+            1,
+            "{piped}"
+        );
+    }
+
+    #[test]
+    fn pipe_channel_strips_wildcard_origin_too() {
+        let cmd = r#""wh.exe" "--remote-allow-origins=*" --lang=zh"#;
+        let out = rewrite_webhelper_cmdline(cmd, DebugChannel::Pipe);
+        assert!(!out.contains("remote-allow-origins"), "{out}");
+    }
+
+    #[test]
     fn injects_session_port() {
-        let out = rewrite_webhelper_cmdline(WEBHELPER, 51234);
+        let out = rewrite_webhelper_cmdline(WEBHELPER, DebugChannel::Port(51234));
         assert!(out.contains("--remote-debugging-port=51234"), "{out}");
     }
 
     #[test]
     fn binds_debug_endpoint_to_loopback() {
-        let out = rewrite_webhelper_cmdline(WEBHELPER, 51234);
-        assert!(out.contains("--remote-debugging-address=127.0.0.1"), "{out}");
+        let out = rewrite_webhelper_cmdline(WEBHELPER, DebugChannel::Port(51234));
+        assert!(
+            out.contains("--remote-debugging-address=127.0.0.1"),
+            "{out}"
+        );
     }
 
     #[test]
     fn keeps_original_arguments() {
-        let out = rewrite_webhelper_cmdline(WEBHELPER, 51234);
+        let out = rewrite_webhelper_cmdline(WEBHELPER, DebugChannel::Port(51234));
         assert!(out.contains("--disable-quick-menu"), "{out}");
     }
 
     #[test]
     fn keeps_quoted_argv0_intact() {
-        let out = rewrite_webhelper_cmdline(WEBHELPER, 51234);
+        let out = rewrite_webhelper_cmdline(WEBHELPER, DebugChannel::Port(51234));
         assert!(
             out.starts_with(r#""E:\Steam\bin\cef\cef.win64\steamwebhelper.exe""#),
             "{out}"
@@ -204,7 +285,7 @@ mod tests {
     #[test]
     fn replaces_steam_own_debug_port() {
         let cmd = r#""wh.exe" --remote-debugging-port=8080 --lang=zh"#;
-        let out = rewrite_webhelper_cmdline(cmd, 51234);
+        let out = rewrite_webhelper_cmdline(cmd, DebugChannel::Port(51234));
         assert!(!out.contains("8080"), "{out}");
     }
 
@@ -212,22 +293,26 @@ mod tests {
     fn strips_quoted_debug_flags() {
         // 实机命令行里 Steam 给这个参数带了引号.
         let cmd = r#""wh.exe" "--remote-debugging-address=127.0.0.1" --lang=zh"#;
-        let out = rewrite_webhelper_cmdline(cmd, 51234);
-        assert_eq!(out.matches("--remote-debugging-address").count(), 1, "{out}");
+        let out = rewrite_webhelper_cmdline(cmd, DebugChannel::Port(51234));
+        assert_eq!(
+            out.matches("--remote-debugging-address").count(),
+            1,
+            "{out}"
+        );
     }
 
     #[test]
     fn strips_steam_wildcard_allow_origins() {
         // 实机上 Steam 带 --remote-allow-origins=*, 等于拆掉 CEF 的 Origin 防线.
         let cmd = r#""wh.exe" "--remote-allow-origins=*" --lang=zh"#;
-        let out = rewrite_webhelper_cmdline(cmd, 51234);
+        let out = rewrite_webhelper_cmdline(cmd, DebugChannel::Port(51234));
         assert!(!out.contains("remote-allow-origins"), "{out}");
     }
 
     #[test]
     fn rewrite_is_idempotent() {
-        let once = rewrite_webhelper_cmdline(WEBHELPER, 51234);
-        let twice = rewrite_webhelper_cmdline(&once, 51234);
+        let once = rewrite_webhelper_cmdline(WEBHELPER, DebugChannel::Port(51234));
+        let twice = rewrite_webhelper_cmdline(&once, DebugChannel::Port(51234));
         assert_eq!(once, twice);
     }
 
@@ -235,14 +320,14 @@ mod tests {
     fn zero_port_strips_without_injecting() {
         // 工具关掉: webhelper 完全不开调试端点.
         let cmd = r#""wh.exe" --remote-debugging-port=8080 --lang=zh"#;
-        let out = rewrite_webhelper_cmdline(cmd, 0);
+        let out = rewrite_webhelper_cmdline(cmd, DebugChannel::None);
         assert!(!out.contains("--remote-debugging-"), "{out}");
     }
 
     #[test]
     fn zero_port_keeps_other_arguments() {
         let cmd = r#""wh.exe" --remote-debugging-port=8080 --lang=zh"#;
-        let out = rewrite_webhelper_cmdline(cmd, 0);
+        let out = rewrite_webhelper_cmdline(cmd, DebugChannel::None);
         assert!(out.contains("--lang=zh"), "{out}");
     }
 
@@ -269,19 +354,19 @@ mod tests {
 
     #[test]
     fn real_cmdline_loses_steam_debug_port() {
-        let out = rewrite_webhelper_cmdline(REAL_CMDLINE, 51234);
+        let out = rewrite_webhelper_cmdline(REAL_CMDLINE, DebugChannel::Port(51234));
         assert!(!out.contains("8080"), "{out}");
     }
 
     #[test]
     fn real_cmdline_loses_wildcard_origin() {
-        let out = rewrite_webhelper_cmdline(REAL_CMDLINE, 51234);
+        let out = rewrite_webhelper_cmdline(REAL_CMDLINE, DebugChannel::Port(51234));
         assert!(!out.contains("remote-allow-origins"), "{out}");
     }
 
     #[test]
     fn real_cmdline_keeps_client_ui_path_with_spaces() {
-        let out = rewrite_webhelper_cmdline(REAL_CMDLINE, 51234);
+        let out = rewrite_webhelper_cmdline(REAL_CMDLINE, DebugChannel::Port(51234));
         assert!(
             out.contains(r#""-clientui=E:\Program Files\Steam\clientui""#),
             "{out}"
@@ -290,21 +375,28 @@ mod tests {
 
     #[test]
     fn real_cmdline_keeps_steampid() {
-        let out = rewrite_webhelper_cmdline(REAL_CMDLINE, 51234);
+        let out = rewrite_webhelper_cmdline(REAL_CMDLINE, DebugChannel::Port(51234));
         assert!(out.contains(r#""-steampid=31300""#), "{out}");
     }
 
     #[test]
     fn real_cmdline_rewrite_is_idempotent() {
-        let once = rewrite_webhelper_cmdline(REAL_CMDLINE, 51234);
-        assert_eq!(rewrite_webhelper_cmdline(&once, 51234), once);
+        let once = rewrite_webhelper_cmdline(REAL_CMDLINE, DebugChannel::Port(51234));
+        assert_eq!(
+            rewrite_webhelper_cmdline(&once, DebugChannel::Port(51234)),
+            once
+        );
     }
 
     #[test]
     fn real_cmdline_keeps_all_other_tokens() {
         // 只该少 2 个 (port/address) + 1 个 allow-origins, 再加回 2 个.
         let before = split_args(REAL_CMDLINE).len();
-        let after = split_args(&rewrite_webhelper_cmdline(REAL_CMDLINE, 51234)).len();
+        let after = split_args(&rewrite_webhelper_cmdline(
+            REAL_CMDLINE,
+            DebugChannel::Port(51234),
+        ))
+        .len();
         assert_eq!(after, before - 3 + 2, "token 数对不上");
     }
 
