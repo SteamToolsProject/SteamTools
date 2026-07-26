@@ -11,11 +11,15 @@ description = "Windows platform helpers for SteamTools"
 sha2 = "0.10"
 # Win32_Security is required for CreateThread in windows 0.58.
 # ProcessStatus: module base/size; Memory: VirtualProtect for hooks.
+# Pipes/FileSystem: DevTools pipe (CDP over inherited fd 3/4) for stt-steamui.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
