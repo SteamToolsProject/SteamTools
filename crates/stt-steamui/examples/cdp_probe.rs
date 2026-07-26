@@ -6,10 +6,7 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let port: u16 = args
-        .iter()
-        .find_map(|a| a.parse().ok())
-        .unwrap_or(0);
+    let port: u16 = args.iter().find_map(|a| a.parse().ok()).unwrap_or(0);
     let force = args.iter().any(|a| a == "--force");
 
     let mut js = String::new();

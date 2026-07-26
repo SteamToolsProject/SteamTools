@@ -7,9 +7,7 @@ use std::ffi::c_void;
 use std::ptr;
 
 use windows::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows::Win32::System::Memory::{
-    VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
-};
+use windows::Win32::System::Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE};
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use crate::error::{HookError, Result};
@@ -127,7 +125,12 @@ unsafe fn write_slot(slot: *mut *const c_void, value: *const c_void) -> Result<(
     )
     .map_err(HookError::Protect)?;
     ptr::write(slot, value);
-    let _ = VirtualProtect(slot.cast(), std::mem::size_of::<*const c_void>(), old, &mut old);
+    let _ = VirtualProtect(
+        slot.cast(),
+        std::mem::size_of::<*const c_void>(),
+        old,
+        &mut old,
+    );
     let _ = FlushInstructionCache(
         GetCurrentProcess(),
         Some(slot.cast()),
@@ -146,8 +149,10 @@ unsafe fn find_iat_slots(base: *const u8, target: *const c_void) -> Vec<*mut *co
     if magic != PE32PLUS_MAGIC {
         return slots;
     }
-    let import_rva =
-        ptr::read_unaligned(nt.add(DATA_DIR_FROM_NT + DIR_ENTRY_IMPORT * 8).cast::<u32>()) as usize;
+    let import_rva = ptr::read_unaligned(
+        nt.add(DATA_DIR_FROM_NT + DIR_ENTRY_IMPORT * 8)
+            .cast::<u32>(),
+    ) as usize;
     if import_rva == 0 {
         return slots;
     }

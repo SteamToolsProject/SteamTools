@@ -54,7 +54,11 @@ pub fn catalog_lua_path(steam_root: &Path, app_id: AppId) -> PathBuf {
 }
 
 /// 写入 `<Steam>/config/lua/stt_{app_id}.lua`.
-pub fn write_catalog_lua(steam_root: &Path, app_id: AppId, bundle: &CatalogBundle) -> Result<PathBuf> {
+pub fn write_catalog_lua(
+    steam_root: &Path,
+    app_id: AppId,
+    bundle: &CatalogBundle,
+) -> Result<PathBuf> {
     let dir = default_lua_dir(steam_root);
     std::fs::create_dir_all(&dir).map_err(|source| ConfigError::Io {
         path: dir.clone(),
@@ -85,19 +89,14 @@ pub fn add_to_library(
     app_id: AppId,
 ) -> Result<AddToLibraryOutcome> {
     if !state.tools().is_enabled(ToolId::CatalogAdd) {
-        return Err(ConfigError::Invalid(
-            "catalog_add tool is disabled".into(),
-        ));
+        return Err(ConfigError::Invalid("catalog_add tool is disabled".into()));
     }
 
     let mut bundle = provider.fetch(app_id)?;
     if !bundle.apps.contains(&app_id) {
         bundle.apps.push(app_id);
     }
-    bundle
-        .purchase_times
-        .entry(app_id)
-        .or_insert_with(now_unix);
+    bundle.purchase_times.entry(app_id).or_insert_with(now_unix);
 
     let lua_path = write_catalog_lua(steam_root, app_id, &bundle)?;
 
