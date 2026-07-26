@@ -9,3 +9,6 @@ description = "Pattern TOML parse, FNV keys, symbol resolve"
 [dependencies]
 thiserror = "2"
 toml = "0.8"
+
+[lints]
+workspace = true

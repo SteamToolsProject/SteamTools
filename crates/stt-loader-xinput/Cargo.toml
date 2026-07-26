@@ -9,3 +9,6 @@ description = "xinput1_4.dll proxy that loads SteamTools.dll"
 [lib]
 crate-type = ["cdylib"]
 name = "xinput1_4"
+
+[lints]
+workspace = true

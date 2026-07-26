@@ -35,3 +35,10 @@ stt-config = { path = "crates/stt-config" }
 stt-metadata = { path = "crates/stt-metadata" }
 stt-hook = { path = "crates/stt-hook" }
 stt-steamui = { path = "crates/stt-steamui" }
+
+[workspace.lints.rust]
+nonstandard_style = { level = "deny", priority = -2 }
+unused = { level = "deny", priority = -2 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }

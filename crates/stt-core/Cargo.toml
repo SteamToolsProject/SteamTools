@@ -7,3 +7,6 @@ publish.workspace = true
 description = "Pure config/state model for SteamTools (no Windows FFI)"
 
 [dependencies]
+
+[lints]
+workspace = true
