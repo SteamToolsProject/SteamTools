@@ -14,8 +14,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// 会话 token 长度; 128 位, 盲猜不现实.
@@ -26,6 +26,28 @@ const ADD_PATH: &str = "/stt/add";
 static BRIDGE_PORT: AtomicU16 = AtomicU16::new(0);
 static BRIDGE_STARTED: OnceLock<()> = OnceLock::new();
 static BRIDGE_TOKEN: OnceLock<String> = OnceLock::new();
+/// 收到的连接数 (不论是否放行).
+static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// 被拒的连接数.
+static REJECTED: AtomicU64 = AtomicU64::new(0);
+/// 最近一次被拒的请求行 (token 已抹掉), 供诊断.
+static LAST_REJECTION: Mutex<Option<String>> = Mutex::new(None);
+
+/// 诊断计数: (收到的连接, 被拒的).
+///
+/// `连接=0` 说明请求压根没到 — 浏览器侧拦掉了 (混合内容 / 私有网络访问),
+/// 而不是我们判错. 两者的修法完全不同, 所以必须分得开.
+pub fn click_bridge_stats() -> (u64, u64) {
+    (
+        CONNECTIONS.load(Ordering::SeqCst),
+        REJECTED.load(Ordering::SeqCst),
+    )
+}
+
+/// 取走最近一次被拒的请求行 (只取一次).
+pub fn take_last_rejection() -> Option<String> {
+    LAST_REJECTION.lock().ok().and_then(|mut g| g.take())
+}
 
 /// 当前桥端口; 0 表示尚未 listen 成功.
 pub fn click_bridge_port() -> u16 {
@@ -73,6 +95,7 @@ pub fn ensure_click_bridge(mut on_app: impl FnMut(u32) + Send + 'static) {
 }
 
 fn handle_conn(stream: &mut TcpStream) -> Option<u32> {
+    CONNECTIONS.fetch_add(1, Ordering::SeqCst);
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).ok()?;
     if n == 0 {
@@ -80,6 +103,9 @@ fn handle_conn(stream: &mut TcpStream) -> Option<u32> {
     }
     let req = std::str::from_utf8(&buf[..n]).ok()?;
     let app_id = parse_add_request(req, click_bridge_token());
+    if app_id.is_none() {
+        note_rejection(req);
+    }
     // 不回 Access-Control-Allow-Origin: 我方脚本用 no-cors 发请求, 不读响应;
     // 放开只会让别人读到结果, 没有任何用处.
     let status: &[u8] = if app_id.is_some() {
@@ -89,6 +115,34 @@ fn handle_conn(stream: &mut TcpStream) -> Option<u32> {
     };
     let _ = stream.write_all(status);
     app_id
+}
+
+/// 记下被拒的请求行供诊断. 不等锁 — 这在连接处理路径上.
+fn note_rejection(req: &str) {
+    REJECTED.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut slot) = LAST_REJECTION.try_lock() {
+        *slot = Some(redact_token(first_line(req)));
+    }
+}
+
+fn first_line(req: &str) -> &str {
+    req.split_once("\r\n").map_or(req, |(line, _)| line)
+}
+
+/// 把 token 的值换成占位符 — 诊断日志不该把凭据写进磁盘.
+fn redact_token(line: &str) -> String {
+    let Some(start) = line.find("token=") else {
+        return line.chars().take(200).collect();
+    };
+    let value_at = start + "token=".len();
+    let value_len = line[value_at..]
+        .find(['&', ' '])
+        .unwrap_or(line.len() - value_at);
+    let mut out = String::with_capacity(line.len());
+    out.push_str(&line[..value_at]);
+    out.push_str("<redacted>");
+    out.push_str(&line[value_at + value_len..]);
+    out.chars().take(200).collect()
 }
 
 /// 从请求里取出 app_id; 任何一项不合规都返回 `None`.
@@ -282,5 +336,30 @@ mod tests {
     fn generated_url_is_accepted_by_the_parser() {
         let req = post(&format!("token={TOKEN}&appid=440"));
         assert_eq!(parse_add_request(&req, TOKEN), Some(440));
+    }
+
+    #[test]
+    fn rejection_log_hides_the_token() {
+        let line = format!("POST /stt/add?token={TOKEN}&appid=440 HTTP/1.1");
+        assert!(!redact_token(&line).contains(TOKEN));
+    }
+
+    #[test]
+    fn rejection_log_keeps_the_app_id() {
+        let line = format!("POST /stt/add?token={TOKEN}&appid=440 HTTP/1.1");
+        assert!(redact_token(&line).contains("appid=440"));
+    }
+
+    #[test]
+    fn rejection_log_handles_a_trailing_token() {
+        let line = format!("POST /stt/add?appid=440&token={TOKEN} HTTP/1.1");
+        let out = redact_token(&line);
+        assert!(!out.contains(TOKEN), "{out}");
+    }
+
+    #[test]
+    fn rejection_log_survives_a_missing_token() {
+        let line = "GET /stt/add?appid=440 HTTP/1.1";
+        assert_eq!(redact_token(line), line);
     }
 }

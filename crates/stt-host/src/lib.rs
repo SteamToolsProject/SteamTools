@@ -546,6 +546,7 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
     // 定期重扫目录, 好把新建的 .lua 纳入监视.
     let mut rescan_ticks: u32 = 0;
     let mut last_stats = (0u64, 0u64, 0u64, 0usize);
+    let mut last_bridge_stats = (0u64, 0u64);
     let mut cef_rearm = CefRearm {
         use_pipe,
         ..CefRearm::default()
@@ -568,6 +569,20 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
                 ),
             );
             last_stats = stats;
+        }
+
+        // 点击桥诊断: conn=0 表示 fetch 压根没到 (浏览器侧拦的), 有 conn 却全被拒
+        // 才是我们判错. 两者修法不同, 必须分得开.
+        let bridge = stt_steamui::click_bridge_stats();
+        if bridge != last_bridge_stats {
+            append_host_log(
+                steam_root,
+                &format!("click_bridge_stats conn={} rejected={}", bridge.0, bridge.1),
+            );
+            if let Some(line) = stt_steamui::take_last_rejection() {
+                append_host_log(steam_root, &format!("click_bridge_rejected {line}"));
+            }
+            last_bridge_stats = bridge;
         }
 
         let mut host_changed = false;
