@@ -19,3 +19,6 @@ mlua = { version = "0.10", features = ["lua54", "vendored"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

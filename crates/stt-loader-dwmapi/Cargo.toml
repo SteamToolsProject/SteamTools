@@ -9,3 +9,6 @@ description = "dwmapi.dll proxy that loads SteamTools.dll"
 [lib]
 crate-type = ["cdylib"]
 name = "dwmapi"
+
+[lints]
+workspace = true
