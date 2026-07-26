@@ -8,6 +8,7 @@
 mod cdp_bridge;
 mod cdp_pipe;
 mod cef_debug;
+mod config_panel;
 mod install;
 mod library_ux;
 mod store_debug;
@@ -16,12 +17,17 @@ mod store_native;
 
 pub use cdp_bridge::{
     cdp_store_inject_js, poll_store_cdp, poll_store_cdp_default, run_store_cdp_loop,
-    run_store_cdp_loop_with_js, StoreCdpPoll, CDP_STORE_INJECT_JS,
+    run_store_cdp_loop_with_js, store_teardown_js, StoreCdpPoll, CDP_STORE_INJECT_JS,
+    STORE_TEARDOWN_JS,
 };
 pub use cdp_pipe::{poll_store_pipe, run_store_pipe_loop, CdpPipeSession, PipeTarget};
 pub use cef_debug::{
     cef_debug_rewrites, cef_debug_stats, install_cef_debug_hook, pipe_armed, take_devtools_pipe,
     take_launch_snapshot, wait_cef_debug_hook, CefDebugReport, CefDebugStatus,
+};
+pub use config_panel::{
+    panel_update_js, parse_panel_tick, snapshot_json, PanelBridge, PanelState, PanelTick,
+    NAV_TICK_JS, PANEL_JS,
 };
 pub use install::{
     plan_library_ux_install, LibraryUxInstallReport, LibraryUxInstallStatus,
