@@ -65,7 +65,7 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
   }
   function enqueue(id){
     window.__SteamToolsPending.push({app_id:Number(id),reason:"store_btn",href:href,ts:Date.now()});
-    try{ fetch("http://127.0.0.1:{{PORT}}/stt/add?appid="+id,{method:"POST",mode:"no-cors"}).catch(function(){}); }catch(e){}
+    try{ fetch("http://127.0.0.1:{{PORT}}/stt/add?token={{TOKEN}}&appid="+id,{method:"POST",mode:"no-cors"}).catch(function(){}); }catch(e){}
   }
   // 用 Steam 自己的按钮类, 与「添加至购物车」同一套渐变/字号/圆角 (蓝色区分是我们的).
   var btn=document.createElement("a");
@@ -90,9 +90,11 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
 })()
 "##;
 
-/// 把 click_bridge 端口填进 CDP 短脚本.
+/// 把 click_bridge 端口与会话 token 填进 CDP 短脚本.
 pub fn cdp_store_inject_js(port: u16) -> String {
-    CDP_STORE_INJECT_JS.replace("{{PORT}}", &port.to_string())
+    CDP_STORE_INJECT_JS
+        .replace("{{PORT}}", &port.to_string())
+        .replace("{{TOKEN}}", crate::click_bridge::click_bridge_token())
 }
 
 /// 一次轮询结果.
@@ -821,6 +823,8 @@ mod tests {
         assert!(s.contains("12345"));
         assert!(s.contains("data-stt-store-btn"));
         assert!(!s.contains("{{PORT}}"));
+        // 占位符必须全部替换掉, 否则脚本会带着字面量去请求, 服务端一律拒.
+        assert!(!s.contains("{{TOKEN}}"));
         // 兜底按钮要能在购买区渲染好之后搬回购物车旁.
         assert!(s.contains("data-stt-fallback"));
         assert!(s.contains("\"moved \""));
