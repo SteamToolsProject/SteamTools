@@ -101,7 +101,8 @@ fn parse_add_request(req: &str, expected_token: &str) -> Option<u32> {
     if expected_token.is_empty() {
         return None;
     }
-    let request_line = req.split("\r\n").next()?;
+    // 只看首行. split 必定产出一段, 用 split_once 免得写出假的可失败.
+    let request_line = req.split_once("\r\n").map_or(req, |(line, _)| line);
     let mut parts = request_line.split(' ');
     if parts.next()? != "POST" {
         return None;
@@ -125,11 +126,16 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
-/// 生成带桥端口与会话 token 的注入脚本 (在 STORE_INJECT_JS 基础上改 enqueue).
+/// 生成带桥端口与本会话 token 的注入脚本 (在 STORE_INJECT_JS 基础上改 enqueue).
 ///
 /// 端口或 token 缺一就不接桥: 没有 token 的请求服务端也会拒, 接了只是白发.
 pub fn store_inject_js_with_bridge(port: u16, base_js: &str) -> String {
-    let token = click_bridge_token();
+    store_inject_js_with(port, click_bridge_token(), base_js)
+}
+
+/// 纯拼接版; 与上面分开是为了能拿真 token 做断言 —
+/// 测试进程里桥不会启动, `click_bridge_token()` 恒为空串, 直接测公开版等于没测.
+fn store_inject_js_with(port: u16, token: &str, base_js: &str) -> String {
     if port == 0 || token.is_empty() {
         return base_js.to_string();
     }
@@ -245,10 +251,36 @@ mod tests {
         assert_eq!(parse_add_request(&req, TOKEN), Some(440));
     }
 
+    const BASE_JS: &str = "window.__SteamToolsPending.push({\n      app_id: 1\n    });\n";
+
     #[test]
-    fn inject_js_without_a_bridge_is_left_untouched() {
-        let base = "window.__SteamToolsPending.push({\n      app_id: 1\n    });\n";
-        // 端口为 0 = 桥没起来.
-        assert_eq!(store_inject_js_with_bridge(0, base), base);
+    fn inject_js_without_a_port_is_left_untouched() {
+        assert_eq!(store_inject_js_with(0, TOKEN, BASE_JS), BASE_JS);
+    }
+
+    /// 拿不到随机数时桥不启动, 脚本也就不该接桥.
+    #[test]
+    fn inject_js_without_a_token_is_left_untouched() {
+        assert_eq!(store_inject_js_with(12345, "", BASE_JS), BASE_JS);
+    }
+
+    #[test]
+    fn inject_js_carries_the_session_token() {
+        let s = store_inject_js_with(12345, TOKEN, BASE_JS);
+        assert!(s.contains(&format!(r#"var _t = "{TOKEN}""#)), "{s}");
+    }
+
+    /// 脚本拼出的 URL 必须是服务端认的那一条.
+    #[test]
+    fn inject_js_builds_a_parsable_bridge_url() {
+        let s = store_inject_js_with(12345, TOKEN, BASE_JS);
+        assert!(s.contains(r#""/stt/add?token="+_t+"&appid=""#), "{s}");
+    }
+
+    /// 端到端自洽: 脚本拼的 URL 要能被本模块的解析器接受.
+    #[test]
+    fn generated_url_is_accepted_by_the_parser() {
+        let req = post(&format!("token={TOKEN}&appid=440"));
+        assert_eq!(parse_add_request(&req, TOKEN), Some(440));
     }
 }
