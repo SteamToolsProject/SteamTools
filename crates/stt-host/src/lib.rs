@@ -1,6 +1,6 @@
-//! Host DLL entry (`SteamTools.dll`).
+//! 宿主 DLL 入口 (`SteamTools.dll`).
 //!
-//! DllMain only kicks a worker thread; real init runs there.
+//! DllMain 只起工作线程, 真正初始化在线程里做.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,7 +15,7 @@ pub fn init_placeholder() -> AppRules {
     AppRules::new()
 }
 
-/// Load host toml into a new `ConfigState`.
+/// 把宿主 toml 载入新的 `ConfigState`.
 pub fn bootstrap_config(steam_root: &Path) -> stt_config::Result<ConfigState> {
     let state = ConfigState::new();
     state.load_host_from_steam_root(steam_root)?;
@@ -44,7 +44,7 @@ fn append_host_log(steam_root: &Path, line: &str) {
         });
 }
 
-/// Init: data dir, config, lua scan, host.log, then poll watchers (blocks).
+/// 初始化: 数据目录, 配置, 扫 lua, 写 host.log, 然后阻塞轮询监视.
 pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     let data = stt_platform::ensure_data_dir(steam_root)?;
     let log_path = stt_platform::host_log_path(steam_root);
@@ -189,7 +189,7 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState) {
         stt_config::lua_files_watcher(steam_root, &host, WATCH_DEBOUNCE)
     };
 
-    // Rescan directory listing periodically so newly created .lua files are tracked.
+    // 定期重扫目录, 好把新建的 .lua 纳入监视.
     let mut rescan_ticks: u32 = 0;
 
     loop {

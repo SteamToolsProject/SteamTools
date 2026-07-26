@@ -1,4 +1,4 @@
-//! Pattern TOML subset + byte signature scan.
+//! Pattern TOML 子集 + 字节特征扫描.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ pub struct PatternEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct PatternMap {
-    /// FNV-1a-32(name) → entry
+    /// FNV-1a-32(name) → 条目
     by_hash: HashMap<u32, PatternEntry>,
     component: String,
     source: Option<PathBuf>,
@@ -118,7 +118,7 @@ fn parse_hex_u64(s: &str) -> Result<u64> {
     u64::from_str_radix(s, 16).map_err(|_| MetadataError::Invalid(format!("bad hex '{s}'")))
 }
 
-/// Parsed IDA-style signature: `48 89 ?? 5C`.
+/// 解析后的 IDA 风格特征: `48 89 ?? 5C`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ByteSig {
     pub bytes: Vec<u8>,
@@ -163,9 +163,9 @@ impl ByteSig {
     }
 }
 
-/// Resolve a named symbol inside a module image buffer (RVA preferred, else sig).
+/// 在模块映像缓冲里解析命名符号 (优先 RVA, 否则特征码).
 ///
-/// Lookup key is FNV-1a-32 of `name` (same as upstream section keys).
+/// 查找键为 `name` 的 FNV-1a-32 (与上游 section 键一致).
 pub fn resolve_in_image(
     map: &PatternMap,
     name: &str,
@@ -178,7 +178,7 @@ pub fn resolve_in_image(
         if off < image.len() {
             return Some(module_base.wrapping_add(off));
         }
-        // RVA out of image: fall through to signature if present.
+        // RVA 越界: 若有特征码则继续扫.
     }
     if let Some(sig) = &entry.sig {
         let parsed = ByteSig::parse(sig).ok()?;
@@ -188,7 +188,7 @@ pub fn resolve_in_image(
     None
 }
 
-/// RVA-only resolve when the image is mapped at `module_base` (no bounds check on live memory).
+/// 仅按 RVA 解析 (映像映射在 `module_base`; 不检查实存边界).
 pub fn resolve_rva(module_base: usize, rva: u64) -> usize {
     module_base.wrapping_add(rva as usize)
 }

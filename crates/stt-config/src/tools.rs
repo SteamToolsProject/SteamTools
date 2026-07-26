@@ -1,4 +1,4 @@
-//! Tool registry skeleton (ids, defaults, no hooks yet).
+//! 工具注册表骨架 (id, 默认开关; 尚无真实 hook).
 
 use std::collections::HashMap;
 
@@ -51,7 +51,7 @@ pub struct ToolManifest {
     pub id: ToolId,
     pub name: &'static str,
     pub default_enabled: bool,
-    /// Placeholder until UI contributions land.
+    /// UI 贡献点落地前的占位.
     pub needs_client: bool,
 }
 

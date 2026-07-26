@@ -1,4 +1,4 @@
-//! Per-component pattern load + missing-symbol bookkeeping.
+//! 按组件加载 pattern, 并记录缺失符号.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ impl PatternStore {
         self.maps.get(component)
     }
 
-    /// Load from an explicit file. On failure the component is marked disabled.
+    /// 从指定文件加载; 失败则标记该组件禁用.
     pub fn load_file(&mut self, component: &str, path: &Path) -> Result<()> {
         match PatternMap::load_file(component, path) {
             Ok(map) => {
@@ -43,7 +43,7 @@ impl PatternStore {
         }
     }
 
-    /// Prefer primary path, else legacy path; missing file → module disabled (not hard error).
+    /// 优先主路径, 否则 legacy; 文件不存在 -> 模块禁用 (非硬错误).
     pub fn load_with_fallback(
         &mut self,
         component: &str,

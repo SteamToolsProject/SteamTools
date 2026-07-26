@@ -1,6 +1,5 @@
-// Export map lives here (like stt-loader-dwmapi). Written to a temp .def
-// because MSVC needs fixed ordinals / NONAME; plain /EXPORT loses them
-// against rustc's auto-generated def.
+// 导出表写在这里 (与 stt-loader-dwmapi 同思路). 生成临时 .def:
+// MSVC 需要固定 ordinal / NONAME; 纯 /EXPORT 会被 rustc 自动 def 冲掉.
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {

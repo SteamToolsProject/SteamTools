@@ -1,4 +1,4 @@
-//! Loaded module base / path helpers.
+//! 已加载模块的基址 / 路径辅助.
 
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ pub struct ModuleInfo {
     pub size: usize,
 }
 
-// SAFETY: raw base is only meaningful in this process; callers treat it as an address.
+// SAFETY: base 只在本进程有意义; 调用方当地址用.
 unsafe impl Send for ModuleInfo {}
 unsafe impl Sync for ModuleInfo {}
 
@@ -59,10 +59,10 @@ pub fn module_info(name: &str) -> Option<ModuleInfo> {
     })
 }
 
-/// Read a process-local module image into a Vec (for offline-style scans / tests).
+/// 把本进程模块映像读进 Vec (离线式扫描 / 测试用).
 ///
 /// # Safety
-/// `info.base` must point at a readable module mapping of `info.size` bytes.
+/// `info.base` 须指向可读, 长度为 `info.size` 的模块映射.
 pub unsafe fn read_module_bytes(info: ModuleInfo) -> Vec<u8> {
     let slice = std::slice::from_raw_parts(info.base as *const u8, info.size);
     slice.to_vec()

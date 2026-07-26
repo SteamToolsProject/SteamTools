@@ -1,4 +1,4 @@
-//! Lua DSL → CatalogBundle / AppRules (mlua).
+//! Lua DSL -> CatalogBundle / AppRules (mlua).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -11,9 +11,9 @@ fn lock_bundle(b: &Mutex<CatalogBundle>) -> MutexGuard<'_, CatalogBundle> {
     b.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Run a Lua config chunk and merge into `rules`.
+/// 执行一段 Lua 配置并合并进 `rules`.
 ///
-/// Compatible surface (lowercase registration):
+/// 兼容面 (小写注册):
 /// - `addappid(id [, unused, key64hex])`
 /// - `addtoken(appId, tokenDecimalString)`
 /// - `setmanifestid(depotId, gidString [, size])`
@@ -77,7 +77,7 @@ pub fn eval_lua_to_bundle(source: &str) -> Result<CatalogBundle> {
                         depot_id,
                         ManifestOverride {
                             manifest_gid: gid,
-                            // Upstream ignores size; we accept optional size for tests.
+                            // 上游忽略 size; 这里可选 size 方便测试.
                             size: size.unwrap_or(0),
                         },
                     );

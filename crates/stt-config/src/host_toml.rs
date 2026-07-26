@@ -1,4 +1,4 @@
-//! Host-level `steamtools.toml` schema.
+//! 宿主级 `steamtools.toml` 结构.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ pub struct HostConfig {
     pub manifest: ManifestSection,
     #[serde(default)]
     pub lua: LuaSection,
-    /// Tool id → enabled. Missing keys fall back to tool defaults.
+    /// 工具 id -> 是否启用; 缺省键走工具默认值.
     #[serde(default)]
     pub tools: ToolsSection,
 }
@@ -80,7 +80,7 @@ impl Default for ManifestSection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LuaSection {
-    /// Extra lua dirs; default `<Steam>/config/lua` is always appended by the loader.
+    /// 额外 lua 目录; 加载器总会再挂上默认的 `<Steam>/config/lua`.
     #[serde(default)]
     pub paths: Vec<String>,
 }
@@ -104,7 +104,7 @@ impl HostConfig {
         Self::parse_str(&text)
     }
 
-    /// Prefer `steamtools.toml`, else legacy `opensteamtool.toml`.
+    /// 优先 `steamtools.toml`, 否则读旧的 `opensteamtool.toml`.
     pub fn resolve_path(steam_root: &Path) -> Option<PathBuf> {
         let primary = steam_root.join(HOST_TOML_NAME);
         if primary.is_file() {
@@ -132,7 +132,7 @@ impl HostConfig {
             .unwrap_or_else(|| id.default_enabled())
     }
 
-    /// Merge defaults for known tools (for UI / dump).
+    /// 合并已知工具默认开关 (给 UI / 导出用).
     pub fn effective_tool_map(&self) -> HashMap<String, bool> {
         let mut map = default_tool_enabled_map();
         for (k, v) in &self.tools.enabled {

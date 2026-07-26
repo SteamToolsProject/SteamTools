@@ -1,4 +1,4 @@
-//! Host config: TOML, tool registry, catalog trait, optional Lua DSL.
+//! 宿主配置: TOML, 工具注册表, 目录 trait, 可选 Lua DSL.
 
 mod catalog;
 mod error;
@@ -36,7 +36,7 @@ use stt_core::AppRules;
 
 type EpochListener = Arc<dyn Fn(u64) + Send + Sync>;
 
-/// In-process config + rules snapshot with epoch subscription hooks.
+/// 进程内配置与 rules 快照, 支持 epoch 订阅.
 #[derive(Clone, Default)]
 pub struct ConfigState {
     inner: Arc<Mutex<ConfigStateInner>>,
@@ -63,7 +63,7 @@ impl ConfigState {
     }
 
     fn lock(&self) -> MutexGuard<'_, ConfigStateInner> {
-        // Poison means a previous holder panicked; keep going with the data.
+        // 锁被毒化说明上次持有者 panic; 继续用现有数据.
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -126,7 +126,7 @@ impl ConfigState {
         out
     }
 
-    /// Replace the whole rules snapshot (used after full lua directory reload).
+    /// 整表替换 rules (lua 目录全量重载后用).
     pub fn replace_rules(&self, rules: AppRules) {
         let (epoch, listeners) = {
             let mut g = self.lock();
@@ -144,7 +144,7 @@ impl ConfigState {
         }
     }
 
-    /// Subscribe to AppRules epoch changes. Prefer not re-entering ConfigState.
+    /// 订阅 AppRules 的 epoch 变化; 回调里尽量不要再进 ConfigState.
     pub fn subscribe_epoch(&self, listener: impl Fn(u64) + Send + Sync + 'static) {
         self.lock().listeners.push(Arc::new(listener));
     }
@@ -154,7 +154,7 @@ impl ConfigState {
         self.with_rules_mut(|rules| apply_lua_chunk(rules, source))
     }
 
-    /// Scan lua search dirs and replace in-memory rules.
+    /// 扫描 lua 目录并替换内存中的 rules.
     #[cfg(feature = "lua")]
     pub fn reload_lua_dirs(&self, steam_root: &Path) -> LuaLoadReport {
         let host = self.host();
@@ -174,12 +174,12 @@ impl ConfigState {
     }
 }
 
-/// Build a watcher for the resolved host toml path (if any).
+/// 为已解析到的宿主 toml 建监视器 (没有文件则 None).
 pub fn host_toml_watcher(steam_root: &Path, debounce: Duration) -> Option<DebouncedWatcher> {
     HostConfig::resolve_path(steam_root).map(|p| DebouncedWatcher::watch_file(p, debounce))
 }
 
-/// Discover current lua files and build a debounced watcher.
+/// 枚举当前 lua 文件并建立防抖监视.
 #[cfg(feature = "lua")]
 pub fn lua_files_watcher(
     steam_root: &Path,

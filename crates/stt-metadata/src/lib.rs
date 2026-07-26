@@ -1,4 +1,4 @@
-//! Pattern metadata: FNV keys, TOML subset, signature scan.
+//! Pattern 元数据: FNV 键, TOML 子集, 特征码扫描.
 
 mod error;
 mod fnv;
