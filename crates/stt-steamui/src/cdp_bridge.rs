@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::config_panel::{panel_step, EvalTarget, PanelBridge, PanelState, ViewRole};
 use crate::store_debug::cdp_host_port;
 use crate::store_inject::STORE_INJECT_JS;
 
@@ -95,6 +96,24 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
 /// CDP 短脚本 (已无占位符待填).
 pub fn cdp_store_inject_js() -> String {
     CDP_STORE_INJECT_JS.to_owned()
+}
+
+/// 工具关掉时用它替换注入脚本: 把已经挂上的按钮摘掉.
+///
+/// 返回 `removed` 只会有一轮, 之后一直是 `off` — 与 `already` 一样不算注入,
+/// 免得每轮刷一行日志.
+pub const STORE_TEARDOWN_JS: &str = r##"
+(function(){
+  var b=document.querySelectorAll("[data-stt-store-btn]");
+  if(!b.length) return "off";
+  for(var i=0;i<b.length;i++){ if(b[i].remove) b[i].remove(); }
+  return "removed";
+})()
+"##;
+
+/// 工具关掉时该往商店页发的脚本.
+pub fn store_teardown_js() -> String {
+    STORE_TEARDOWN_JS.to_owned()
 }
 
 /// 一次轮询结果.
@@ -215,12 +234,13 @@ pub fn poll_store_cdp(host_port: &str, inject_js: &str) -> StoreCdpPoll {
             Ok(res) => {
                 out.store_pages = out.store_pages.max(1);
                 // 只有真的挂上才算一次注入; 按钮已在时 (already) 不刷日志.
-                if res.mounted {
+                if res.removed {
+                    out.notes
+                        .push(format!("cdp_teardown ok url={}", clip(&url, 96)));
+                } else if res.mounted {
                     out.injected += 1;
-                    out.notes.push(format!(
-                        "cdp_injected ok url={}",
-                        url.chars().take(96).collect::<String>()
-                    ));
+                    out.notes
+                        .push(format!("cdp_injected ok url={}", clip(&url, 96)));
                 }
                 for id in res.pending {
                     if !out.pending_app_ids.contains(&id) {
@@ -259,27 +279,35 @@ pub fn poll_store_cdp_default() -> StoreCdpPoll {
 /// 后台循环: 注入按钮, 并把点击排下的 app_id 回调出去.
 pub fn run_store_cdp_loop(
     poll_every: Duration,
-    on_app: impl FnMut(u32),
-    on_log: impl FnMut(String),
+    on_app: &mut dyn FnMut(u32),
+    on_log: &mut dyn FnMut(String),
 ) {
-    run_store_cdp_loop_with_js(poll_every, || STORE_INJECT_JS.to_string(), on_app, on_log);
+    run_store_cdp_loop_with_js(
+        poll_every,
+        &mut || STORE_INJECT_JS.to_string(),
+        on_app,
+        on_log,
+        None,
+    );
 }
 
-/// 同上, 但每次轮询用 `make_js()` 现生成脚本.
+/// 同上, 但每次轮询用 `make_js()` 现生成脚本, 并可捎带配置页.
 pub fn run_store_cdp_loop_with_js(
     poll_every: Duration,
-    mut make_js: impl FnMut() -> String,
-    mut on_app: impl FnMut(u32),
-    mut on_log: impl FnMut(String),
+    make_js: &mut dyn FnMut() -> String,
+    on_app: &mut dyn FnMut(u32),
+    on_log: &mut dyn FnMut(String),
+    mut panel: Option<&mut dyn PanelBridge>,
 ) {
+    let mut panel_state = PanelState::default();
     let mut last_down_log = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
     let mut last_up = false;
     let mut last_pages: usize = 0;
-    let mut last_zero_log = Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(Instant::now);
+    // "一个商店页都没摸到" 每轮都会复现: 只在刚进入这个状态时记一次.
+    // 按时间节流不行 — 没开商店页是常态, 定时重记就是每小时几百行长日志.
+    let mut zero_logged = false;
     loop {
         let js = make_js();
         // 单次轮询 panic 不能弄死整条桥: 之前 ws 握手 panic 让线程静默退出,
@@ -314,26 +342,217 @@ pub fn run_store_cdp_loop_with_js(
                 last_up = true;
                 last_pages = r.store_pages;
             }
+            if r.store_pages > 0 {
+                zero_logged = false;
+            }
             for note in &r.notes {
                 if note.starts_with("cdp_page_err")
                     || note.starts_with("cdp_injected")
+                    || note.starts_with("cdp_teardown")
                     || note.starts_with("cdp_json_err")
                     || note.starts_with("cdp_store_hit")
                 {
                     on_log(format!("catalog_add={note}"));
-                } else if note.starts_with("cdp_store_pages=0")
-                    && last_zero_log.elapsed() >= Duration::from_secs(10)
-                {
+                } else if note.starts_with("cdp_store_pages=0") && !zero_logged {
                     on_log(format!("catalog_add={note}"));
-                    last_zero_log = Instant::now();
+                    zero_logged = true;
                 }
             }
             for app_id in r.pending_app_ids {
                 on_app(app_id);
             }
         }
+        // 配置页搭同一趟车; 它出问题也不能连累入库那条路.
+        if r.cdp_up {
+            if let Some(p) = panel.as_mut() {
+                let on = p.enabled();
+                if panel_state.should_run(on) {
+                    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        poll_panel_cdp(&cdp_host_port(), &mut **p, &mut panel_state, on, on_log);
+                    }));
+                    if ok.is_err() {
+                        on_log("config_ui=poll_panic (bridge kept alive)".into());
+                    }
+                }
+            }
+        }
         std::thread::sleep(poll_every);
     }
+}
+
+/// 配置页一轮 (端口通道): 找客户端窗口, 补挂入口, 需要时开面板并推快照.
+pub(crate) fn poll_panel_cdp(
+    host_port: &str,
+    bridge: &mut dyn PanelBridge,
+    state: &mut PanelState,
+    enabled: bool,
+    on_log: &mut dyn FnMut(String),
+) {
+    // 列不出来说明通道这轮不通; 商店那条路已经在报了, 这里不重复刷.
+    let Ok(targets) = list_page_targets(host_port) else {
+        return;
+    };
+    state.begin_round();
+    for t in targets {
+        if !wants_panel_tick(&t.url, &t.title) {
+            continue;
+        }
+        let mut ws = match WsClient::connect(&t.ws, Duration::from_millis(1500)) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        let role = ViewRole {
+            enabled,
+            hosts_entry: hosts_nav_entry(&t.url, &t.title),
+        };
+        match panel_step(&t.key, &mut ws, bridge, state, role) {
+            Ok(out) => log_panel_step(&out, &t.title, on_log),
+            Err(e) => on_log(format!(
+                "config_ui=page_err title={} {e}",
+                clip(&t.title, 32)
+            )),
+        }
+    }
+}
+
+/// 只有状态变了才写日志: 600ms 一轮, 常态一律闭嘴.
+pub(crate) fn log_panel_step(
+    out: &crate::config_panel::PanelStepOutcome,
+    title: &str,
+    on_log: &mut dyn FnMut(String),
+) {
+    if out.tick.just_mounted() || out.tick.state == "removed" {
+        on_log(format!(
+            "config_ui=entry {} title={}",
+            out.tick.state,
+            clip(title, 32)
+        ));
+    }
+    if out.asked {
+        on_log(format!(
+            "config_ui=requested by={} via={}",
+            clip(title, 32),
+            out.asked_why
+        ));
+    }
+    if out.opened {
+        on_log("config_ui=panel opened".into());
+    }
+    if out.tick.dropped > 0 {
+        on_log(format!("config_ui=dropped_intents n={}", out.tick.dropped));
+    }
+}
+
+/// 目标列表里的一页.
+pub(crate) struct PageTarget {
+    pub url: String,
+    pub title: String,
+    pub ws: String,
+    /// 跨轮次认页面用的键.
+    pub key: String,
+}
+
+fn list_page_targets(host_port: &str) -> Result<Vec<PageTarget>, String> {
+    let body = http_get(&format!("http://{host_port}/json"), Duration::from_secs(2))?;
+    let body = body.trim_start_matches('\u{feff}').trim();
+    let targets: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let arr = targets
+        .as_array()
+        .ok_or_else(|| "cdp_json=not_array".to_string())?;
+    Ok(arr
+        .iter()
+        .filter_map(|t| {
+            let kind = t.get("type").and_then(Value::as_str).unwrap_or("page");
+            if kind != "page" && kind != "iframe" {
+                return None;
+            }
+            let id = t.get("id").and_then(Value::as_str).unwrap_or("");
+            let ws = t
+                .get("webSocketDebuggerUrl")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    (!id.is_empty()).then(|| format!("ws://{host_port}/devtools/page/{id}"))
+                })?;
+            Some(PageTarget {
+                url: t
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                title: t
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                key: if id.is_empty() {
+                    ws.clone()
+                } else {
+                    id.to_owned()
+                },
+                ws,
+            })
+        })
+        .collect())
+}
+
+/// 按字符截断; 按字节切可能落在 UTF-8 中间.
+pub(crate) fn clip(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// 一个调试目标该怎么处理.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetKind {
+    /// 商店页: 挂入库按钮.
+    Store,
+    /// 客户端界面窗口: 挂配置入口.
+    ClientUi,
+    /// 不碰.
+    Skip,
+}
+
+/// 只看 url 与标题分流; 具体页面对不对由注入脚本自己再判一次.
+pub(crate) fn classify_target(url: &str, title: &str) -> TargetKind {
+    if url.contains("store.steampowered.com") || url.contains("steamcommunity.com") {
+        return if is_store_app_url(url) {
+            TargetKind::Store
+        } else {
+            TargetKind::Skip
+        };
+    }
+    // 共享 JS 上下文没有可见 DOM; 弹出菜单也不该挂东西.
+    if title == "SharedJSContext" || title.contains("Menu") || title.contains("Supernav") {
+        return TargetKind::Skip;
+    }
+    // 客户端窗口的文档是 about:blank?createflags=... 或 data:text/html 的空壳,
+    // 界面由共享上下文渲染进去.
+    if url.starts_with("about:blank")
+        || url.starts_with("data:text/html")
+        || url.contains("steamloopback.host")
+    {
+        return TargetKind::ClientUi;
+    }
+    TargetKind::Skip
+}
+
+/// 配置页这一轮要问哪些文档.
+///
+/// 客户端外壳之外还要带上商店/社区那些网页视图: 它们是独立的 CEF 视图, 被合成在
+/// 客户端文档之上, 面板画在下面那层会被整块盖住. 具体画在哪一个由
+/// `PanelState::owner` 按"可见且够大"挑.
+pub(crate) fn wants_panel_tick(url: &str, title: &str) -> bool {
+    if title == "SharedJSContext" || title.contains("Menu") || title.contains("Supernav") {
+        return false;
+    }
+    classify_target(url, title) == TargetKind::ClientUi
+        || url.contains("store.steampowered.com")
+        || url.contains("steamcommunity.com")
+}
+
+/// 这个文档里要不要找导航行挂入口 —— 只有客户端外壳里有那一行.
+pub(crate) fn hosts_nav_entry(url: &str, title: &str) -> bool {
+    classify_target(url, title) == TargetKind::ClientUi
 }
 
 pub(crate) fn is_store_app_url(url: &str) -> bool {
@@ -349,6 +568,8 @@ pub(crate) fn is_store_app_url(url: &str) -> bool {
 struct InjectOutcome {
     /// 本轮真的挂上/搬动了按钮 (脚本返回 already 时为 false).
     mounted: bool,
+    /// 本轮是把按钮摘了 (工具被关掉).
+    removed: bool,
     pending: Vec<u32>,
 }
 
@@ -367,13 +588,27 @@ fn session_inject_and_drain(ws_url: &str, inject_js: &str) -> Result<InjectOutco
     let res = ws
         .eval_value(inject_js)
         .map_err(|e| format!("eval inject: {e}"))?;
-    // 短脚本返回 near-cart/moved/fixed/already/no-appid; 大脚本无返回值 (Null).
-    let mounted = res.as_str().is_none_or(|s| !s.starts_with("already"));
+    let mounted = is_mount_news(&res);
+    let removed = res.as_str() == Some("removed");
     let pending = match ws.eval_value(DRAIN_JS) {
         Ok(pending) => parse_pending_app_ids(&pending),
         Err(_) => Vec::new(),
     };
-    Ok(InjectOutcome { mounted, pending })
+    Ok(InjectOutcome {
+        mounted,
+        removed,
+        pending,
+    })
+}
+
+/// 注入脚本的返回值里, 哪些算"这轮真动了页面".
+///
+/// 挂上/搬动/摘掉算; `already` / `off` / `no-appid` 是常态, 记进日志就是刷屏.
+/// 大脚本没有返回值 (Null), 按动了算.
+pub(crate) fn is_mount_news(res: &Value) -> bool {
+    res.as_str().is_none_or(|s| {
+        !(s.starts_with("already") || s.starts_with("off") || s.starts_with("no-appid"))
+    })
 }
 
 pub(crate) fn parse_pending_app_ids(v: &Value) -> Vec<u32> {
@@ -640,12 +875,16 @@ impl WsClient {
     fn eval_value(&mut self, expression: &str) -> Result<Value, String> {
         // awaitPromise 必须 false: 注入脚本不是 Promise, true 会在 CEF 上一直挂起,
         // 导致轮询卡死, host.log 永远停在 store_pages=0.
+        //
+        // userGesture: 没有它 `window.open` 会被当成非用户触发的弹窗直接拦掉
+        // (实测 host.log 报 overlay:blocked). 配置页要开成真窗口就得靠这个.
         let result = self.call(
             "Runtime.evaluate",
             Some(json!({
                 "expression": expression,
                 "returnByValue": true,
                 "awaitPromise": false,
+                "userGesture": true,
             })),
         )?;
         let r = result.get("result").cloned().unwrap_or(Value::Null);
@@ -760,6 +999,12 @@ impl WsClient {
     }
 }
 
+impl EvalTarget for WsClient {
+    fn eval(&mut self, js: &str) -> Result<Value, String> {
+        self.eval_value(js)
+    }
+}
+
 /// ws key 计数器: 同一秒内多次握手也不重复.
 static WS_KEY_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -804,6 +1049,69 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 客户端窗口的 url 就是这几种空壳; 认错了配置页就没地方挂.
+    #[test]
+    fn client_windows_are_told_apart_from_web_pages() {
+        assert_eq!(
+            classify_target("about:blank?createflags=274&minwidth=1010", "Steam"),
+            TargetKind::ClientUi
+        );
+        assert_eq!(
+            classify_target(
+                "data:text/html,<body></body><!--tracking:x:/library/home-->",
+                ""
+            ),
+            TargetKind::ClientUi
+        );
+        assert_eq!(
+            classify_target("https://store.steampowered.com/app/570/", "Dota"),
+            TargetKind::Store
+        );
+    }
+
+    /// 共享上下文没有可见 DOM, 弹出菜单也不该挂东西.
+    #[test]
+    fn shared_context_and_popups_are_skipped() {
+        assert_eq!(
+            classify_target("https://steamloopback.host/index.html", "SharedJSContext"),
+            TargetKind::Skip
+        );
+        assert_eq!(
+            classify_target("about:blank", "Supernav Menu"),
+            TargetKind::Skip
+        );
+        assert_eq!(
+            classify_target("https://steamcommunity.com/app/570", "Community"),
+            TargetKind::Skip
+        );
+    }
+
+    /// 没有 userGesture, CEF 会把 `window.open` 当成广告弹窗拦掉 —— 配置页就退回
+    /// 页内浮层, 又会被商店那层 CEF 视图盖住 (实测 overlay:blocked).
+    #[test]
+    fn evaluate_carries_a_user_gesture() {
+        let js = include_str!("cdp_bridge.rs");
+        assert_eq!(js.matches("\"userGesture\": true").count(), 1);
+    }
+
+    /// already/off 是常态, 记进日志就是每 600ms 刷一行.
+    #[test]
+    fn only_real_changes_count_as_news() {
+        assert!(is_mount_news(&json!("near-cart 570")));
+        assert!(is_mount_news(&json!("moved 570")));
+        assert!(is_mount_news(&json!("removed")));
+        assert!(is_mount_news(&Value::Null));
+        assert!(!is_mount_news(&json!("already")));
+        assert!(!is_mount_news(&json!("off")));
+        assert!(!is_mount_news(&json!("no-appid")));
+    }
+
+    #[test]
+    fn teardown_script_targets_our_button_only() {
+        assert!(STORE_TEARDOWN_JS.contains("data-stt-store-btn"));
+        assert!(STORE_TEARDOWN_JS.contains("\"off\""));
+    }
 
     #[test]
     fn store_url_filter() {
