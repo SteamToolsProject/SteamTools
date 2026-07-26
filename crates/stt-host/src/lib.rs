@@ -11,8 +11,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use stt_config::{
-    add_to_library, apply_intent, ConfigIntent, ConfigSnapshot, ConfigState, HostConfig,
-    MockCatalogProvider, ToolId,
+    add_to_library, apply_intent, remove_from_library, ConfigIntent, ConfigSnapshot, ConfigState,
+    HostConfig, MockCatalogProvider, ToolId,
 };
 use stt_core::AppRules;
 
@@ -153,7 +153,7 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
 
     log_module_hashes(steam_root);
     let patterns = log_pattern_probe(steam_root);
-    log_library_ux_plan(steam_root, &state, &patterns);
+    let library_ux = log_library_ux_plan(steam_root, &state, &patterns);
     match stt_hook::run_harmless_self_test() {
         Ok(n) => append_host_log(steam_root, &format!("hook_self_test=ok calls={n}")),
         Err(e) => append_host_log(steam_root, &format!("hook_self_test=err {e}")),
@@ -193,7 +193,14 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
              it keeps 8080 open for every Steam session)",
         );
     }
-    spawn_store_cdp_bridge(steam_root, &state, use_pipe);
+    let details = tool_details(
+        &state,
+        &library_ux,
+        &native,
+        use_pipe,
+        cef.caught_webhelper(),
+    );
+    spawn_store_cdp_bridge(steam_root, &state, use_pipe, details);
     append_host_log(
         steam_root,
         &format!(
@@ -233,6 +240,39 @@ struct HostPanel {
     note: String,
     /// 勘察样本只留第一份.
     recon_done: bool,
+    /// 各工具的运行状态 (init 时算一次), 给工具中心显示.
+    details: stt_config::ToolDetails,
+    /// 受管 app 的缓存与它对应的 rules epoch —— 算一次要扫目录, 别每轮来.
+    managed: Vec<u32>,
+    managed_epoch: Option<u64>,
+}
+
+impl HostPanel {
+    /// 受管列表; rules 没变就用上一次的.
+    fn managed_cached(&mut self) -> &[u32] {
+        let epoch = self.state.rules_epoch();
+        if self.managed_epoch != Some(epoch) {
+            self.managed = stt_config::managed_apps(&self.state, &self.steam_root);
+            self.managed_epoch = Some(epoch);
+        }
+        &self.managed
+    }
+
+    /// 针对某个 app 的意图: 刷新 = 重新拉一次清单覆盖 lua; 移除 = 删掉那份 lua.
+    fn apply_app_intent(&self, intent: &ConfigIntent, app_id: u32) -> stt_config::Result<String> {
+        match intent {
+            ConfigIntent::RefreshApp(_) => {
+                let provider = MockCatalogProvider::new().with_auto_generate(true);
+                let out = add_to_library(&self.state, &self.steam_root, &provider, app_id)?;
+                Ok(format!("已刷新 {app_id} (owned={})", out.owned_count))
+            }
+            ConfigIntent::RemoveApp(_) => {
+                let out = remove_from_library(&self.state, &self.steam_root, app_id)?;
+                Ok(format!("已移除 {app_id} (owned={})", out.owned_count))
+            }
+            _ => Err(stt_config::ConfigError::Invalid("不是 app 意图".into())),
+        }
+    }
 }
 
 impl stt_steamui::PanelBridge for HostPanel {
@@ -241,17 +281,31 @@ impl stt_steamui::PanelBridge for HostPanel {
     }
 
     fn snapshot(&mut self) -> Option<ConfigSnapshot> {
-        Some(ConfigSnapshot::from_state(
+        let facts = stt_config::HostFacts {
+            tool_details: self.details.clone(),
+            managed: self.managed_cached().to_vec(),
+        };
+        Some(ConfigSnapshot::new(
             &self.state,
             &self.steam_root,
             &self.channel,
             &self.note,
+            &facts,
         ))
+    }
+
+    fn managed_apps(&mut self) -> Vec<u32> {
+        self.managed_cached().to_vec()
     }
 
     fn on_intents(&mut self, intents: &[ConfigIntent]) {
         for intent in intents {
-            match apply_intent(&self.state, &self.steam_root, intent) {
+            // 针对某个 app 的意图不写 toml, 要 provider, 只有宿主这儿有.
+            let done = match intent.app_target() {
+                Some(app_id) => self.apply_app_intent(intent, app_id),
+                None => apply_intent(&self.state, &self.steam_root, intent),
+            };
+            match done {
                 Ok(done) => {
                     append_host_log(&self.steam_root, &format!("config_ui=saved {done}"));
                     self.note = format!("已保存 {done}");
@@ -281,7 +335,12 @@ impl stt_steamui::PanelBridge for HostPanel {
 ///
 /// `use_pipe` 时先试无端口的管道通道; 它明确走不通才落标记文件并回退到端口,
 /// 这样最多一个会话入库不可用, 不会永久卡死.
-fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
+fn spawn_store_cdp_bridge(
+    steam_root: &Path,
+    state: &ConfigState,
+    use_pipe: bool,
+    details: stt_config::ToolDetails,
+) {
     let root = steam_root.to_path_buf();
     let state = state.clone();
     let _ = std::thread::Builder::new()
@@ -294,6 +353,9 @@ fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState, use_pipe: bool
                 channel: channel_label(use_pipe),
                 note: String::new(),
                 recon_done: false,
+                details,
+                managed: Vec::new(),
+                managed_epoch: None,
             };
             // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
             // 工具关掉就换成摘按钮的脚本, 让开关当场看得见.
@@ -431,7 +493,7 @@ fn log_library_ux_plan(
     steam_root: &Path,
     state: &ConfigState,
     patterns: &stt_metadata::PatternStore,
-) {
+) -> stt_steamui::LibraryUxInstallReport {
     let tools = state.tools();
     let report = stt_steamui::plan_library_ux_install(&tools, patterns, "steamui");
     append_host_log(steam_root, &report.summary_line());
@@ -442,6 +504,57 @@ fn log_library_ux_plan(
             ux.on_rules_app_present(app_id);
         }
     });
+    report
+}
+
+/// 各工具此刻的运行状态 —— 开着不等于跑起来了, 这些原来只进 host.log.
+fn tool_details(
+    state: &ConfigState,
+    library_ux: &stt_steamui::LibraryUxInstallReport,
+    native: &stt_steamui::StoreNativeReport,
+    use_pipe: bool,
+    caught: bool,
+) -> stt_config::ToolDetails {
+    let tools = state.tools();
+    let mut d = stt_config::ToolDetails::new();
+    d.insert(
+        ToolId::CatalogAdd.as_str(),
+        if !tools.is_enabled(ToolId::CatalogAdd) {
+            "已关闭, 商店页不挂入库按钮".to_owned()
+        } else if caught {
+            format!("经 {} 注入商店页", channel_label(use_pipe))
+        } else {
+            "调试通道没截到 steamwebhelper, 商店按钮挂不上".to_owned()
+        },
+    );
+    d.insert(
+        ToolId::LibraryUx.as_str(),
+        match library_ux.status {
+            stt_steamui::LibraryUxInstallStatus::Disabled => "已关闭".to_owned(),
+            stt_steamui::LibraryUxInstallStatus::PatternMissing => {
+                "缺 steamui pattern, 本层已降级".to_owned()
+            }
+            stt_steamui::LibraryUxInstallStatus::SymbolsMissing => {
+                format!("缺符号: {}", library_ux.missing.join(","))
+            }
+            stt_steamui::LibraryUxInstallStatus::LogicOnly => {
+                format!(
+                    "状态机就绪 ({} 个符号), 业务 detour 未挂",
+                    library_ux.resolved.len()
+                )
+            }
+            stt_steamui::LibraryUxInstallStatus::HooksAttached => "detour 已挂上".to_owned(),
+        },
+    );
+    d.insert(
+        ToolId::ConfigUi.as_str(),
+        format!("就是这个界面, 经 {}", channel_label(use_pipe)),
+    );
+    d.insert(
+        ToolId::StoreAccel.as_str(),
+        format!("尚未实现; 原生注入路径: {:?}", native.status),
+    );
+    d
 }
 
 /// 处理 steamtools/inbox/*.txt: 每行一个 app_id, 走 Mock AddToLibrary.
