@@ -78,7 +78,10 @@ pub fn plan_library_ux_install(
             return LibraryUxInstallReport {
                 status: LibraryUxInstallStatus::PatternMissing,
                 resolved: Vec::new(),
-                missing: LIBRARY_UX_SYMBOLS.iter().map(|s| (*s).to_string()).collect(),
+                missing: LIBRARY_UX_SYMBOLS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             }
         }
     };

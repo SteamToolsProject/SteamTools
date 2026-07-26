@@ -334,12 +334,7 @@ pub unsafe fn call_original_execute_js(this: *mut c_void, script: *const u8) -> 
     f(this, script)
 }
 
-unsafe fn call_original_ctor(
-    this: *mut c_void,
-    a2: *mut c_void,
-    a3: i32,
-    a4: i8,
-) -> *mut c_void {
+unsafe fn call_original_ctor(this: *mut c_void, a2: *mut c_void, a3: i32, a4: i8) -> *mut c_void {
     let p = ORIG_CTOR.load(Ordering::SeqCst);
     if p.is_null() {
         return this;

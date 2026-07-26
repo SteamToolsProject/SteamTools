@@ -131,9 +131,6 @@ mod tests {
         host.lua.paths.push(extra.to_string_lossy().into_owned());
         let (rules, report) = load_lua_directories(root.path(), &host);
         assert_eq!(report.files_ok, 2);
-        assert_eq!(
-            rules.manifest_override(10).map(|m| m.manifest_gid),
-            Some(2)
-        );
+        assert_eq!(rules.manifest_override(10).map(|m| m.manifest_gid), Some(2));
     }
 }

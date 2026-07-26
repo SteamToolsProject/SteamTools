@@ -10,11 +10,7 @@ pub enum ToolId {
 }
 
 impl ToolId {
-    pub const ALL: &'static [ToolId] = &[
-        ToolId::CatalogAdd,
-        ToolId::LibraryUx,
-        ToolId::StoreAccel,
-    ];
+    pub const ALL: &'static [ToolId] = &[ToolId::CatalogAdd, ToolId::LibraryUx, ToolId::StoreAccel];
 
     pub fn as_str(self) -> &'static str {
         match self {
