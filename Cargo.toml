@@ -5,6 +5,7 @@ members = [
     "crates/stt-platform",
     "crates/stt-config",
     "crates/stt-metadata",
+    "crates/stt-hook",
     "crates/stt-host",
     "crates/stt-loader-dwmapi",
     "crates/stt-loader-xinput",
@@ -14,6 +15,7 @@ default-members = [
     "crates/stt-platform",
     "crates/stt-config",
     "crates/stt-metadata",
+    "crates/stt-hook",
     "crates/stt-host",
 ]
 
@@ -29,3 +31,4 @@ stt-core = { path = "crates/stt-core" }
 stt-platform = { path = "crates/stt-platform" }
 stt-config = { path = "crates/stt-config" }
 stt-metadata = { path = "crates/stt-metadata" }
+stt-hook = { path = "crates/stt-hook" }
