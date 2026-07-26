@@ -72,6 +72,45 @@ pub fn host_log_path(steam_root: &Path) -> PathBuf {
     data_dir(steam_root).join("host.log")
 }
 
+/// 入库意图收件箱: 每行一个 app_id (十进制).
+pub fn inbox_dir(steam_root: &Path) -> PathBuf {
+    data_dir(steam_root).join("inbox")
+}
+
+pub fn ensure_inbox_dir(steam_root: &Path) -> std::io::Result<PathBuf> {
+    let dir = inbox_dir(steam_root);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// 商店页注入脚本路径 (CEF/CDP 或后续原生注入共用).
+pub fn store_inject_js_path(steam_root: &Path) -> PathBuf {
+    data_dir(steam_root).join("store_inject.js")
+}
+
+pub fn write_store_inject_js(steam_root: &Path, source: &str) -> std::io::Result<PathBuf> {
+    let _ = ensure_data_dir(steam_root)?;
+    let path = store_inject_js_path(steam_root);
+    std::fs::write(&path, source)?;
+    Ok(path)
+}
+
+/// CEF 远程调试开关文件 (Steam 根目录, 空文件即可).
+/// loader 会在 steam.exe 启动时自动创建, 用户无需手开.
+pub fn cef_remote_debugging_flag_path(steam_root: &Path) -> PathBuf {
+    steam_root.join(".cef-enable-remote-debugging")
+}
+
+/// 幂等创建开关文件; 返回是否新创建.
+pub fn ensure_cef_remote_debugging_flag(steam_root: &Path) -> std::io::Result<bool> {
+    let path = cef_remote_debugging_flag_path(steam_root);
+    if path.is_file() {
+        return Ok(false);
+    }
+    std::fs::File::create(&path)?;
+    Ok(true)
+}
+
 /// # Safety
 /// `hinst` 为 DllMain 传入的模块句柄.
 pub unsafe fn disable_thread_library_calls_raw(hinst: *mut core::ffi::c_void) {
