@@ -4,6 +4,8 @@ mod catalog;
 mod catalog_add;
 mod error;
 mod host_toml;
+mod intent;
+mod snapshot;
 mod tools;
 mod watch;
 
@@ -21,6 +23,11 @@ pub use host_toml::{
     HostConfig, LogSection, LuaSection, ManifestSection, ToolsSection, HOST_TOML_NAME,
     LEGACY_TOML_NAME,
 };
+pub use intent::{
+    apply_intent, host_toml_write_path, save_host_change, ConfigIntent, LOG_LEVELS,
+    MANIFEST_SOURCES,
+};
+pub use snapshot::{ConfigSnapshot, ToolView};
 pub use tools::{builtin_manifests, ToolId, ToolManifest, ToolRegistry};
 pub use watch::DebouncedWatcher;
 
