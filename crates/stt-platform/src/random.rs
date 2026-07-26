@@ -29,12 +29,21 @@ pub fn random_hex_token(bytes: usize) -> Option<String> {
     if !random_bytes(&mut raw) {
         return None;
     }
-    let mut out = String::with_capacity(bytes * 2);
-    for b in raw {
-        // 定长两位, 免得前导零被吃掉让 token 变短.
-        out.push_str(&format!("{b:02x}"));
+    Some(to_hex(&raw))
+}
+
+/// 小写十六进制, 每字节定长两位.
+///
+/// 定长很关键: 前导零被吃掉会让 token 变短, 熵也就跟着少了.
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // write! 直接写进 out, 不像 format! 每字节再分配一个 String.
+        let _ = write!(out, "{b:02x}");
     }
-    Some(out)
+    out
 }
 
 /// 定长比较, 不因首个不同字节的位置提前返回.
@@ -60,6 +69,17 @@ mod tests {
     fn token_has_two_hex_chars_per_byte() {
         let t = random_hex_token(16).expect("system rng");
         assert_eq!(t.len(), 32);
+    }
+
+    /// 前导零若被吃掉, token 会变短、熵会变少 — 这里用定值把它钉死.
+    #[test]
+    fn hex_keeps_leading_zeros() {
+        assert_eq!(to_hex(&[0x00, 0x0f, 0xff]), "000fff");
+    }
+
+    #[test]
+    fn hex_of_nothing_is_empty() {
+        assert_eq!(to_hex(&[]), "");
     }
 
     #[test]
