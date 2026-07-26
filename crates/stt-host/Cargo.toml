@@ -11,12 +11,10 @@ description = "SteamTools host cdylib (SteamTools.dll)"
 crate-type = ["cdylib", "rlib"]
 name = "SteamTools"
 
-[lints.rust]
-non_snake_case = "allow"
-
 [dependencies]
 stt-core = { workspace = true }
 stt-platform = { workspace = true }
 stt-config = { workspace = true }
 stt-metadata = { workspace = true }
 stt-hook = { workspace = true }
+stt-steamui = { workspace = true }
