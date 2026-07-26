@@ -16,6 +16,23 @@ pub struct ToolView {
     pub enabled: bool,
     /// 占位工具: 开关能拨, 但还没有实现.
     pub placeholder: bool,
+    /// 这个工具此刻在干什么 / 为什么没干成.
+    ///
+    /// 开着不等于跑起来了: 缺 pattern 会降级, 通道没起来会哑火. 这些原来只进
+    /// host.log, 用户在界面上看不出区别 —— 工具中心就是为了把它摆出来.
+    pub detail: String,
+}
+
+/// 宿主每轮给配置页的工具运行状态 (id → 一句话).
+pub type ToolDetails = std::collections::HashMap<&'static str, String>;
+
+/// 只有宿主知道 (或算起来贵, 不该每轮重算) 的那部分.
+#[derive(Debug, Default, Clone)]
+pub struct HostFacts {
+    /// 各工具此刻在干什么 / 为什么没干成.
+    pub tool_details: ToolDetails,
+    /// 我们自己入库的 app; 由宿主按 rules epoch 缓存, 见 [`managed_apps`].
+    pub managed: Vec<u32>,
 }
 
 /// 配置页一次渲染需要的全部数据.
@@ -36,10 +53,30 @@ pub struct ConfigSnapshot {
     pub channel: String,
     /// 最近一次保存的结果, 给页面显示.
     pub note: String,
+    /// 我们自己入库的 app (有 `stt_{id}.lua` 那些), 升序.
+    ///
+    /// 库里右键要用它判断"这一项是不是我们加的" —— 不是我们加的就别抢 Steam 的菜单.
+    pub managed: Vec<u32>,
 }
 
 impl ConfigSnapshot {
+    /// 不带宿主补给的快照 (测试用; 受管列表就地扫一次目录).
     pub fn from_state(state: &ConfigState, steam_root: &Path, channel: &str, note: &str) -> Self {
+        let facts = HostFacts {
+            managed: managed_apps(state, steam_root),
+            ..HostFacts::default()
+        };
+        Self::new(state, steam_root, channel, note, &facts)
+    }
+
+    /// 带上宿主补给的那部分.
+    pub fn new(
+        state: &ConfigState,
+        steam_root: &Path,
+        channel: &str,
+        note: &str,
+        facts: &HostFacts,
+    ) -> Self {
         let host = state.host();
         let tools = state.tools();
         Self {
@@ -51,6 +88,11 @@ impl ConfigSnapshot {
                     name: id.display_name(),
                     enabled: tools.is_enabled(*id),
                     placeholder: id.is_placeholder(),
+                    detail: facts
+                        .tool_details
+                        .get(id.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
                 })
                 .collect(),
             // `host` 已经是 `state.host()` 给的副本, 直接搬走字段, 别再克隆一遍.
@@ -66,14 +108,87 @@ impl ConfigSnapshot {
             epoch: state.rules_epoch(),
             channel: channel.to_owned(),
             note: note.to_owned(),
+            managed: facts.managed.clone(),
         }
     }
+}
+
+/// 我们自己入库的 app: 目录里有 `stt_{id}.lua` 的那些.
+///
+/// 按文件名认而不是按 `AppRules` 里的 owned —— owned 是所有 lua 合并出来的,
+/// 里面混着用户手写的, 那些不该由我们的菜单去"移除".
+///
+/// 要扫一次目录, 所以调用方应按 `rules_epoch` 缓存, 别每轮都来.
+pub fn managed_apps(state: &ConfigState, steam_root: &Path) -> Vec<u32> {
+    let dir = ConfigState::default_lua_dir(steam_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let id: u32 = name
+                .strip_prefix("stt_")?
+                .strip_suffix(".lua")?
+                .parse()
+                .ok()?;
+            // 文件在但规则里没有 = 那份 lua 有问题, 别当成管着.
+            state.with_rules(|r| r.is_owned(id)).then_some(id)
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host_toml::HostConfig;
+
+    /// 只认我们自己写的 `stt_*.lua`; 用户手写的不归菜单管.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn managed_lists_only_our_own_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = ConfigState::default_lua_dir(root.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stt_730.lua"), "addappid(730)\n").unwrap();
+        std::fs::write(dir.join("mine.lua"), "addappid(777)\n").unwrap();
+
+        let state = ConfigState::new();
+        state.reload_lua_dirs(root.path());
+        let snap = ConfigSnapshot::from_state(&state, root.path(), "pipe", "");
+        assert_eq!(snap.managed, vec![730]);
+    }
+
+    /// 文件在但规则里没有 = 那份 lua 坏了, 不该报成"管着".
+    #[cfg(feature = "lua")]
+    #[test]
+    fn managed_skips_files_that_did_not_load() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = ConfigState::default_lua_dir(root.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stt_730.lua"), "this is not lua ((\n").unwrap();
+
+        let state = ConfigState::new();
+        state.reload_lua_dirs(root.path());
+        let snap = ConfigSnapshot::from_state(&state, root.path(), "pipe", "");
+        assert!(snap.managed.is_empty());
+    }
+
+    #[test]
+    fn tool_detail_comes_from_the_host() {
+        let state = ConfigState::new();
+        let mut facts = HostFacts::default();
+        facts
+            .tool_details
+            .insert("library_ux", "缺 pattern, 已降级".into());
+        let snap = ConfigSnapshot::new(&state, Path::new("C:/steam"), "pipe", "", &facts);
+        let ux = snap.tools.iter().find(|t| t.id == "library_ux").unwrap();
+        assert_eq!(ux.detail, "缺 pattern, 已降级");
+    }
 
     #[test]
     fn snapshot_lists_every_tool() {

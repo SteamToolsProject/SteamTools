@@ -28,11 +28,18 @@ const MAX_PATH_LEN: usize = 260;
 /// 页面能提出的改动; 构造函数就是白名单.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigIntent {
-    SetTool { id: ToolId, on: bool },
+    SetTool {
+        id: ToolId,
+        on: bool,
+    },
     SetLogLevel(String),
     SetManifestUrl(String),
     AddLuaPath(String),
     RemoveLuaPath(String),
+    /// 重新拉一次清单并覆盖那个 app 的 lua.
+    RefreshApp(u32),
+    /// 撤掉入库: 删我们写的那个 lua.
+    RemoveApp(u32),
 }
 
 impl ConfigIntent {
@@ -58,6 +65,22 @@ impl ConfigIntent {
 
     pub fn remove_lua_path(path: &str) -> Option<Self> {
         sane_path(path).map(Self::RemoveLuaPath)
+    }
+
+    pub fn refresh_app(app_id: u32) -> Option<Self> {
+        (app_id > 0).then_some(Self::RefreshApp(app_id))
+    }
+
+    pub fn remove_app(app_id: u32) -> Option<Self> {
+        (app_id > 0).then_some(Self::RemoveApp(app_id))
+    }
+
+    /// 针对某个 app 的意图不改 toml, 由宿主拿 provider 去执行.
+    pub fn app_target(&self) -> Option<u32> {
+        match self {
+            Self::RefreshApp(id) | Self::RemoveApp(id) => Some(*id),
+            _ => None,
+        }
     }
 
     /// 改一份配置副本; 只有这里通过了才会落盘.
@@ -98,6 +121,10 @@ impl ConfigIntent {
                 }
                 Ok(format!("lua.paths -= {path}"))
             }
+            // 这两个不动 toml, 由宿主接手 (它才有 provider).
+            Self::RefreshApp(_) | Self::RemoveApp(_) => Err(ConfigError::Invalid(
+                "app 意图不写 toml, 应由宿主处理".into(),
+            )),
         }
     }
 }
@@ -122,6 +149,10 @@ pub fn apply_intent(
     steam_root: &Path,
     intent: &ConfigIntent,
 ) -> Result<String> {
+    debug_assert!(
+        intent.app_target().is_none(),
+        "app 意图该走宿主, 不该进 apply_intent"
+    );
     let mut host = state.host();
     let note = intent.apply_to(&mut host)?;
     save_host_change(steam_root, &host, intent)?;
@@ -157,6 +188,10 @@ pub fn save_host_change(
         ConfigIntent::SetManifestUrl(source) => {
             let table = table_at(&mut doc, &["manifest"])?;
             table["url"] = toml_edit::value(source.as_str());
+        }
+        // app 意图不动 toml, 走不到这儿 (apply_intent 已经挡住).
+        ConfigIntent::RefreshApp(_) | ConfigIntent::RemoveApp(_) => {
+            return Err(ConfigError::Invalid("app 意图不写 toml".into()))
         }
         ConfigIntent::AddLuaPath(_) | ConfigIntent::RemoveLuaPath(_) => {
             let mut array = Array::new();
