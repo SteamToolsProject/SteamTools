@@ -90,11 +90,17 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
 })()
 "##;
 
-/// 把 click_bridge 端口与会话 token 填进 CDP 短脚本.
+/// 把 click_bridge 端口与本会话 token 填进 CDP 短脚本.
 pub fn cdp_store_inject_js(port: u16) -> String {
+    cdp_store_inject_js_with(port, crate::click_bridge::click_bridge_token())
+}
+
+/// 纯替换版; 与上面分开是为了能拿真 token 做断言 —
+/// 测试进程里桥不会启动, `click_bridge_token()` 恒为空串, 直接测公开版等于没测.
+fn cdp_store_inject_js_with(port: u16, token: &str) -> String {
     CDP_STORE_INJECT_JS
         .replace("{{PORT}}", &port.to_string())
-        .replace("{{TOKEN}}", crate::click_bridge::click_bridge_token())
+        .replace("{{TOKEN}}", token)
 }
 
 /// 一次轮询结果.
@@ -823,8 +829,6 @@ mod tests {
         assert!(s.contains("12345"));
         assert!(s.contains("data-stt-store-btn"));
         assert!(!s.contains("{{PORT}}"));
-        // 占位符必须全部替换掉, 否则脚本会带着字面量去请求, 服务端一律拒.
-        assert!(!s.contains("{{TOKEN}}"));
         // 兜底按钮要能在购买区渲染好之后搬回购物车旁.
         assert!(s.contains("data-stt-fallback"));
         assert!(s.contains("\"moved \""));
@@ -836,6 +840,30 @@ mod tests {
         assert!(s.contains("demo_above_purchase"));
         assert!(s.contains("data-ds-bundleid"));
         assert!(s.contains("margin-left:2px"));
+    }
+
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn cdp_js_carries_the_session_token() {
+        let s = cdp_store_inject_js_with(12345, TEST_TOKEN);
+        assert!(s.contains(&format!("token={TEST_TOKEN}")), "{s}");
+    }
+
+    #[test]
+    fn cdp_js_leaves_no_token_placeholder() {
+        let s = cdp_store_inject_js_with(12345, TEST_TOKEN);
+        assert!(!s.contains("{{TOKEN}}"), "{s}");
+    }
+
+    /// token 在前、appid 在后, 拼出的 URL 要能被 click_bridge 解析.
+    #[test]
+    fn cdp_js_builds_a_parsable_bridge_url() {
+        let s = cdp_store_inject_js_with(12345, TEST_TOKEN);
+        assert!(
+            s.contains(&format!("/stt/add?token={TEST_TOKEN}&appid=")),
+            "{s}"
+        );
     }
 
     #[test]
