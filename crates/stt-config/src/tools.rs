@@ -6,16 +6,23 @@ use std::collections::HashMap;
 pub enum ToolId {
     CatalogAdd,
     LibraryUx,
+    ConfigUi,
     StoreAccel,
 }
 
 impl ToolId {
-    pub const ALL: &'static [ToolId] = &[ToolId::CatalogAdd, ToolId::LibraryUx, ToolId::StoreAccel];
+    pub const ALL: &'static [ToolId] = &[
+        ToolId::CatalogAdd,
+        ToolId::LibraryUx,
+        ToolId::ConfigUi,
+        ToolId::StoreAccel,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             ToolId::CatalogAdd => "catalog_add",
             ToolId::LibraryUx => "library_ux",
+            ToolId::ConfigUi => "config_ui",
             ToolId::StoreAccel => "store_accel",
         }
     }
@@ -24,21 +31,31 @@ impl ToolId {
         match s {
             "catalog_add" => Some(Self::CatalogAdd),
             "library_ux" => Some(Self::LibraryUx),
+            "config_ui" => Some(Self::ConfigUi),
             "store_accel" => Some(Self::StoreAccel),
             _ => None,
         }
     }
 
     pub fn default_enabled(self) -> bool {
-        matches!(self, ToolId::CatalogAdd | ToolId::LibraryUx)
+        matches!(
+            self,
+            ToolId::CatalogAdd | ToolId::LibraryUx | ToolId::ConfigUi
+        )
     }
 
     pub fn display_name(self) -> &'static str {
         match self {
-            ToolId::CatalogAdd => "Catalog Add",
-            ToolId::LibraryUx => "Library UX",
-            ToolId::StoreAccel => "Store Accel",
+            ToolId::CatalogAdd => "入库 / 清单",
+            ToolId::LibraryUx => "库 UX",
+            ToolId::ConfigUi => "配置页",
+            ToolId::StoreAccel => "商店加速",
         }
+    }
+
+    /// 只占位, 还没有实现 — UI 上要标出来, 别让人以为开了就有效果.
+    pub fn is_placeholder(self) -> bool {
+        matches!(self, ToolId::StoreAccel)
     }
 }
 
@@ -127,7 +144,16 @@ mod tests {
         let reg = ToolRegistry::with_defaults();
         assert!(reg.is_enabled(ToolId::CatalogAdd));
         assert!(reg.is_enabled(ToolId::LibraryUx));
+        assert!(reg.is_enabled(ToolId::ConfigUi));
         assert!(!reg.is_enabled(ToolId::StoreAccel));
+    }
+
+    /// id 字符串是配置文件里的键, 改了会静默丢用户的开关.
+    #[test]
+    fn ids_round_trip() {
+        for id in ToolId::ALL {
+            assert_eq!(ToolId::parse(id.as_str()), Some(*id));
+        }
     }
 
     #[test]
