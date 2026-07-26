@@ -14,6 +14,8 @@ lua = ["dep:mlua"]
 stt-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# 配置页保存时定点改键, 不冲掉用户手写的注释与键序; 已经是 toml 0.8 的内部依赖.
+toml_edit = "0.22"
 thiserror = "2"
 mlua = { version = "0.10", features = ["lua54", "vendored"], optional = true }
 
