@@ -5,7 +5,6 @@
 mod child_pipe;
 mod hash;
 mod module;
-mod random;
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +21,6 @@ pub use module::{
     enumerate_modules, main_module_base, module_handle, module_info, module_info_by_handle,
     module_path, module_path_by_name, proc_address, read_module_bytes, ModuleInfo,
 };
-pub use random::{constant_time_eq, random_bytes, random_hex_token};
 
 pub const DATA_DIR_NAME: &str = "steamtools";
 pub const LEGACY_DATA_DIR_NAME: &str = "opensteamtool";
