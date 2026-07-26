@@ -18,9 +18,10 @@
 
 ## 当前状态
 
-- [x] workspace：`stt-core` / `stt-platform` / `stt-config` / `stt-host` / loaders
-- [x] M1 代码：双 loader + `SteamTools.dll` + `steamtools/host.log`（待本机 Steam 冒烟）
-- [x] M2 代码：`steamtools.toml`、工具开关、mlua 核心 API、Catalog Mock、epoch 订阅
+- [x] workspace：`stt-core` / `stt-platform` / `stt-config` / `stt-metadata` / `stt-hook` / `stt-host` / loaders
+- [x] M1：双 loader + `SteamTools.dll` + `host.log`（本机已冒烟）
+- [x] M2：`steamtools.toml`、工具开关、mlua、Catalog Mock、lua 扫盘/watch
+- [x] M3：SHA-256、pattern TOML、符号解析、可卸载 detour、无害自测 hook
 
 ```powershell
 cargo test
@@ -34,7 +35,7 @@ cargo build -p stt-host -p stt-loader-dwmapi -p stt-loader-xinput --release
 ```text
 loader (dwmapi/xinput) → stt-host
   → stt-config (TOML + mlua) / stt-metadata / stt-platform
-  → stt-core ← stt-hook ← stt-steamui + stt-steamclient
+  → stt-core ← stt-hook（M3 脚手架）← stt-steamui + stt-steamclient（后置）
 ```
 
 - **steamui**：库体验与配置 UX  
