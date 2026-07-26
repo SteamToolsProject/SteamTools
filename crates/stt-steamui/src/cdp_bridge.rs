@@ -1,7 +1,7 @@
 //! 进程内 CEF 远程调试桥: 向商店页注入脚本并取回入库点击.
 //!
-//! 使用 127.0.0.1:8080 (CEF remote debugging).
-//! 开关文件由 loader/host 自动创建, 用户无需手开.
+//! 端点由 `store_debug::cdp_host_port()` 给 (本会话端口, 见 ADR 0010);
+//! hook 没赶上时回退 8080, 兼容已经在跑的 webhelper.
 //! 不猜 CEF vtable; 跑在 host 工作线程.
 
 use std::io::{Read, Write};
@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::store_debug::cdp_host_port;
 use crate::store_inject::STORE_INJECT_JS;
 
-const DRAIN_JS: &str = r#"(function(){var p=window.__SteamToolsPending||[];window.__SteamToolsPending=[];return p;})()"#;
+pub(crate) const DRAIN_JS: &str = r#"(function(){var p=window.__SteamToolsPending||[];window.__SteamToolsPending=[];return p;})()"#;
 
 /// CDP 专用短脚本: 大脚本在 CEF evaluate 上偶发挂起; 短脚本狗粮已验证 near-cart 可挂.
 /// `{{PORT}}` 由 host 替换为 click_bridge 端口.
@@ -334,7 +334,7 @@ pub fn run_store_cdp_loop_with_js(
     }
 }
 
-fn is_store_app_url(url: &str) -> bool {
+pub(crate) fn is_store_app_url(url: &str) -> bool {
     // 商店 CEF 页: 只要 store.steampowered.com 就注入.
     // 脚本内再解析 /app/<id>; 过严的 /app/ 过滤会漏掉 SPA/重定向中间态.
     if url.contains("agecheck") {
@@ -374,7 +374,7 @@ fn session_inject_and_drain(ws_url: &str, inject_js: &str) -> Result<InjectOutco
     Ok(InjectOutcome { mounted, pending })
 }
 
-fn parse_pending_app_ids(v: &Value) -> Vec<u32> {
+pub(crate) fn parse_pending_app_ids(v: &Value) -> Vec<u32> {
     let Some(arr) = v.as_array() else {
         return Vec::new();
     };
@@ -536,9 +536,7 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
 fn parse_content_length(head: &str) -> Option<usize> {

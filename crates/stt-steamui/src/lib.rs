@@ -6,6 +6,8 @@
 //! `Result`: 缺 pattern / 缺符号都属于"该层降级", 宿主照常起.
 
 mod cdp_bridge;
+mod cdp_pipe;
+mod cef_debug;
 mod click_bridge;
 mod install;
 mod library_ux;
@@ -17,6 +19,11 @@ pub use cdp_bridge::{
     cdp_store_inject_js, poll_store_cdp, poll_store_cdp_default, run_store_cdp_loop,
     run_store_cdp_loop_with_js, StoreCdpPoll, CDP_STORE_INJECT_JS,
 };
+pub use cdp_pipe::{poll_store_pipe, run_store_pipe_loop, CdpPipeSession, PipeTarget};
+pub use cef_debug::{
+    cef_debug_rewrites, cef_debug_stats, install_cef_debug_hook, pipe_armed, take_devtools_pipe,
+    take_launch_snapshot, wait_cef_debug_hook, CefDebugReport, CefDebugStatus,
+};
 pub use click_bridge::{click_bridge_port, ensure_click_bridge, store_inject_js_with_bridge};
 pub use install::{
     plan_library_ux_install, LibraryUxInstallReport, LibraryUxInstallStatus,
@@ -25,7 +32,7 @@ pub use install::{
 pub use library_ux::{LibraryUx, RemovalDrainAction};
 pub use store_debug::{
     alloc_cef_debug_port, cdp_host_port, cef_debug_port, is_webhelper_launch,
-    rewrite_webhelper_cmdline, LEGACY_CDP_PORT,
+    rewrite_webhelper_cmdline, session_port_live, DebugChannel, LEGACY_CDP_PORT,
 };
 pub use store_inject::{app_id_from_store_path, STORE_INJECT_JS};
 pub use store_native::{
