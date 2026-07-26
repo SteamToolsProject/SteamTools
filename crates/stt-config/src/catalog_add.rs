@@ -120,6 +120,49 @@ pub fn add_to_library(
     })
 }
 
+/// 一次移除的结果.
+#[derive(Debug, Clone)]
+pub struct RemoveFromLibraryOutcome {
+    pub app_id: AppId,
+    /// 删掉的 lua; 文件本来就不在时为 `None` (仍算成功).
+    pub lua_path: Option<PathBuf>,
+    pub epoch: u64,
+    pub owned_count: usize,
+}
+
+/// 把入库撤掉: 删 `stt_{app_id}.lua`, 然后整表重扫.
+///
+/// 不去 `AppRules` 里做减法 —— 那份状态是所有 lua 合并出来的, 单独摘一个 app 容易
+/// 与磁盘不一致. 删完重扫是唯一能保证两边一致的做法, 而且几十个文件也就几毫秒.
+///
+/// 只删我们自己写的那个文件; 用户手写的 lua 一概不碰.
+#[cfg(feature = "lua")]
+pub fn remove_from_library(
+    state: &ConfigState,
+    steam_root: &Path,
+    app_id: AppId,
+) -> Result<RemoveFromLibraryOutcome> {
+    let path = catalog_lua_path(steam_root, app_id);
+    let lua_path = match std::fs::remove_file(&path) {
+        Ok(()) => Some(path),
+        // 已经不在了: 目的已经达到, 不当错误.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(ConfigError::Io {
+                path: path.clone(),
+                source,
+            })
+        }
+    };
+    state.reload_lua_dirs(steam_root);
+    Ok(RemoveFromLibraryOutcome {
+        app_id,
+        lua_path,
+        epoch: state.rules_epoch(),
+        owned_count: state.owned_count(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +224,47 @@ mod tests {
     fn bumps_rules_epoch() {
         let (_root, _state, out) = add_app_42();
         assert!(out.epoch > 0);
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn remove_deletes_our_lua() {
+        let (root, state, out) = add_app_42();
+        let gone = remove_from_library(&state, root.path(), 42).unwrap();
+        assert_eq!(gone.lua_path.as_ref(), Some(&out.lua_path));
+        assert!(!out.lua_path.exists());
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn remove_drops_the_app_from_rules() {
+        let (root, state, _out) = add_app_42();
+        remove_from_library(&state, root.path(), 42).unwrap();
+        assert!(!state.with_rules(|r: &AppRules| r.is_owned(42)));
+    }
+
+    /// 用户手写的 lua 不是我们写的, 移除一个 app 不该把它们一起弄没.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn remove_keeps_hand_written_lua() {
+        let (root, state, _out) = add_app_42();
+        let mine = default_lua_dir(root.path()).join("mine.lua");
+        std::fs::write(&mine, "addappid(777)\n").unwrap();
+        state.reload_lua_dirs(root.path());
+
+        remove_from_library(&state, root.path(), 42).unwrap();
+        assert!(mine.exists());
+        assert!(state.with_rules(|r: &AppRules| r.is_owned(777)));
+    }
+
+    /// 已经不在了也算成功 —— 目的就是"让它不在".
+    #[cfg(feature = "lua")]
+    #[test]
+    fn remove_is_idempotent() {
+        let (root, state, _out) = add_app_42();
+        remove_from_library(&state, root.path(), 42).unwrap();
+        let again = remove_from_library(&state, root.path(), 42).unwrap();
+        assert!(again.lua_path.is_none());
     }
 
     #[test]
