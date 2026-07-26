@@ -82,6 +82,15 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         }
     };
 
+    // 抢在 Steam 拉起 steamwebhelper 之前装 CreateProcessW hook (ADR 0010).
+    // 必须是配置就绪后的第一件事: 后面 SHA-256 两个大 DLL 要几百毫秒, 等不起.
+    // 发起调用的模块可能比 host 晚加载, 而 webhelper 约 300ms 就被拉起,
+    // 所以这里忙等着补挂; watch 里的 CefRearm 负责后续新模块与 webhelper 重启.
+    // 首选 pipe (不开任何端口); 上次证明走不通才回退到端口.
+    let catalog_on = state.tools().is_enabled(ToolId::CatalogAdd);
+    let use_pipe = !stt_platform::cef_pipe_fallback_marker(steam_root).is_file();
+    let cef = stt_steamui::wait_cef_debug_hook(catalog_on, use_pipe, Duration::from_millis(2000));
+
     let lua_report = state.reload_lua_dirs(steam_root);
 
     let cfg_path = HostConfig::resolve_path(steam_root)
@@ -181,63 +190,111 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         );
     }
 
-    // 商店页在 steamwebhelper CEF, 不在 steam.exe CHTMLWindow — 主路径 CDP 8080.
+    // 商店页在 steamwebhelper CEF, 不在 steam.exe CHTMLWindow — 主路径走 CDP.
     // native hook 默认关 (STEAMTOOLS_STORE_NATIVE=inject 才开).
     let native = stt_steamui::try_install_store_native(&state.tools(), &patterns);
     append_host_log(steam_root, &native.summary_line());
 
-    match stt_platform::ensure_cef_remote_debugging_flag(steam_root) {
-        Ok(true) => append_host_log(
+    // 调试端点由 CreateProcessW hook 控制, 不再落 .cef-enable-remote-debugging
+    // (ADR 0010): 端口只活在本会话, 且顺手剥掉 Steam 自带的 --remote-allow-origins=*.
+    // hook 本身在 init 开头就装好了, 这里只报状态.
+    append_host_log(steam_root, &cef.summary_line());
+    if stt_platform::cef_remote_debugging_flag_path(steam_root).is_file() {
+        append_host_log(
             steam_root,
-            "catalog_add=store_cdp flag=created (restart Steam once if 8080 was never open)",
-        ),
-        Ok(false) => append_host_log(steam_root, "catalog_add=store_cdp flag=present"),
-        Err(e) => append_host_log(steam_root, &format!("catalog_add=store_cdp flag_err {e}")),
+            "cef_debug=legacy_flag present (delete .cef-enable-remote-debugging; \
+             it keeps 8080 open for every Steam session)",
+        );
     }
-    spawn_store_cdp_bridge(steam_root, &state);
+    spawn_store_cdp_bridge(steam_root, &state, use_pipe);
     append_host_log(
         steam_root,
-        "catalog_add=store_inject path=cdp8080+click_bridge (store lives in steamwebhelper)",
+        &format!(
+            "catalog_add=store_inject channel={} caught_webhelper={} \
+             (store lives in steamwebhelper)",
+            if use_pipe {
+                "pipe".to_string()
+            } else {
+                stt_steamui::cdp_host_port()
+            },
+            cef.caught_webhelper()
+        ),
     );
 
-    run_watch_loop(steam_root, &state);
+    run_watch_loop(steam_root, &state, use_pipe);
     Ok(())
 }
 
 /// 后台: CEF CDP 向商店页注入按钮; 点击走 click_bridge, pending 队列作兜底.
-fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState) {
+///
+/// `use_pipe` 时先试无端口的管道通道; 它明确走不通才落标记文件并回退到端口,
+/// 这样最多一个会话入库不可用, 不会永久卡死.
+fn spawn_store_cdp_bridge(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
     let root = steam_root.to_path_buf();
     let state = state.clone();
     let _ = std::thread::Builder::new()
         .name("stt-store-cdp".into())
         .spawn(move || {
             let provider = MockCatalogProvider::new().with_auto_generate(true);
+            let mut make_js = || {
+                // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
+                let port = stt_steamui::click_bridge_port();
+                stt_steamui::cdp_store_inject_js(port)
+            };
+            let mut on_app = |app_id: u32| {
+                match add_to_library(&state, &root, &provider, app_id) {
+                    Ok(out) => append_host_log(
+                        &root,
+                        &format!(
+                            "catalog_add=ok source=store_cdp app_id={app_id} provider={} lua={} epoch={} owned={}",
+                            out.provider_id,
+                            out.lua_path.display(),
+                            out.epoch,
+                            out.owned_count
+                        ),
+                    ),
+                    Err(e) => append_host_log(
+                        &root,
+                        &format!("catalog_add=err source=store_cdp app_id={app_id} {e}"),
+                    ),
+                }
+            };
+            let mut on_log = |line: String| append_host_log(&root, &line);
+
+            if use_pipe {
+                // webhelper 起来 + CEF 初始化完要点时间, 给够 30s.
+                let ok = stt_steamui::run_store_pipe_loop(
+                    Duration::from_millis(600),
+                    &mut make_js,
+                    &mut on_app,
+                    &mut on_log,
+                    Duration::from_secs(30),
+                );
+                if ok {
+                    return; // 通道好使, 循环自己会长驻; 走到这说明 Steam 要退了
+                }
+                // 明确不可用: 记下来, 下次直接用端口, 免得每次都赔一个会话.
+                let marker = stt_platform::cef_pipe_fallback_marker(&root);
+                let _ = std::fs::write(
+                    &marker,
+                    "CDP over --remote-debugging-pipe did not come up; \
+                     delete this file to retry pipe mode.\n",
+                );
+                append_host_log(
+                    &root,
+                    &format!(
+                        "cef_debug=pipe_fallback marker={} (restart Steam to use the port channel)",
+                        marker.display()
+                    ),
+                );
+                return;
+            }
+
             stt_steamui::run_store_cdp_loop_with_js(
                 Duration::from_millis(600),
-                || {
-                    // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
-                    let port = stt_steamui::click_bridge_port();
-                    stt_steamui::cdp_store_inject_js(port)
-                },
-                |app_id| {
-                    match add_to_library(&state, &root, &provider, app_id) {
-                        Ok(out) => append_host_log(
-                            &root,
-                            &format!(
-                                "catalog_add=ok source=store_cdp app_id={app_id} provider={} lua={} epoch={} owned={}",
-                                out.provider_id,
-                                out.lua_path.display(),
-                                out.epoch,
-                                out.owned_count
-                            ),
-                        ),
-                        Err(e) => append_host_log(
-                            &root,
-                            &format!("catalog_add=err source=store_cdp app_id={app_id} {e}"),
-                        ),
-                    }
-                },
-                |line| append_host_log(&root, &line),
+                make_js,
+                on_app,
+                on_log,
             );
         });
 }
@@ -402,7 +459,81 @@ fn process_inbox(
     }
 }
 
-fn run_watch_loop(steam_root: &Path, state: &ConfigState) {
+/// 持续补挂 CreateProcessW hook, 并在始终截不到 webhelper 时写明诊断.
+///
+/// 不设终点: 模块是陆续加载的, webhelper 崩了 Steam 还会重拉一个.
+/// 但 2s 一轮就够, 不占满 250ms 的 watch 节拍.
+#[derive(Default)]
+struct CefRearm {
+    ticks: u32,
+    modules: usize,
+    caught: bool,
+    warned: bool,
+    /// 与 init 时一致, 否则补挂会把通道悄悄切回端口.
+    use_pipe: bool,
+}
+
+impl CefRearm {
+    /// 每 8 个 watch tick 补挂一次 (~2s).
+    const EVERY: u32 = 8;
+
+    /// 日志里怎么称呼当前通道.
+    ///
+    /// pipe 模式下不存在端口, 早先这里无脑打 `cdp_host_port()`, 结果日志显示
+    /// `cdp=127.0.0.1:8080` — 明明走的是管道, 读日志的人会以为端口还开着.
+    fn channel_label(&self) -> String {
+        if self.use_pipe {
+            "pipe".to_owned()
+        } else {
+            stt_steamui::cdp_host_port()
+        }
+    }
+    /// 这么久还没截到就写诊断 (~20s), 够覆盖冷启动.
+    const WARN_AFTER: u32 = 80;
+
+    fn tick(&mut self, steam_root: &Path, state: &ConfigState) {
+        self.ticks += 1;
+        if !self.ticks.is_multiple_of(Self::EVERY) {
+            return;
+        }
+        let r = stt_steamui::install_cef_debug_hook(
+            state.tools().is_enabled(ToolId::CatalogAdd),
+            self.use_pipe,
+        );
+        if r.modules.len() > self.modules {
+            self.modules = r.modules.len();
+            append_host_log(steam_root, &format!("{} (rearm)", r.summary_line()));
+        }
+        if !self.caught && r.caught_webhelper() {
+            self.caught = true;
+            append_host_log(
+                steam_root,
+                &format!("cef_debug=caught webhelper via={}", self.channel_label()),
+            );
+            // pipe 方案探路: Steam 给的 bInheritHandles / STARTUPINFO 决定
+            // 我们能不能干净地塞进 fd 3/4.
+            if let Some(snap) = stt_steamui::take_launch_snapshot() {
+                append_host_log(steam_root, &format!("cef_debug=launch_params {snap}"));
+            }
+        }
+        if !self.caught && !self.warned && self.ticks >= Self::WARN_AFTER {
+            self.warned = true;
+            let (calls, seen, rewrites) = stt_steamui::cef_debug_stats();
+            // calls=0: hook 没挂到发起调用的模块.
+            // calls>0 且 seen=0: webhelper 走的不是 CreateProcessW.
+            append_host_log(
+                steam_root,
+                &format!(
+                    "cef_debug=missed_webhelper calls={calls} webhelper={seen} rewrites={rewrites} \
+                     channel={} (webhelper kept its own arguments; no debug channel of ours)",
+                    self.channel_label()
+                ),
+            );
+        }
+    }
+}
+
+fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
     let mut toml_watch = stt_config::host_toml_watcher(steam_root, WATCH_DEBOUNCE);
     let mut lua_watch = {
         let host = state.host();
@@ -415,10 +546,15 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState) {
     // 定期重扫目录, 好把新建的 .lua 纳入监视.
     let mut rescan_ticks: u32 = 0;
     let mut last_stats = (0u64, 0u64, 0u64, 0usize);
+    let mut cef_rearm = CefRearm {
+        use_pipe,
+        ..CefRearm::default()
+    };
 
     loop {
         std::thread::sleep(WATCH_POLL);
         process_inbox(steam_root, state, &provider, &mut inbox_seen);
+        cef_rearm.tick(steam_root, state);
 
         // 商店注入诊断: 有变化才写 log.
         let stats = stt_steamui::store_native_stats();
