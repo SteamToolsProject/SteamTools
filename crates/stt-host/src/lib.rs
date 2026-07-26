@@ -118,8 +118,68 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         }
     }
 
+    log_module_hashes(steam_root);
+    log_pattern_probe(steam_root);
+    match stt_hook::run_harmless_self_test() {
+        Ok(n) => append_host_log(steam_root, &format!("hook_self_test=ok calls={n}")),
+        Err(e) => append_host_log(steam_root, &format!("hook_self_test=err {e}")),
+    }
+
     run_watch_loop(steam_root, &state);
     Ok(())
+}
+
+fn log_module_hashes(steam_root: &Path) {
+    for name in ["steamui.dll", "steamclient64.dll"] {
+        let path = steam_root.join(name);
+        if !path.is_file() {
+            append_host_log(steam_root, &format!("sha256_{name}=missing"));
+            continue;
+        }
+        match stt_platform::sha256_file(&path) {
+            Ok(h) => append_host_log(steam_root, &format!("sha256_{name}={h}")),
+            Err(e) => append_host_log(steam_root, &format!("sha256_{name}=err {e}")),
+        }
+    }
+}
+
+fn log_pattern_probe(steam_root: &Path) {
+    let mut store = stt_metadata::PatternStore::new();
+    for component in ["steamui", "steamclient"] {
+        let dll = if component == "steamui" {
+            "steamui.dll"
+        } else {
+            "steamclient64.dll"
+        };
+        let path = steam_root.join(dll);
+        let sha = match stt_platform::sha256_file(&path) {
+            Ok(h) => h,
+            Err(_) => {
+                append_host_log(
+                    steam_root,
+                    &format!("pattern_{component}=skip (dll hash unavailable)"),
+                );
+                continue;
+            }
+        };
+        let primary = stt_platform::pattern_cache_file(steam_root, component, &sha);
+        let legacy = stt_platform::legacy_pattern_cache_file(steam_root, component, &sha);
+        match store.load_with_fallback(component, &primary, Some(&legacy)) {
+            Ok(loaded) => append_host_log(
+                steam_root,
+                &format!(
+                    "pattern_{component}=loaded entries={} path={} legacy={}",
+                    store.map(component).map(|m| m.len()).unwrap_or(0),
+                    loaded.path.display(),
+                    loaded.legacy
+                ),
+            ),
+            Err(e) => append_host_log(
+                steam_root,
+                &format!("pattern_{component}=disabled ({e}) sha={sha}"),
+            ),
+        }
+    }
 }
 
 fn run_watch_loop(steam_root: &Path, state: &ConfigState) {
