@@ -10,6 +10,8 @@ pub enum HookError {
     AlreadyInstalled,
     #[error("hook not installed")]
     NotInstalled,
+    #[error("target function not found in import table")]
+    ImportNotFound,
     #[error("steal_len {got} out of range {min}..={max}")]
     InvalidStealLen { got: usize, min: usize, max: usize },
     #[error("trampoline allocation failed")]
