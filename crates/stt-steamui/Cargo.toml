@@ -1,0 +1,20 @@
+[package]
+name = "stt-steamui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "steamui library UX state and install scaffolding"
+
+[dependencies]
+stt-core = { workspace = true }
+stt-config = { workspace = true }
+stt-metadata = { workspace = true }
+stt-hook = { workspace = true }
+stt-platform = { workspace = true }
+thiserror = "2"
+# CDP JSON (Chrome DevTools Protocol list/evaluate); no HTTP client crate.
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
