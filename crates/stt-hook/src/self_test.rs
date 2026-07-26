@@ -9,6 +9,7 @@ use windows::Win32::System::Memory::{
 
 use crate::detour::{InlineHook, TrampolineHook};
 use crate::error::{HookError, Result};
+use crate::iat::IatHook;
 
 static CALLS: AtomicU32 = AtomicU32::new(0);
 static SELF_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -186,9 +187,78 @@ pub fn run_trampoline_self_test() -> Result<u32> {
     Ok(n)
 }
 
+/// IAT 往返自测: 把本模块导入的 `GetTickCount` 换成 detour, 调用后卸掉.
+///
+/// detour 返回固定哨兵值以证明"走的是 detour 而非原函数"; 卸载后再调必须落回
+/// kernel32 原实现. 与生产要 hook 的 `CreateProcessW` 走完全一样的 IAT 机制.
+pub fn run_iat_self_test() -> Result<u32> {
+    use windows::core::s;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::System::SystemInformation::GetTickCount;
+
+    let _guard = SELF_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    const SENTINEL: u32 = 0x5474_1234;
+    unsafe extern "system" fn tick_detour() -> u32 {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        SENTINEL
+    }
+
+    // 逼链接器把 GetTickCount 放进本模块 IAT.
+    let _warmup = unsafe { GetTickCount() };
+    CALLS.store(0, Ordering::SeqCst);
+
+    unsafe {
+        let module = GetModuleHandleW(None).map_err(HookError::Protect)?;
+        let target = GetProcAddress(
+            GetModuleHandleW(windows::core::w!("kernel32.dll")).map_err(HookError::Protect)?,
+            s!("GetTickCount"),
+        )
+        .ok_or(HookError::ImportNotFound)?;
+
+        let mut hook = IatHook::new(
+            module.0.cast(),
+            target as *const core::ffi::c_void,
+            tick_detour as *const core::ffi::c_void,
+        )?;
+        hook.attach()?;
+
+        let hooked = GetTickCount();
+        if hooked != SENTINEL {
+            let _ = hook.detach();
+            return Err(HookError::SelfTestFailed(format!(
+                "expected sentinel {SENTINEL:#x}, got {hooked:#x}"
+            )));
+        }
+
+        hook.detach()?;
+        // 卸载后应落回真实 tick (非哨兵).
+        let after = GetTickCount();
+        if after == SENTINEL {
+            return Err(HookError::SelfTestFailed(
+                "iat detour still active after detach".into(),
+            ));
+        }
+    }
+
+    let n = CALLS.load(Ordering::SeqCst);
+    if n == 0 {
+        return Err(HookError::SelfTestFailed("iat detour did not run".into()));
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iat_hook_swaps_and_restores() {
+        let n = run_iat_self_test().expect("iat self test");
+        assert!(n >= 1, "detour should have run at least once, got {n}");
+    }
 
     #[test]
     fn harmless_hook_counts_and_restores() {
