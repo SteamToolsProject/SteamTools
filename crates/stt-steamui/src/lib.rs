@@ -24,7 +24,9 @@ pub use cef_debug::{
     cef_debug_rewrites, cef_debug_stats, install_cef_debug_hook, pipe_armed, take_devtools_pipe,
     take_launch_snapshot, wait_cef_debug_hook, CefDebugReport, CefDebugStatus,
 };
-pub use click_bridge::{click_bridge_port, ensure_click_bridge, store_inject_js_with_bridge};
+pub use click_bridge::{
+    click_bridge_port, click_bridge_token, ensure_click_bridge, store_inject_js_with_bridge,
+};
 pub use install::{
     plan_library_ux_install, LibraryUxInstallReport, LibraryUxInstallStatus,
     LIBRARY_UX_HOOK_SYMBOLS, LIBRARY_UX_SYMBOLS,
