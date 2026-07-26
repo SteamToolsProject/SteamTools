@@ -51,6 +51,7 @@ pub const NAV_TICK_JS: &str = r##"
   // 其余菜单/隐藏视图一律 hidden, SharedJSContext 虽然 visible 但只有 1x1.
   out.vis=(d.visibilityState!=="hidden");
   out.w=window.innerWidth; out.h=window.innerHeight;
+  out.menu=!!window.__SteamToolsMenuArmed;
   if(!b||!b.children.length) return out;
 
   function open(e){
@@ -175,6 +176,104 @@ pub const NAV_TICK_JS: &str = r##"
   window.__SteamToolsRecon=1;
   out.recon=recon();
   return out;
+})()
+"##;
+
+/// 库里的右键菜单 (只对我们自己加的 app 生效).
+///
+/// 装一次监听就够, 之后每轮只是确认还在. 判 app_id 靠胶囊图的 URL:
+/// 本地是 `steamloopback.host/assets/<id>/`, 远程是 `.../apps/<id>/` ——
+/// 库行的类名是混淆的, 认不得, 但图片路径稳定.
+///
+/// **不是我们加的一律不拦**: 用户自己的游戏照常弹 Steam 的菜单.
+pub const LIBRARY_MENU_JS: &str = r##"
+(function(){
+  if(window.__SteamToolsMenuArmed) return "already";
+  var d=document;
+  function appIdOf(node){
+    var e=node;
+    for(var up=0; e && up<12; up++, e=e.parentElement){
+      var html=e.innerHTML;
+      if(!html) continue;
+      var m=/(?:assets|apps)\/(\d{3,8})\//.exec(html);
+      if(m) return Number(m[1]);
+    }
+    return 0;
+  }
+  function close(){
+    var old=d.getElementById("stt-ctx");
+    if(old&&old.remove) old.remove();
+  }
+  function item(txt,cb){
+    var e=d.createElement("div");
+    e.textContent=txt;
+    e.style.cssText="padding:8px 16px;cursor:pointer;white-space:nowrap;color:#dcdedf;";
+    e.className="stt-ctx-i";
+    e.addEventListener("click",function(ev){
+      ev.stopPropagation(); close(); cb();
+    });
+    return e;
+  }
+  d.addEventListener("contextmenu",function(ev){
+    close();
+    var managed=window.__SteamToolsManaged||[];
+    if(!managed.length) return;
+    var id=appIdOf(ev.target);
+    if(!id || managed.indexOf(id)<0) return;   // 不是我们加的 -> 让 Steam 自己弹
+    ev.preventDefault(); ev.stopPropagation();
+
+    var box=d.createElement("div");
+    box.id="stt-ctx";
+    box.style.cssText="position:fixed;z-index:9100;min-width:168px;padding:6px 0;"
+      +"background:#23262e;border:1px solid rgba(0,0,0,.5);border-radius:3px;"
+      +"box-shadow:0 6px 24px rgba(0,0,0,.6);font:14px/18px 'Motiva Sans',Helvetica,sans-serif;";
+    var head=d.createElement("div");
+    head.textContent="SteamTools · "+id;
+    head.style.cssText="padding:6px 16px 8px;color:#7d8894;font-size:12px;"
+      +"border-bottom:1px solid rgba(255,255,255,.07);margin-bottom:4px;";
+    box.appendChild(head);
+    box.appendChild(item("刷新清单",function(){
+      (window.__SteamToolsIntents=window.__SteamToolsIntents||[])
+        .push({kind:"refresh_app",app_id:id});
+    }));
+    box.appendChild(item("移除入库",function(){
+      (window.__SteamToolsIntents=window.__SteamToolsIntents||[])
+        .push({kind:"remove_app",app_id:id});
+    }));
+    box.appendChild(item("打开 SteamTools",function(){ window.__SteamToolsWant=true; }));
+    // 先挂上再量, 否则量不到尺寸; 贴着光标, 越界就翻到另一侧.
+    box.style.left="0px"; box.style.top="0px";
+    (d.body||d.documentElement).appendChild(box);
+    var r=box.getBoundingClientRect();
+    var x=ev.clientX, y=ev.clientY;
+    if(x+r.width>window.innerWidth) x=Math.max(0,x-r.width);
+    if(y+r.height>window.innerHeight) y=Math.max(0,y-r.height);
+    box.style.left=x+"px"; box.style.top=y+"px";
+  },true);
+  d.addEventListener("click",close,true);
+  d.addEventListener("keydown",function(e){ if(e.key==="Escape") close(); },true);
+
+  var css=d.createElement("style");
+  css.textContent="#stt-ctx .stt-ctx-i:hover{background:#1a9fff;color:#fff}";
+  (d.head||d.documentElement).appendChild(css);
+  window.__SteamToolsMenuArmed=true;
+  return "armed";
+})()
+"##;
+
+/// 把"哪些 app 是我们加的"推给页面 —— 右键时要即刻判断, 来不及问宿主.
+pub fn managed_apps_js(ids: &[u32]) -> String {
+    let list: Vec<String> = ids.iter().map(u32::to_string).collect();
+    format!("window.__SteamToolsManaged=[{}];", list.join(","))
+}
+
+/// 工具关掉时把右键菜单也撤掉.
+pub const LIBRARY_MENU_TEARDOWN_JS: &str = r##"
+(function(){
+  var p=document.getElementById("stt-ctx");
+  if(p&&p.remove) p.remove();
+  window.__SteamToolsManaged=[];
+  return "off";
 })()
 "##;
 
@@ -401,6 +500,7 @@ pub const PANEL_JS: &str = r##"
     ["tools","工具","M4 8h3m4 0h9M4 16h9m4 0h3"
       +"M11 8a2 2 0 10-4 0 2 2 0 004 0M17 16a2 2 0 10-4 0 2 2 0 004 0"],
     ["source","上游与日志","M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"],
+    ["apps","已入库","M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"],
     ["lua","Lua 目录","M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"],
     ["status","状态","M12 21a9 9 0 100-18 9 9 0 000 18zM12 8h.01M11 12h1v5h1"]
   ];
@@ -411,7 +511,8 @@ pub const PANEL_JS: &str = r##"
   function renderTools(s){
     (s.tools||[]).forEach(function(x){
       var c=card();
-      var left=label(x.name,x.id);
+      // 开着不等于跑起来了: 第二行说清它此刻在干什么 / 为什么没干成.
+      var left=label(x.name,x.detail||x.id);
       if(x.placeholder){
         // 占位是第三种状态, 开关表达不了 —— 给它一个标记, 别塞进名字里.
         left.firstChild.appendChild(el("span","占位",
@@ -422,6 +523,26 @@ pub const PANEL_JS: &str = r##"
       c.appendChild(toggle(x.enabled,function(){
         push({kind:"set_tool",id:x.id,on:!x.enabled});
       }));
+    });
+  }
+  // 已入库: 只列我们自己写的那些 lua, 每项能刷新 / 移除.
+  function renderApps(s){
+    var ids=s.managed||[];
+    if(!ids.length){
+      var e=card();
+      e.appendChild(label("还没有入库的应用","从商店页点「入库」, 或往 steamtools/inbox 丢 app_id"));
+      return;
+    }
+    ids.forEach(function(id){
+      var c=card();
+      c.appendChild(label(String(id),"config/lua/stt_"+id+".lua",true));
+      var box=el("div",null,"display:flex;gap:8px;flex:none;");
+      var re=btn("刷新");
+      onHit(re,function(){ re.textContent="…"; push({kind:"refresh_app",app_id:id}); });
+      var rm=btn("移除","stt-rm");
+      onHit(rm,function(){ rm.textContent="…"; push({kind:"remove_app",app_id:id}); });
+      box.appendChild(re); box.appendChild(rm);
+      c.appendChild(box);
     });
   }
   function renderSource(s){
@@ -502,6 +623,7 @@ pub const PANEL_JS: &str = r##"
     title.textContent=name;
     body.textContent="";
     if(page==="tools") renderTools(s);
+    else if(page==="apps") renderApps(s);
     else if(page==="source") renderSource(s);
     else if(page==="lua") renderLua(s);
     else renderStatus(s);
@@ -576,8 +698,10 @@ pub(crate) trait EvalTarget {
 pub trait PanelBridge {
     /// 配置页这一层开着没有.
     fn enabled(&mut self) -> bool;
-    /// 当前要显示的快照.
+    /// 当前要显示的快照 (面板开着时才要).
     fn snapshot(&mut self) -> Option<ConfigSnapshot>;
+    /// 我们自己入库的 app —— 库右键每轮都要, 所以宿主该缓存, 别每轮扫盘.
+    fn managed_apps(&mut self) -> Vec<u32>;
     /// 页面发回来的改动.
     fn on_intents(&mut self, intents: &[ConfigIntent]);
     /// 认不出导航行时的候选样本, 供勘察.
@@ -597,6 +721,8 @@ pub struct PanelState {
     views: Vec<ViewInfo>,
     /// 本轮正在收的; 一轮结束时顶替 `views`.
     pending: Vec<ViewInfo>,
+    /// 上次推给各文档的"我们管着哪些 app", 没变就不重推.
+    last_managed: std::collections::HashMap<String, String>,
 }
 
 /// 这一轮怎么对待某个视图.
@@ -693,6 +819,8 @@ pub(crate) fn panel_step(
     role: ViewRole,
 ) -> Result<PanelStepOutcome, String> {
     if !role.enabled {
+        let _ = target.eval(LIBRARY_MENU_TEARDOWN_JS);
+        state.last_managed.remove(key);
         let res = target.eval(NAV_TEARDOWN_JS)?;
         state.forget(key);
         state.open = false;
@@ -714,6 +842,19 @@ pub(crate) fn panel_step(
         bridge.on_recon(sample);
     }
     state.note_view(key, role.hosts_entry, tick.showing);
+    // 库在客户端外壳里, 右键菜单只装那儿; 装一次, 之后每轮只推一次"哪些是我们的".
+    if role.hosts_entry && tick.mounted() {
+        if !tick.menu_armed {
+            target.eval(LIBRARY_MENU_JS)?;
+        }
+        {
+            let js = managed_apps_js(&bridge.managed_apps());
+            if state.last_managed.get(key) != Some(&js) {
+                target.eval(&js)?;
+                state.last_managed.insert(key.to_owned(), js);
+            }
+        }
+    }
     let mut just_asked = false;
     if tick.want {
         just_asked = !state.open;
@@ -781,6 +922,8 @@ pub struct PanelTick {
     pub why: String,
     /// 这个视图此刻真的摆在用户面前 (可见且有实际尺寸).
     pub showing: bool,
+    /// 库右键菜单已经装过监听了.
+    pub menu_armed: bool,
     /// 面板已经在页面上.
     pub has: bool,
     pub intents: Vec<ConfigIntent>,
@@ -819,6 +962,7 @@ pub fn parse_panel_tick(v: &Value) -> PanelTick {
             .to_owned(),
         // 只有可见且够大才算摆在面前: SharedJSContext 是 visible 的, 但只有 1x1.
         // 尺寸按 f64 读 —— 缩放下 innerWidth 会是小数, 按整数读会解析失败当成 0.
+        menu_armed: v.get("menu").and_then(Value::as_bool).unwrap_or(false),
         showing: v.get("vis").and_then(Value::as_bool).unwrap_or(false)
             && surface_side(v, "w") >= MIN_SURFACE
             && surface_side(v, "h") >= MIN_SURFACE,
@@ -850,6 +994,12 @@ fn parse_intents(v: Option<&Value>) -> (Vec<ConfigIntent>, usize) {
     (out, dropped)
 }
 
+/// 意图里的 app_id; 负数 / 越界 / 0 都不是合法 app.
+fn app_id(item: &Value) -> Option<u32> {
+    let id = item.get("app_id")?.as_u64()?;
+    u32::try_from(id).ok().filter(|&id| id > 0)
+}
+
 fn parse_one(item: &Value) -> Option<ConfigIntent> {
     let kind = item.get("kind")?.as_str()?;
     let value = item.get("value").and_then(Value::as_str).unwrap_or("");
@@ -863,6 +1013,8 @@ fn parse_one(item: &Value) -> Option<ConfigIntent> {
         "set_manifest_url" => ConfigIntent::set_manifest_url(value),
         "add_lua_path" => ConfigIntent::add_lua_path(value),
         "remove_lua_path" => ConfigIntent::remove_lua_path(value),
+        "refresh_app" => ConfigIntent::refresh_app(app_id(item)?),
+        "remove_app" => ConfigIntent::remove_app(app_id(item)?),
         _ => None,
     }
 }
@@ -872,6 +1024,15 @@ mod tests {
     use super::*;
     use serde_json::json;
     use stt_config::ToolId;
+
+    /// 只看面板相关的动作 —— 库右键那两下 (装监听 / 推 managed) 与面板无关.
+    fn panel_acts(page: &FakePage) -> Vec<&'static str> {
+        page.seen
+            .iter()
+            .copied()
+            .filter(|a| !matches!(*a, "menu" | "managed" | "menu_off"))
+            .collect()
+    }
 
     /// 测试里的角色速写, 免得每处都展开字段.
     fn role(enabled: bool, hosts_entry: bool) -> ViewRole {
@@ -1159,6 +1320,18 @@ mod tests {
                 self.seen.push("close");
                 return Ok(json!("closed"));
             }
+            if js == LIBRARY_MENU_JS {
+                self.seen.push("menu");
+                return Ok(json!("armed"));
+            }
+            if js == LIBRARY_MENU_TEARDOWN_JS {
+                self.seen.push("menu_off");
+                return Ok(json!("off"));
+            }
+            if js.starts_with("window.__SteamToolsManaged=") {
+                self.seen.push("managed");
+                return Ok(Value::Null);
+            }
             self.seen.push("update");
             Ok(json!("ok"))
         }
@@ -1166,6 +1339,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeHost {
+        /// 算过几次整份快照 —— 它要扫目录, 不该在面板关着时发生.
+        snapshots: usize,
         note: String,
         got: Vec<ConfigIntent>,
         recon: Vec<String>,
@@ -1176,12 +1351,16 @@ mod tests {
             true
         }
         fn snapshot(&mut self) -> Option<ConfigSnapshot> {
+            self.snapshots += 1;
             Some(ConfigSnapshot::from_state(
                 &stt_config::ConfigState::new(),
                 std::path::Path::new("C:/steam"),
                 "pipe",
                 &self.note,
             ))
+        }
+        fn managed_apps(&mut self) -> Vec<u32> {
+            Vec::new()
         }
         fn on_intents(&mut self, intents: &[ConfigIntent]) {
             self.got.extend_from_slice(intents);
@@ -1198,7 +1377,7 @@ mod tests {
         let mut state = PanelState::default();
         let out = panel_step("t1", &mut page, &mut host, &mut state, role(true, true)).unwrap();
         assert!(out.opened);
-        assert_eq!(page.seen, vec!["tick", "open", "update"]);
+        assert_eq!(panel_acts(&page), vec!["tick", "open", "update"]);
     }
 
     /// 面板开着但内容没变就别推 — 600ms 一轮, 白推就是白烧.
@@ -1209,11 +1388,11 @@ mod tests {
         let mut state = PanelState::default();
         panel_step("t1", &mut page, &mut host, &mut state, role(true, true)).unwrap();
         panel_step("t1", &mut page, &mut host, &mut state, role(true, true)).unwrap();
-        assert_eq!(page.seen, vec!["tick", "update", "tick"]);
+        assert_eq!(panel_acts(&page), vec!["tick", "update", "tick"]);
 
         host.note = "已保存".into();
         panel_step("t1", &mut page, &mut host, &mut state, role(true, true)).unwrap();
-        assert_eq!(page.seen.last(), Some(&"update"));
+        assert_eq!(panel_acts(&page).last(), Some(&"update"));
     }
 
     /// 面板没开就只 tick, 不该往页面里塞任何东西.
@@ -1223,7 +1402,7 @@ mod tests {
         let mut host = FakeHost::default();
         let mut state = PanelState::default();
         panel_step("t1", &mut page, &mut host, &mut state, role(true, true)).unwrap();
-        assert_eq!(page.seen, vec!["tick"]);
+        assert_eq!(panel_acts(&page), vec!["tick"]);
     }
 
     /// 窗口刚建出来时 body 是空的, 这轮什么都别做.
@@ -1234,7 +1413,7 @@ mod tests {
         let mut state = PanelState::default();
         let out = panel_step("t1", &mut page, &mut host, &mut state, role(true, true)).unwrap();
         assert!(!out.opened);
-        assert_eq!(page.seen, vec!["tick"]);
+        assert_eq!(panel_acts(&page), vec!["tick"]);
     }
 
     /// 商店视图摆在面前时, 面板必须画进它 —— 画在客户端文档里会被它整块盖住.
@@ -1327,6 +1506,67 @@ mod tests {
         assert!(!out.opened, "面板画进了 1x1 的视图");
     }
 
+    /// 库右键只对我们加的 app 生效 —— 用户自己的游戏要照常弹 Steam 的菜单.
+    #[test]
+    fn the_library_menu_defers_to_steam_for_other_games() {
+        assert!(LIBRARY_MENU_JS.contains("managed.indexOf(id)<0) return"));
+        assert!(LIBRARY_MENU_JS.contains("preventDefault"));
+        // 认 app 靠图片路径, 不靠混淆的类名.
+        assert!(LIBRARY_MENU_JS.contains("(?:assets|apps)"));
+    }
+
+    /// 菜单挂一次就够, tick 要能报出来, 否则每轮重装一遍监听.
+    #[test]
+    fn the_library_menu_is_armed_once() {
+        assert!(NAV_TICK_JS.contains("out.menu="));
+        assert!(parse_panel_tick(&json!({"menu":true})).menu_armed);
+        assert!(!parse_panel_tick(&json!({})).menu_armed);
+    }
+
+    /// 面板关着时不该去算整份快照 —— 那里面的受管列表要扫目录, 每轮来太贵.
+    #[test]
+    fn a_closed_panel_costs_no_snapshot() {
+        let mut state = PanelState::default();
+        let mut host = FakeHost::default();
+        let mut page = FakePage::new(json!({"s":"already","menu":true}));
+        panel_step("shell", &mut page, &mut host, &mut state, role(true, true)).unwrap();
+        assert_eq!(host.snapshots, 0, "面板没开却算了快照");
+        assert!(page.seen.contains(&"managed"), "受管列表还是要推的");
+    }
+
+    #[test]
+    fn managed_ids_reach_the_page_as_a_literal_array() {
+        assert_eq!(
+            managed_apps_js(&[7, 42]),
+            "window.__SteamToolsManaged=[7,42];"
+        );
+        assert_eq!(managed_apps_js(&[]), "window.__SteamToolsManaged=[];");
+    }
+
+    #[test]
+    fn app_intents_are_parsed() {
+        let tick = parse_panel_tick(&json!({"q":[
+            {"kind":"refresh_app","app_id":730},
+            {"kind":"remove_app","app_id":440}
+        ]}));
+        assert_eq!(
+            tick.intents,
+            vec![ConfigIntent::RefreshApp(730), ConfigIntent::RemoveApp(440)]
+        );
+    }
+
+    /// app_id 缺失 / 为 0 / 越界都不是合法目标.
+    #[test]
+    fn bad_app_ids_are_dropped() {
+        let tick = parse_panel_tick(&json!({"q":[
+            {"kind":"remove_app"},
+            {"kind":"remove_app","app_id":0},
+            {"kind":"refresh_app","app_id":99999999999u64}
+        ]}));
+        assert!(tick.intents.is_empty());
+        assert_eq!(tick.dropped, 3);
+    }
+
     /// 用户关掉面板 (tick 报 closed), 宿主要认账, 否则会以为还开着, 再也不给开.
     #[test]
     fn closing_lets_it_be_reopened() {
@@ -1358,7 +1598,7 @@ mod tests {
         let mut host = FakeHost::default();
         let mut state = PanelState::default();
         let out = panel_step("t1", &mut page, &mut host, &mut state, role(false, true)).unwrap();
-        assert_eq!(page.seen, vec!["teardown"]);
+        assert_eq!(panel_acts(&page), vec!["teardown"]);
         assert_eq!(out.tick.state, "removed");
     }
 
