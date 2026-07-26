@@ -30,16 +30,18 @@ pub fn eval_lua_to_bundle(source: &str) -> Result<CatalogBundle> {
     {
         let b = Arc::clone(&bundle);
         let f = lua
-            .create_function(move |_, (id, _unused, key): (u32, Option<Value>, Option<String>)| {
-                let mut g = lock_bundle(&b);
-                g.apps.push(id);
-                if let Some(k) = key {
-                    if k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()) {
-                        g.depot_keys.insert(id, k);
+            .create_function(
+                move |_, (id, _unused, key): (u32, Option<Value>, Option<String>)| {
+                    let mut g = lock_bundle(&b);
+                    g.apps.push(id);
+                    if let Some(k) = key {
+                        if k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()) {
+                            g.depot_keys.insert(id, k);
+                        }
                     }
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+            )
             .map_err(lua_err)?;
         lua.globals().set("addappid", f).map_err(lua_err)?;
     }
@@ -113,10 +115,7 @@ setmanifestid(228980, "9876543210")
         let mut rules = AppRules::new();
         apply_lua_chunk(&mut rules, src).unwrap();
         assert!(rules.is_owned(1361510));
-        assert_eq!(
-            rules.depot_key(1361510).map(|s| s.len()),
-            Some(64)
-        );
+        assert_eq!(rules.depot_key(1361510).map(|s| s.len()), Some(64));
         assert_eq!(rules.access_token(1361510), Some(1234567890));
         assert_eq!(
             rules.manifest_override(228980).map(|m| m.manifest_gid),
