@@ -1,6 +1,9 @@
-//! Small Windows helpers: paths, data dir, threads from DllMain.
+//! Small Windows helpers: paths, data dir, threads, hash, modules.
 
 #![cfg(windows)]
+
+mod hash;
+mod module;
 
 use std::path::{Path, PathBuf};
 
@@ -8,9 +11,27 @@ use windows::Win32::Foundation::{HMODULE, MAX_PATH};
 use windows::Win32::System::LibraryLoader::{DisableThreadLibraryCalls, GetModuleFileNameW};
 use windows::Win32::System::Threading::CreateThread;
 
+pub use hash::{sha256_bytes, sha256_file};
+pub use module::{module_handle, module_info, module_path, module_path_by_name, read_module_bytes, ModuleInfo};
+
 pub const DATA_DIR_NAME: &str = "steamtools";
 pub const LEGACY_DATA_DIR_NAME: &str = "opensteamtool";
 pub const HOST_DLL_NAME: &str = "SteamTools.dll";
+
+pub fn pattern_cache_dir(steam_root: &Path, component: &str) -> PathBuf {
+    data_dir(steam_root).join("pattern").join(component)
+}
+
+pub fn pattern_cache_file(steam_root: &Path, component: &str, sha256_hex: &str) -> PathBuf {
+    pattern_cache_dir(steam_root, component).join(format!("{sha256_hex}.toml"))
+}
+
+pub fn legacy_pattern_cache_file(steam_root: &Path, component: &str, sha256_hex: &str) -> PathBuf {
+    legacy_data_dir(steam_root)
+        .join("pattern")
+        .join(component)
+        .join(format!("{sha256_hex}.toml"))
+}
 
 pub fn module_directory(module: HMODULE) -> Option<PathBuf> {
     let mut buf = vec![0u16; MAX_PATH as usize];
