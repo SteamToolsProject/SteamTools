@@ -15,8 +15,11 @@ mod lua_dsl;
 mod lua_load;
 
 pub use catalog::{CatalogProvider, MockCatalogProvider};
+#[cfg(feature = "lua")]
+pub use catalog_add::remove_from_library;
 pub use catalog_add::{
     add_to_library, catalog_lua_path, format_catalog_lua, write_catalog_lua, AddToLibraryOutcome,
+    RemoveFromLibraryOutcome,
 };
 pub use error::{ConfigError, Result};
 pub use host_toml::{
@@ -27,7 +30,7 @@ pub use intent::{
     apply_intent, host_toml_write_path, save_host_change, ConfigIntent, LOG_LEVELS,
     MANIFEST_SOURCES,
 };
-pub use snapshot::{ConfigSnapshot, ToolView};
+pub use snapshot::{managed_apps, ConfigSnapshot, HostFacts, ToolDetails, ToolView};
 pub use tools::{builtin_manifests, ToolId, ToolManifest, ToolRegistry};
 pub use watch::DebouncedWatcher;
 
