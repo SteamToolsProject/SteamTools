@@ -9,6 +9,7 @@ mod cdp_bridge;
 mod click_bridge;
 mod install;
 mod library_ux;
+mod store_debug;
 mod store_inject;
 mod store_native;
 
@@ -22,6 +23,10 @@ pub use install::{
     LIBRARY_UX_HOOK_SYMBOLS, LIBRARY_UX_SYMBOLS,
 };
 pub use library_ux::{LibraryUx, RemovalDrainAction};
+pub use store_debug::{
+    alloc_cef_debug_port, cdp_host_port, cef_debug_port, is_webhelper_launch,
+    rewrite_webhelper_cmdline, LEGACY_CDP_PORT,
+};
 pub use store_inject::{app_id_from_store_path, STORE_INJECT_JS};
 pub use store_native::{
     builtin_steamui_pattern, ensure_builtin_steamui_pattern, is_observing, remembered_window_count,

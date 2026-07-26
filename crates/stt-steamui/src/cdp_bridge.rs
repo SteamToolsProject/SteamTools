@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::store_debug::cdp_host_port;
 use crate::store_inject::STORE_INJECT_JS;
 
-const DEFAULT_CDP: &str = "127.0.0.1:8080";
 const DRAIN_JS: &str = r#"(function(){var p=window.__SteamToolsPending||[];window.__SteamToolsPending=[];return p;})()"#;
 
 /// CDP 专用短脚本: 大脚本在 CEF evaluate 上偶发挂起; 短脚本狗粮已验证 near-cart 可挂.
@@ -251,7 +251,7 @@ pub fn poll_store_cdp(host_port: &str, inject_js: &str) -> StoreCdpPoll {
 
 /// 默认脚本 + 默认端口的一次轮询.
 pub fn poll_store_cdp_default() -> StoreCdpPoll {
-    poll_store_cdp(DEFAULT_CDP, STORE_INJECT_JS)
+    poll_store_cdp(&cdp_host_port(), STORE_INJECT_JS)
 }
 
 /// 后台循环: 注入 + 回调 app_id (pending 队列兜底; 点击优先走 click_bridge fetch).
@@ -283,7 +283,7 @@ pub fn run_store_cdp_loop_with_js(
         // 单次轮询 panic 不能弄死整条桥: 之前 ws 握手 panic 让线程静默退出,
         // 表现就是日志停在 store_pages=0 且按钮永远挂不上.
         let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            poll_store_cdp(DEFAULT_CDP, &js)
+            poll_store_cdp(&cdp_host_port(), &js)
         })) {
             Ok(r) => r,
             Err(_) => {
