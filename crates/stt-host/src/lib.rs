@@ -398,6 +398,7 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     append_host_log(steam_root, "package=setup begin");
     let package = setup_package_layer(steam_root, &state, &patterns);
     append_host_log(steam_root, "package=setup end");
+    let download = plan_download_layer(steam_root, &state, &patterns);
     match stt_hook::run_harmless_self_test() {
         Ok(n) => append_host_log(steam_root, &format!("hook_self_test=ok calls={n}")),
         Err(e) => append_host_log(steam_root, &format!("hook_self_test=err {e}")),
@@ -441,6 +442,7 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         &state,
         &library_ux_report,
         &package,
+        &download,
         &native,
         use_pipe,
         cef.caught_webhelper(),
@@ -983,11 +985,58 @@ fn setup_package_layer(
     report
 }
 
+fn download_env_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "off" | "false" | "no")
+        }
+        Err(_) => true,
+    }
+}
+
+fn plan_download_layer(
+    steam_root: &Path,
+    state: &ConfigState,
+    patterns: &stt_metadata::PatternStore,
+) -> stt_steamclient::DownloadKitReport {
+    let request_code = matches!(
+        state.host().manifest.url.as_str(),
+        "opensteamtool" | "steamrun" | "wudrm"
+    );
+    let data = state.with_rules(|rules| stt_steamclient::DownloadDataAvailability {
+        manifest: rules.has_manifest_overrides(),
+        key: rules.has_depot_keys(),
+        token: rules.has_access_tokens(),
+        request_code,
+    });
+    let switches = stt_steamclient::DownloadRuntimeSwitches {
+        manifest: download_env_enabled("STEAMTOOLS_DOWNLOAD_MANIFEST"),
+        key: download_env_enabled("STEAMTOOLS_DOWNLOAD_KEY"),
+        token: download_env_enabled("STEAMTOOLS_DOWNLOAD_TOKEN"),
+        request_code: download_env_enabled("STEAMTOOLS_DOWNLOAD_REQUEST_CODE"),
+    };
+    let report = stt_steamclient::plan_download_kit(
+        &state.tools(),
+        patterns,
+        "steamclient",
+        stt_steamclient::DownloadFeatureSet::compiled(),
+        switches,
+        data,
+    );
+    append_host_log(
+        steam_root,
+        &format!("download_kit {}", report.summary_line()),
+    );
+    report
+}
+
 /// 各工具此刻的运行状态 —— 开着不等于跑起来了, 这些原来只进 host.log.
 fn tool_details(
     state: &ConfigState,
     library_ux: &stt_steamui::LibraryUxInstallReport,
     package: &stt_steamclient::PackageInstallReport,
+    download: &stt_steamclient::DownloadKitReport,
     native: &stt_steamui::StoreNativeReport,
     use_pipe: bool,
     caught: bool,
@@ -1043,37 +1092,13 @@ fn tool_details(
     );
     d.insert(
         ToolId::DownloadKit.as_str(),
-        download_kit_detail(&tools),
+        download.detail_for_ui(),
     );
     d.insert(
         ToolId::StoreAccel.as_str(),
         format!("尚未实现; 原生注入路径: {:?}", native.status),
     );
     d
-}
-
-fn download_kit_detail(tools: &stt_config::ToolRegistry) -> String {
-    if !tools.is_enabled(ToolId::DownloadKit) {
-        return "已关闭, 下载能力不安装".to_owned();
-    }
-    let mut capabilities = Vec::new();
-    if cfg!(feature = "download-manifest") {
-        capabilities.push("manifest");
-    }
-    if cfg!(feature = "download-key") {
-        capabilities.push("key");
-    }
-    if cfg!(feature = "download-token") {
-        capabilities.push("token");
-    }
-    if cfg!(feature = "download-request-code") {
-        capabilities.push("request-code");
-    }
-    if capabilities.is_empty() {
-        "已开启, 当前构建未包含下载能力".to_owned()
-    } else {
-        format!("已开启, 编译能力: {}; hook 尚未安装", capabilities.join(","))
-    }
 }
 
 /// 处理 steamtools/inbox/*.txt: 每行一个 app_id, 按当前 Catalog 配置入库.
@@ -1535,9 +1560,18 @@ end
     #[test]
     fn download_kit_is_runtime_disabled_by_default() {
         let tools = stt_config::ToolRegistry::with_defaults();
+        let report = stt_steamclient::plan_download_kit(
+            &tools,
+            &stt_metadata::PatternStore::new(),
+            "steamclient",
+            stt_steamclient::DownloadFeatureSet::compiled(),
+            stt_steamclient::DownloadRuntimeSwitches::default(),
+            stt_steamclient::DownloadDataAvailability::default(),
+        );
 
-        let detail = download_kit_detail(&tools);
-
-        assert_eq!(detail, "已关闭, 下载能力不安装");
+        assert!(report
+            .capabilities
+            .iter()
+            .all(|item| item.status == stt_steamclient::DownloadCapabilityStatus::ToolDisabled));
     }
 }
