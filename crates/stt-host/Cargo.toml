@@ -16,7 +16,7 @@ default = []
 download-manifest = ["stt-steamclient/download-manifest"]
 download-key = ["stt-steamclient/download-key"]
 download-token = ["stt-steamclient/download-token"]
-download-request-code = ["stt-steamclient/download-request-code"]
+download-request-code = ["stt-steamclient/download-request-code", "dep:serde_json"]
 
 [dependencies]
 stt-core = { workspace = true }
@@ -27,6 +27,10 @@ stt-metadata = { workspace = true }
 stt-hook = { workspace = true }
 stt-steamui = { workspace = true }
 stt-steamclient = { workspace = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

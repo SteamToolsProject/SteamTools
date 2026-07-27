@@ -7,6 +7,9 @@
 // 会报 unfulfilled_lint_expectations.
 #![allow(non_snake_case)]
 
+#[cfg(feature = "download-request-code")]
+mod manifest_code;
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -401,6 +404,8 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     append_host_log(steam_root, "package=setup begin");
     let package = setup_package_layer(steam_root, &state, &patterns);
     append_host_log(steam_root, "package=setup end");
+    #[cfg(feature = "download-request-code")]
+    manifest_code::spawn_resolver_worker(steam_root, &state);
     let download = plan_download_layer(steam_root, &state, &patterns);
     match stt_hook::run_harmless_self_test() {
         Ok(n) => append_host_log(steam_root, &format!("hook_self_test=ok calls={n}")),
@@ -1120,10 +1125,28 @@ fn sync_download_runtime(state: &ConfigState) {
         let _ = stt_steamclient::replace_access_tokens(values);
     }
 
+    #[cfg(feature = "download-request-code")]
+    {
+        let enabled = state.tools().is_enabled(ToolId::DownloadKit)
+            && download_env_enabled("STEAMTOOLS_DOWNLOAD_REQUEST_CODE");
+        let depots = if enabled {
+            state.with_rules(|rules| {
+                rules
+                    .owned_iter()
+                    .flat_map(|app_id| rules.app_depots(app_id).iter().copied())
+                    .collect::<HashSet<_>>()
+            })
+        } else {
+            HashSet::new()
+        };
+        let _ = stt_steamclient::replace_manifest_code_depots(depots);
+    }
+
     #[cfg(not(any(
         feature = "download-manifest",
         feature = "download-key",
-        feature = "download-token"
+        feature = "download-token",
+        feature = "download-request-code"
     )))]
     let _ = state;
 }
