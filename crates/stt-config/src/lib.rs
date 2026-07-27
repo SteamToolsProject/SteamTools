@@ -15,6 +15,8 @@ mod lua_load;
 #[cfg(feature = "lua")]
 mod lua_http;
 #[cfg(feature = "lua")]
+mod lua_manifest_code;
+#[cfg(feature = "lua")]
 mod lua_catalog;
 
 #[cfg(feature = "lua")]
@@ -43,6 +45,10 @@ pub use lua_dsl::{apply_lua_chunk, eval_lua_to_bundle, eval_lua_to_bundle_with_h
 #[cfg(feature = "lua")]
 pub use lua_http::{
     LuaHttpClient, LuaHttpErrorKind, LuaHttpMethod, LuaHttpRequest, LuaHttpResponse,
+};
+#[cfg(feature = "lua")]
+pub use lua_manifest_code::{
+    LuaManifestCodeErrorKind, LuaManifestCodeExecutor, LuaManifestCodeResult,
 };
 #[cfg(feature = "lua")]
 pub use lua_load::{
