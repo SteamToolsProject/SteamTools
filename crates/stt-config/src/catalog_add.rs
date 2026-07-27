@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use stt_catalog::{validate_bundle, CatalogProvider};
+use stt_catalog::{validate_bundle, CatalogProvider, CatalogTraceEntry};
 use stt_core::{AppId, CatalogBundle};
 
 use crate::error::{ConfigError, Result};
@@ -16,6 +16,7 @@ use crate::ConfigState;
 pub struct AddToLibraryOutcome {
     pub app_id: AppId,
     pub provider_id: String,
+    pub provider_trace: Vec<CatalogTraceEntry>,
     pub lua_path: PathBuf,
     pub epoch: u64,
     pub owned_count: usize,
@@ -92,7 +93,8 @@ pub fn add_to_library(
         return Err(ConfigError::Invalid("catalog_add tool is disabled".into()));
     }
 
-    let mut bundle = validate_bundle(app_id, provider.fetch(app_id)?)?;
+    let fetched = provider.fetch_with_trace(app_id)?;
+    let mut bundle = validate_bundle(app_id, fetched.bundle)?;
     bundle.purchase_times.entry(app_id).or_insert_with(now_unix);
 
     let lua_path = write_catalog_lua(steam_root, app_id, &bundle)?;
@@ -110,7 +112,8 @@ pub fn add_to_library(
 
     Ok(AddToLibraryOutcome {
         app_id,
-        provider_id: provider.id().to_string(),
+        provider_id: fetched.source,
+        provider_trace: fetched.trace,
         lua_path,
         epoch: state.rules_epoch(),
         owned_count: state.owned_count(),

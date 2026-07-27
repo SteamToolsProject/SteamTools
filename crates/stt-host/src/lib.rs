@@ -14,12 +14,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use stt_catalog::{
-    CatalogError, CatalogLimits, CatalogProvider, CustomHttpCatalogProvider, MockCatalogProvider,
+    CatalogError, CatalogLimits, CatalogProvider, CatalogProviderChain, CatalogTraceEntry,
+    CatalogTraceOutcome, CommunityCatalogProvider, CustomHttpCatalogProvider, MockCatalogProvider,
     ProviderErrorKind,
 };
 use stt_config::{
     add_to_library, apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent,
-    ConfigSnapshot, ConfigState, HostConfig, ToolId,
+    ConfigSnapshot, ConfigState, HostConfig, LuaCatalogProvider, LuaHttpClient, LuaHttpErrorKind,
+    LuaHttpMethod, LuaHttpRequest, LuaHttpResponse, ToolId,
 };
 use stt_core::{AppId, AppRules};
 use stt_steamclient::{LicenseQueue, UiLicenseAction};
@@ -140,7 +142,67 @@ fn catalog_mode_line(state: &ConfigState) -> String {
     format!("catalog_mode={}", state.host().catalog.mode.as_str())
 }
 
+struct WinHttpLuaClient {
+    options: stt_platform::WinHttpRequestOptions,
+}
+
+impl LuaHttpClient for WinHttpLuaClient {
+    fn execute(&self, request: LuaHttpRequest) -> Result<LuaHttpResponse, LuaHttpErrorKind> {
+        let method = match request.method {
+            LuaHttpMethod::Get => stt_platform::HttpMethod::Get,
+            LuaHttpMethod::Post => stt_platform::HttpMethod::Post,
+        };
+        let response = stt_platform::winhttp_request(
+            method,
+            &request.url,
+            &request.headers,
+            &request.body,
+            self.options,
+        )
+        .map_err(map_lua_http_error)?;
+        Ok(LuaHttpResponse {
+            status: response.status,
+            body: response.body,
+        })
+    }
+}
+
+fn map_lua_http_error(error: stt_platform::HttpError) -> LuaHttpErrorKind {
+    match error {
+        stt_platform::HttpError::Timeout { .. } => LuaHttpErrorKind::Timeout,
+        stt_platform::HttpError::RequestTooLarge { .. } => LuaHttpErrorKind::RequestTooLarge,
+        stt_platform::HttpError::ResponseTooLarge { .. } => LuaHttpErrorKind::ResponseTooLarge,
+        stt_platform::HttpError::InvalidUrl(_) | stt_platform::HttpError::InvalidOptions(_) => {
+            LuaHttpErrorKind::InvalidRequest
+        }
+        stt_platform::HttpError::Windows { .. } => LuaHttpErrorKind::Unavailable,
+    }
+}
+
+fn catalog_http_options(config: &CatalogSection) -> stt_platform::WinHttpRequestOptions {
+    stt_platform::WinHttpRequestOptions {
+        timeouts: stt_platform::WinHttpTimeouts {
+            resolve_ms: config.timeout_resolve_ms,
+            connect_ms: config.timeout_connect_ms,
+            send_ms: config.timeout_send_ms,
+            receive_ms: config.timeout_recv_ms,
+        },
+        max_request_body_bytes: 256 * 1024,
+        max_response_body_bytes: config
+            .max_response_bytes
+            .min(CatalogLimits::default().max_wire_bytes),
+    }
+}
+
+fn with_community_fallback(provider: Box<dyn CatalogProvider>) -> Box<dyn CatalogProvider> {
+    Box::new(CatalogProviderChain::new(vec![
+        provider,
+        Box::new(CommunityCatalogProvider),
+    ]))
+}
+
 fn build_catalog_provider(
+    steam_root: &Path,
     config: &CatalogSection,
 ) -> stt_catalog::CatalogResult<Box<dyn CatalogProvider>> {
     match config.mode {
@@ -153,22 +215,33 @@ fn build_catalog_provider(
             MockCatalogProvider::new().with_auto_generate(true),
         )),
         CatalogMode::CustomHttp => {
+            let request_options = catalog_http_options(config);
             let options = stt_platform::WinHttpGetOptions {
-                timeouts: stt_platform::WinHttpTimeouts {
-                    resolve_ms: config.timeout_resolve_ms,
-                    connect_ms: config.timeout_connect_ms,
-                    send_ms: config.timeout_send_ms,
-                    receive_ms: config.timeout_recv_ms,
-                },
-                max_body_bytes: config
-                    .max_response_bytes
-                    .min(CatalogLimits::default().max_wire_bytes),
+                timeouts: request_options.timeouts,
+                max_body_bytes: request_options.max_response_body_bytes,
             };
-            Ok(Box::new(CustomHttpCatalogProvider::new(
+            let provider = Box::new(CustomHttpCatalogProvider::new(
                 config.url_template.clone(),
                 options,
-            )?))
+            )?);
+            Ok(with_community_fallback(provider))
         }
+        CatalogMode::Lua => {
+            let path = ConfigState::default_lua_dir(steam_root).join("catalog.lua");
+            let source = std::fs::read_to_string(path).map_err(|_| CatalogError::Provider {
+                provider: "lua".to_owned(),
+                kind: ProviderErrorKind::Unavailable,
+                detail: "config/lua/catalog.lua is unavailable".to_owned(),
+            })?;
+            let client: Arc<dyn LuaHttpClient> = Arc::new(WinHttpLuaClient {
+                options: catalog_http_options(config),
+            });
+            let provider = Box::new(LuaCatalogProvider::new(source, Some(client))?);
+            Ok(with_community_fallback(provider))
+        }
+        CatalogMode::Community => Ok(Box::new(CatalogProviderChain::new(vec![Box::new(
+            CommunityCatalogProvider,
+        )]))),
     }
 }
 
@@ -178,8 +251,31 @@ fn add_from_config(
     app_id: AppId,
 ) -> stt_config::Result<stt_config::AddToLibraryOutcome> {
     let host = state.host();
-    let provider = build_catalog_provider(&host.catalog)?;
+    let provider = build_catalog_provider(steam_root, &host.catalog)?;
     add_to_library(state, steam_root, provider.as_ref(), app_id)
+}
+
+fn catalog_trace_text(trace: &[CatalogTraceEntry]) -> String {
+    trace
+        .iter()
+        .map(|entry| match entry.outcome {
+            CatalogTraceOutcome::Hit => format!("{}:hit", entry.provider),
+            CatalogTraceOutcome::Failed(kind) => {
+                format!("{}:failed:{kind:?}", entry.provider)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn catalog_error_text(error: &stt_config::ConfigError) -> String {
+    match error {
+        stt_config::ConfigError::Catalog(CatalogError::ChainExhausted { trace }) => format!(
+            "catalog provider chain exhausted trace={}",
+            catalog_trace_text(trace)
+        ),
+        _ => error.to_string(),
+    }
 }
 
 /// 调试通道给谁用: 入库按钮和配置页都靠它, 有一个开着就得装 hook.
@@ -440,10 +536,11 @@ fn spawn_catalog_worker(
                         append_host_log(
                             &root,
                             &format!(
-                                "catalog_add=ok source={} app_id={} provider={} lua={} epoch={} owned={}",
+                                "catalog_add=ok source={} app_id={} provider={} trace={} lua={} epoch={} owned={}",
                                 job.source.as_str(),
                                 job.app_id,
                                 out.provider_id,
+                                catalog_trace_text(&out.provider_trace),
                                 out.lua_path.display(),
                                 out.epoch,
                                 out.owned_count
@@ -466,15 +563,16 @@ fn spawn_catalog_worker(
                         }
                     }
                     Err(error) => {
+                        let error_text = catalog_error_text(&error);
                         append_host_log(
                             &root,
                             &format!(
-                                "catalog_add=err source={} app_id={} {error}",
+                                "catalog_add=err source={} app_id={} {error_text}",
                                 job.source.as_str(),
                                 job.app_id
                             ),
                         );
-                        set_shared_note(&note, format!("失败: 入库 {}: {error}", job.app_id));
+                        set_shared_note(&note, format!("失败: 入库 {}: {error_text}", job.app_id));
                         if matches!(job.source, CatalogJobSource::StoreCdp) {
                             let _ = feedback_tx.send(stt_steamui::store_button_result_js(
                                 job.app_id,
@@ -898,6 +996,8 @@ fn tool_details(
     let catalog = match state.host().catalog.mode {
         CatalogMode::Disabled => "Catalog 未配置",
         CatalogMode::CustomHttp => "Catalog: CustomHttp",
+        CatalogMode::Lua => "Catalog: Lua (config/lua/catalog.lua)",
+        CatalogMode::Community => "Catalog: Community 暂不可用",
         CatalogMode::Mock => "Catalog: Mock 开发模式",
     };
     let mut d = stt_config::ToolDetails::new();
@@ -1000,8 +1100,9 @@ fn process_inbox(
                     append_host_log(
                         steam_root,
                         &format!(
-                            "catalog_add=ok app_id={app_id} provider={} lua={} epoch={} owned={}",
+                            "catalog_add=ok app_id={app_id} provider={} trace={} lua={} epoch={} owned={}",
                             out.provider_id,
+                            catalog_trace_text(&out.provider_trace),
                             out.lua_path.display(),
                             out.epoch,
                             out.owned_count
@@ -1009,9 +1110,13 @@ fn process_inbox(
                     );
                     on_library_added(steam_root, app_id);
                 }
-                Err(e) => {
-                    append_host_log(steam_root, &format!("catalog_add=err app_id={app_id} {e}"))
-                }
+                Err(error) => append_host_log(
+                    steam_root,
+                    &format!(
+                        "catalog_add=err app_id={app_id} {}",
+                        catalog_error_text(&error)
+                    ),
+                ),
             }
         }
         if !any {
@@ -1357,12 +1462,45 @@ mod tests {
 
     #[test]
     fn mock_provider_requires_explicit_mode() {
+        let dir = Path::new("unused");
         let mut config = CatalogSection::default();
-        assert!(build_catalog_provider(&config).is_err());
+        assert!(build_catalog_provider(dir, &config).is_err());
 
         config.mode = CatalogMode::Mock;
-        let provider = build_catalog_provider(&config).unwrap();
+        let provider = build_catalog_provider(dir, &config).unwrap();
 
         assert_eq!(provider.id(), "mock");
+    }
+
+    #[test]
+    fn lua_catalog_uses_fixed_file_and_reports_final_source() {
+        let root = std::env::temp_dir().join(format!(
+            "steamtools-host-lua-catalog-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let lua_dir = ConfigState::default_lua_dir(&root);
+        fs::create_dir_all(&lua_dir).unwrap();
+        fs::write(
+            lua_dir.join("catalog.lua"),
+            r#"
+function fetch_catalog(app_id)
+  return '{"schema_version":1,"apps":[{"app_id":' .. app_id .. '}]}'
+end
+"#,
+        )
+        .unwrap();
+        let config = CatalogSection {
+            mode: CatalogMode::Lua,
+            ..CatalogSection::default()
+        };
+
+        let provider = build_catalog_provider(&root, &config).unwrap();
+        let outcome = provider.fetch_with_trace(42).unwrap();
+
+        assert_eq!(outcome.source, "lua");
+        assert_eq!(outcome.trace.len(), 1);
+        assert_eq!(outcome.trace[0].outcome, CatalogTraceOutcome::Hit);
+        let _ = fs::remove_dir_all(root);
     }
 }

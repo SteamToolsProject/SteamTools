@@ -2,6 +2,19 @@
 
 use stt_core::{AppId, DepotId};
 
+/// 单次 Catalog provider 尝试的脱敏结果.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogTraceEntry {
+    pub provider: String,
+    pub outcome: CatalogTraceOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogTraceOutcome {
+    Hit,
+    Failed(ProviderErrorKind),
+}
+
 /// provider 执行失败的稳定分类.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderErrorKind {
@@ -28,6 +41,9 @@ pub enum CatalogError {
         /// 不包含 key/token 正文的诊断.
         detail: String,
     },
+    /// provider chain 已全部失败, 只保留脱敏分类.
+    #[error("catalog provider chain exhausted")]
+    ChainExhausted { trace: Vec<CatalogTraceEntry> },
     /// wire body 超过协议层上限.
     #[error("catalog payload too large: {actual} bytes, limit {limit}")]
     PayloadTooLarge {
