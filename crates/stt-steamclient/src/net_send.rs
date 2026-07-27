@@ -24,6 +24,10 @@ pub(crate) fn is_consumer_attached(capability: DownloadCapability) -> bool {
     ATTACHED.load(Ordering::SeqCst) && consumer_active(capability).load(Ordering::SeqCst)
 }
 
+pub(crate) fn deactivate_consumer(capability: DownloadCapability) {
+    consumer_active(capability).store(false, Ordering::SeqCst);
+}
+
 pub(crate) fn try_install_consumer(
     report: &mut DownloadKitReport,
     patterns: &PatternStore,

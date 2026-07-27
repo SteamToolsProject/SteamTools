@@ -256,21 +256,65 @@ pub fn manifest_code_hook_stats() -> (u64, u64, u64, u64, u64) {
     )
 }
 
-pub fn is_manifest_code_send_hook_attached() -> bool {
-    crate::net_send::is_consumer_attached(DownloadCapability::RequestCode)
+pub fn is_manifest_code_hook_attached() -> bool {
+    crate::net_recv::is_active()
+        && crate::net_send::is_consumer_attached(DownloadCapability::RequestCode)
 }
 
-/// 只安装共用发送入口; RecvPkt 验证并挂上前 host 不应调用.
-pub fn try_install_manifest_code_send_hook(
-    report: &mut DownloadKitReport,
-    patterns: &PatternStore,
-) {
+/// 先挂接收入口, 再激活共用发送入口; 不产生 send-only 状态.
+pub fn try_install_manifest_code_hooks(report: &mut DownloadKitReport, patterns: &PatternStore) {
+    let Some(status) = report
+        .capabilities
+        .iter()
+        .find(|item| item.capability == DownloadCapability::RequestCode)
+        .map(|item| item.status)
+    else {
+        return;
+    };
+    if is_manifest_code_hook_attached() {
+        if let Some(capability) = report
+            .capabilities
+            .iter_mut()
+            .find(|item| item.capability == DownloadCapability::RequestCode)
+        {
+            capability.status = crate::DownloadCapabilityStatus::HooksAttached;
+            capability.detail = Some("manifest request code send/recv hooks 已挂上".to_owned());
+        }
+        return;
+    }
+    if status != crate::DownloadCapabilityStatus::LogicOnly {
+        return;
+    }
+    if let Err(error) = crate::net_recv::try_install(patterns) {
+        if let Some(capability) = report
+            .capabilities
+            .iter_mut()
+            .find(|item| item.capability == DownloadCapability::RequestCode)
+        {
+            capability.detail = Some(error);
+        }
+        return;
+    }
+
+    crate::net_recv::set_active(true);
     crate::net_send::try_install_consumer(
         report,
         patterns,
         DownloadCapability::RequestCode,
         "manifest request code send",
     );
+    if is_manifest_code_hook_attached() {
+        if let Some(capability) = report
+            .capabilities
+            .iter_mut()
+            .find(|item| item.capability == DownloadCapability::RequestCode)
+        {
+            capability.status = crate::DownloadCapabilityStatus::HooksAttached;
+            capability.detail = Some("manifest request code send/recv hooks 已挂上".to_owned());
+        }
+    } else {
+        crate::net_recv::set_active(false);
+    }
 }
 
 /// 后台 worker 成功时写入完成态. code 正文不会进入诊断状态.
