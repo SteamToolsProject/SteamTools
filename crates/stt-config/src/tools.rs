@@ -37,6 +37,11 @@ impl ToolId {
         }
     }
 
+    /// 默认开: 入库 + 库 UX + 配置页.
+    ///
+    /// 产品表常写「默认仅 catalog_add + library_ux」; 狗粮期把 `config_ui` 也默认开,
+    /// 否则通道 gating (`catalog_add || config_ui`) 下关掉入库会把自己关没,
+    /// 也没法在面板里拨开关. 用户仍可在 toml 里关掉.
     pub fn default_enabled(self) -> bool {
         matches!(
             self,

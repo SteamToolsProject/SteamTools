@@ -58,7 +58,8 @@ pub enum StoreNativeMode {
 
 impl StoreNativeMode {
     /// 商店页在 steamwebhelper (CEF), 不在 steam.exe 的 CHTMLWindow.
-    /// 产品主路径是 CDP 8080; native 默认关, 仅调试时 `STEAMTOOLS_STORE_NATIVE=inject`.
+    /// 产品主路径是 CDP (首选 pipe, 端口为回退); native 默认关, 仅调试时
+    /// `STEAMTOOLS_STORE_NATIVE=inject`.
     pub fn from_env() -> Self {
         mode_from_env_value(&std::env::var("STEAMTOOLS_STORE_NATIVE").unwrap_or_default())
     }
