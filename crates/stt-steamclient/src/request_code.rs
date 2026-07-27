@@ -1,10 +1,17 @@
 //! Manifest request code 的 service-method frame 与有界 job 状态.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+use stt_core::DepotId;
+use stt_metadata::PatternStore;
 
 use crate::manifest_code::ManifestCodeRequest;
 use crate::wire::{encode_varint, parse_field, WireValue};
+use crate::{DownloadCapability, DownloadKitReport};
 
 const BINARY_OPCODE: u32 = 2;
 const PROTO_FLAG: u32 = 0x8000_0000;
@@ -15,6 +22,17 @@ const MAX_PROTO_HEADER_SIZE: usize = 1024;
 const MAX_BODY_SIZE: usize = 65_536;
 const TARGET_JOB_NAME: &[u8] = b"ContentServerDirectory.GetManifestRequestCode#1";
 const ERESULT_OK: u64 = 1;
+const MAX_JOBS: usize = 64;
+const JOB_TTL: Duration = Duration::from_secs(15);
+
+static JOBS: OnceLock<Mutex<ManifestCodeJobTable>> = OnceLock::new();
+static WORKER: OnceLock<SyncSender<ManifestCodeResolveWork>> = OnceLock::new();
+static DEPOTS: OnceLock<RwLock<HashSet<DepotId>>> = OnceLock::new();
+static CALLS: AtomicU64 = AtomicU64::new(0);
+static SUBMITTED: AtomicU64 = AtomicU64::new(0);
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+static COMPLETED: AtomicU64 = AtomicU64::new(0);
+static PATCHED: AtomicU64 = AtomicU64::new(0);
 
 /// 从发送帧提取的解析任务.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +46,19 @@ pub struct ManifestCodeJob {
 pub struct ManifestCodeJobTicket {
     job_id: u64,
     generation: u64,
+}
+
+/// 发送 hook 只构造工作项; resolver 必须在后台消费.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestCodeResolveWork {
+    pub request: ManifestCodeRequest,
+    ticket: ManifestCodeJobTicket,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ManifestCodeDepotSnapshotReport {
+    pub accepted: usize,
+    pub rejected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +206,150 @@ impl ManifestCodeJobTable {
     fn is_expired(&self, entry: JobEntry, now: Instant) -> bool {
         now.saturating_duration_since(entry.inserted_at) >= self.ttl
     }
+}
+
+fn runtime_jobs() -> &'static Mutex<ManifestCodeJobTable> {
+    JOBS.get_or_init(|| {
+        Mutex::new(
+            ManifestCodeJobTable::new(MAX_JOBS, JOB_TTL)
+                .expect("request code job limits are nonzero"),
+        )
+    })
+}
+
+fn configured_depots() -> &'static RwLock<HashSet<DepotId>> {
+    DEPOTS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// 注册唯一的有界后台队列发送端.
+pub fn register_manifest_code_worker(sender: SyncSender<ManifestCodeResolveWork>) -> bool {
+    WORKER.set(sender).is_ok()
+}
+
+/// 替换 request-code 能力允许处理的 depot 快照.
+pub fn replace_manifest_code_depots(
+    depots: impl IntoIterator<Item = DepotId>,
+) -> ManifestCodeDepotSnapshotReport {
+    let mut accepted = HashSet::new();
+    let mut report = ManifestCodeDepotSnapshotReport::default();
+    for depot_id in depots {
+        if depot_id == 0 {
+            report.rejected += 1;
+        } else if accepted.insert(depot_id) {
+            report.accepted += 1;
+        }
+    }
+    let mut guard = configured_depots()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = accepted;
+    report
+}
+
+pub fn manifest_code_hook_stats() -> (u64, u64, u64, u64, u64) {
+    (
+        CALLS.load(Ordering::Relaxed),
+        SUBMITTED.load(Ordering::Relaxed),
+        DROPPED.load(Ordering::Relaxed),
+        COMPLETED.load(Ordering::Relaxed),
+        PATCHED.load(Ordering::Relaxed),
+    )
+}
+
+pub fn is_manifest_code_send_hook_attached() -> bool {
+    crate::net_send::is_consumer_attached(DownloadCapability::RequestCode)
+}
+
+/// 只安装共用发送入口; RecvPkt 验证并挂上前 host 不应调用.
+pub fn try_install_manifest_code_send_hook(
+    report: &mut DownloadKitReport,
+    patterns: &PatternStore,
+) {
+    crate::net_send::try_install_consumer(
+        report,
+        patterns,
+        DownloadCapability::RequestCode,
+        "manifest request code send",
+    );
+}
+
+/// 后台 worker 成功时写入完成态. code 正文不会进入诊断状态.
+pub fn complete_manifest_code_work(
+    work: ManifestCodeResolveWork,
+    request_code: u64,
+) -> ManifestCodeCompletion {
+    let mut jobs = runtime_jobs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let outcome = jobs.complete(work.ticket, request_code, Instant::now());
+    if outcome == ManifestCodeCompletion::Completed {
+        COMPLETED.fetch_add(1, Ordering::Relaxed);
+    }
+    outcome
+}
+
+/// 后台 worker 失败时立即释放容量.
+pub fn cancel_manifest_code_work(work: ManifestCodeResolveWork) -> bool {
+    let mut jobs = runtime_jobs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    jobs.cancel(work.ticket)
+}
+
+pub(crate) fn submit_manifest_code_frame(opcode: u32, packet: &[u8]) {
+    CALLS.fetch_add(1, Ordering::Relaxed);
+    let Some(job) = inspect_manifest_code_request_frame(opcode, packet) else {
+        return;
+    };
+    let Some(depot_id) = job.request.depot_id else {
+        return;
+    };
+    if !configured_depots()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&depot_id)
+    {
+        return;
+    }
+    let Some(worker) = WORKER.get() else {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    let mut jobs = runtime_jobs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ManifestCodeRegister::Registered(ticket) = jobs.register(job.job_id, Instant::now()) else {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let work = ManifestCodeResolveWork {
+        request: job.request,
+        ticket,
+    };
+    match worker.try_send(work) {
+        Ok(()) => {
+            SUBMITTED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Full(work) | TrySendError::Disconnected(work)) => {
+            jobs.cancel(work.ticket);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn rewrite_manifest_code_runtime_response(
+    opcode: u32,
+    packet: &[u8],
+) -> ManifestCodeResponseRewrite {
+    let mut jobs = runtime_jobs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rewrite = rewrite_manifest_code_response_frame(opcode, packet, &mut jobs, Instant::now());
+    if matches!(rewrite, ManifestCodeResponseRewrite::Rewritten { .. }) {
+        PATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+    rewrite
 }
 
 /// 只识别目标 EMsg 151, 不修改发送帧.
@@ -357,6 +532,8 @@ fn read_fixed_u64(input: &[u8], offset: usize) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
 
     fn field_varint(number: u32, value: u64) -> Vec<u8> {
@@ -597,5 +774,36 @@ mod tests {
             ManifestCodeResponseRewrite::Passthrough
         );
         assert_eq!(jobs.len(), 1);
+    }
+
+    #[test]
+    fn runtime_submits_only_configured_depot_and_accepts_worker_result() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert!(register_manifest_code_worker(sender));
+        assert_eq!(
+            replace_manifest_code_depots([0, 20, 20]),
+            ManifestCodeDepotSnapshotReport {
+                accepted: 1,
+                rejected: 1,
+            }
+        );
+
+        submit_manifest_code_frame(2, &request_frame(40));
+        let work = receiver.recv().unwrap();
+        assert_eq!(work.request.depot_id, Some(20));
+        assert_eq!(
+            complete_manifest_code_work(work, 99),
+            ManifestCodeCompletion::Completed
+        );
+
+        let response = frame(
+            SERVICE_METHOD_RESPONSE,
+            &service_header(11, 40, Some(2)),
+            &field_varint(1, 5),
+        );
+        assert!(matches!(
+            rewrite_manifest_code_runtime_response(2, &response),
+            ManifestCodeResponseRewrite::Rewritten { job_id: 40, .. }
+        ));
     }
 }
