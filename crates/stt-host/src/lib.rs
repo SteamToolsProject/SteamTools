@@ -7,15 +7,104 @@
 // 会报 unfulfilled_lint_expectations.
 #![allow(non_snake_case)]
 
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use stt_config::{
     add_to_library, apply_intent, remove_from_library, ConfigIntent, ConfigSnapshot, ConfigState,
     HostConfig, MockCatalogProvider, ToolId,
 };
-use stt_core::AppRules;
+use stt_core::{AppId, AppRules};
+use stt_steamclient::{LicenseQueue, UiLicenseAction};
+
+/// 进程内 package 许可队列 (init 时注册).
+static LICENSE_QUEUE: OnceLock<Arc<LicenseQueue>> = OnceLock::new();
+/// 配置内 app 集合, CheckAppOwnership 钩子只读这份.
+static CONFIGURED_APPS: OnceLock<Arc<Mutex<HashSet<AppId>>>> = OnceLock::new();
+/// 库 UX 纯逻辑控制器 (CancelRemoval / QueueRemoval).
+static LIBRARY_UX: OnceLock<stt_steamui::LibraryUx> = OnceLock::new();
+
+fn license_queue() -> Option<Arc<LicenseQueue>> {
+    LICENSE_QUEUE.get().map(Arc::clone)
+}
+
+fn library_ux() -> &'static stt_steamui::LibraryUx {
+    LIBRARY_UX.get_or_init(stt_steamui::LibraryUx::new)
+}
+
+fn configured_apps() -> Option<Arc<Mutex<HashSet<AppId>>>> {
+    CONFIGURED_APPS.get().map(Arc::clone)
+}
+
+fn sync_configured_from_state(state: &ConfigState) {
+    // 先收集 id, 再锁 mutex 一次.
+    // CONFIGURED_APPS 与 package runtime 共用同一把 Arc<Mutex<HashSet>>,
+    // 若持锁时再调 set_configured_apps 会 **自死锁** (非可重入 Mutex).
+    let ids: Vec<AppId> = state.with_rules(|rules| rules.owned_iter().collect());
+    if let Some(set) = configured_apps() {
+        let mut g = set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.clear();
+        g.extend(ids.iter().copied());
+    } else {
+        // runtime 尚未注册时仍推一份给 hooks 侧 (若已 register 则写同一把锁).
+        stt_steamclient::set_configured_apps(ids);
+    }
+}
+
+fn apply_ui_license_action(action: UiLicenseAction) {
+    let ux = library_ux();
+    match action {
+        UiLicenseAction::CancelRemoval(id) => ux.cancel_removal(id),
+        UiLicenseAction::QueueRemoval(id) => ux.queue_removal(id),
+    }
+}
+
+/// 入库成功后: 入队 + notify (有 hook 则改 client, 否则纯逻辑).
+fn on_library_added(steam_root: &Path, app_id: AppId) {
+    stt_steamclient::add_configured_app(app_id);
+    let Some(q) = license_queue() else {
+        append_host_log(steam_root, "package=notify skip=no_license_queue");
+        return;
+    };
+    q.queue_addition(app_id);
+    let plan = stt_steamclient::notify_license_changed(&q);
+    append_host_log(steam_root, &plan.summary_line());
+    library_ux().on_rules_app_present(app_id);
+}
+
+/// 移除成功后.
+fn on_library_removed(steam_root: &Path, app_id: AppId) {
+    stt_steamclient::remove_configured_app(app_id);
+    let Some(q) = license_queue() else {
+        append_host_log(steam_root, "package=notify skip=no_license_queue");
+        return;
+    };
+    q.queue_removal(app_id);
+    let plan = stt_steamclient::notify_license_changed(&q);
+    append_host_log(steam_root, &plan.summary_line());
+}
+
+/// lua 全量重载后: 与 owned 做差再 notify.
+fn on_rules_reloaded(steam_root: &Path, state: &ConfigState) {
+    sync_configured_from_state(state);
+    let Some(q) = license_queue() else {
+        return;
+    };
+    let owned: Vec<AppId> = state.with_rules(|r| r.owned_iter().collect());
+    q.reconcile_owned(owned.iter().copied());
+    // 重载后取消仍在配置里的 app 的 UI 移除标记.
+    for id in &owned {
+        library_ux().on_rules_app_present(*id);
+    }
+    if q.pending_add_len() > 0 || q.pending_remove_len() > 0 {
+        let plan = stt_steamclient::notify_license_changed(&q);
+        append_host_log(steam_root, &plan.summary_line());
+    }
+}
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 const WATCH_POLL: Duration = Duration::from_millis(250);
@@ -129,8 +218,8 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
          owned_count={owned_count}\n\
          rules_epoch={rules_epoch}\n\
          {legacy}\
-         status=init complete\n\
-         watch=started debounce_ms={debounce_ms} poll_ms={poll_ms}\n",
+         status=init bootstrapped (hooks/package still loading)\n\
+         watch=pending debounce_ms={debounce_ms} poll_ms={poll_ms}\n",
         steam_root = steam_root.display(),
         data_dir = data.display(),
         cfg_path = cfg_path,
@@ -154,7 +243,11 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
 
     log_module_hashes(steam_root);
     let patterns = log_pattern_probe(steam_root);
-    let library_ux = log_library_ux_plan(steam_root, &state, &patterns);
+    let library_ux_report = log_library_ux_plan(steam_root, &state, &patterns);
+    // package attach 可能失败/较慢: 先打阶段日志, 再装, 避免 silent hang.
+    append_host_log(steam_root, "package=setup begin");
+    let package = setup_package_layer(steam_root, &state, &patterns);
+    append_host_log(steam_root, "package=setup end");
     match stt_hook::run_harmless_self_test() {
         Ok(n) => append_host_log(steam_root, &format!("hook_self_test=ok calls={n}")),
         Err(e) => append_host_log(steam_root, &format!("hook_self_test=err {e}")),
@@ -196,7 +289,8 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     }
     let details = tool_details(
         &state,
-        &library_ux,
+        &library_ux_report,
+        &package,
         &native,
         use_pipe,
         cef.caught_webhelper(),
@@ -228,7 +322,15 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         ),
     );
 
-    run_watch_loop(steam_root, &state, use_pipe);
+    append_host_log(
+        steam_root,
+        &format!(
+            "status=init complete package={:?} attached={} watch=started",
+            package.status,
+            stt_steamclient::is_attached()
+        ),
+    );
+    run_watch_loop(steam_root, &state, use_pipe, patterns);
     Ok(())
 }
 
@@ -280,10 +382,12 @@ impl HostPanel {
             ConfigIntent::RefreshApp(_) => {
                 let provider = MockCatalogProvider::new().with_auto_generate(true);
                 let out = add_to_library(&self.state, &self.steam_root, &provider, app_id)?;
+                on_library_added(&self.steam_root, app_id);
                 Ok(format!("已刷新 {app_id} (owned={})", out.owned_count))
             }
             ConfigIntent::RemoveApp(_) => {
                 let out = remove_from_library(&self.state, &self.steam_root, app_id)?;
+                on_library_removed(&self.steam_root, app_id);
                 Ok(format!("已移除 {app_id} (owned={})", out.owned_count))
             }
             _ => Err(stt_config::ConfigError::Invalid("不是 app 意图".into())),
@@ -399,6 +503,7 @@ fn spawn_store_cdp_bridge(
                                 out.owned_count
                             ),
                         );
+                        on_library_added(&root, app_id);
                         set_shared_note(
                             &note,
                             format!(
@@ -535,8 +640,8 @@ fn log_library_ux_plan(
     let tools = state.tools();
     let report = stt_steamui::plan_library_ux_install(&tools, patterns, "steamui");
     append_host_log(steam_root, &report.summary_line());
-    // 配置里已有的 app 取消移除标记 (纯逻辑, 无 detour).
-    let ux = stt_steamui::LibraryUx::new();
+    // 配置里已有的 app 取消移除标记 (纯逻辑; steamui 写内存 detour 仍未挂).
+    let ux = library_ux();
     state.with_rules(|rules| {
         for app_id in rules.owned_iter() {
             ux.on_rules_app_present(app_id);
@@ -545,10 +650,83 @@ fn log_library_ux_plan(
     report
 }
 
+/// 注册 LicenseQueue / 配置集, 尝试 attach package hooks, 打日志.
+fn setup_package_layer(
+    steam_root: &Path,
+    state: &ConfigState,
+    patterns: &stt_metadata::PatternStore,
+) -> stt_steamclient::PackageInstallReport {
+    let queue = Arc::new(LicenseQueue::new());
+    let configured = Arc::new(Mutex::new(HashSet::new()));
+    let owned: Vec<AppId> = state.with_rules(|rules| rules.owned_iter().collect());
+    {
+        let mut g = configured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.extend(owned.iter().copied());
+    }
+    queue.seed_injected_from_owned(owned.iter().copied());
+
+    let _ = LICENSE_QUEUE.set(Arc::clone(&queue));
+    let _ = CONFIGURED_APPS.set(Arc::clone(&configured));
+    stt_steamclient::register_runtime(Arc::clone(&queue), Arc::clone(&configured));
+    stt_steamclient::set_ui_action_handler(apply_ui_license_action);
+    // 已与 runtime 共享 configured Arc, 只填本地锁即可 (勿再嵌套 set_configured_apps).
+    append_host_log(
+        steam_root,
+        &format!(
+            "package=license_queue seeded_injected={} configured={}",
+            queue.injected_len(),
+            configured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        ),
+    );
+
+    append_host_log(steam_root, "package=try_install begin");
+    let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stt_steamclient::try_install_package_hooks(&state.tools(), patterns)
+    }));
+    let report = match report {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_owned()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_owned()
+            };
+            append_host_log(steam_root, &format!("package=try_install PANIC {msg}"));
+            stt_steamclient::plan_package_install(&state.tools(), patterns, "steamclient")
+                .with_detail(format!("panic during attach: {msg}"))
+        }
+    };
+    append_host_log(steam_root, &report.summary_line());
+    if let Some(d) = report.attach_detail() {
+        append_host_log(steam_root, &format!("package=detail {d}"));
+    }
+    if stt_steamclient::is_attached() {
+        let (checks, forges) = stt_steamclient::hook_stats();
+        append_host_log(
+            steam_root,
+            &format!(
+                "package=hooks attached (CheckAppOwnership+GetPackageInfo) \
+                 check_hits={checks} forge_hits={forges}"
+            ),
+        );
+    } else {
+        append_host_log(steam_root, "package=hooks not attached (logic-only or failed)");
+    }
+    report
+}
+
 /// 各工具此刻的运行状态 —— 开着不等于跑起来了, 这些原来只进 host.log.
 fn tool_details(
     state: &ConfigState,
     library_ux: &stt_steamui::LibraryUxInstallReport,
+    package: &stt_steamclient::PackageInstallReport,
     native: &stt_steamui::StoreNativeReport,
     use_pipe: bool,
     caught: bool,
@@ -560,9 +738,16 @@ fn tool_details(
         if !tools.is_enabled(ToolId::CatalogAdd) {
             "已关闭, 商店页不挂入库按钮".to_owned()
         } else if caught {
-            format!("经 {} 注入商店页", channel_label(use_pipe))
+            format!(
+                "经 {} 注入商店页; {}",
+                channel_label(use_pipe),
+                package.detail_for_ui()
+            )
         } else {
-            "调试通道没截到 steamwebhelper, 商店按钮挂不上".to_owned()
+            format!(
+                "调试通道没截到 steamwebhelper; {}",
+                package.detail_for_ui()
+            )
         },
     );
     d.insert(
@@ -644,16 +829,19 @@ fn process_inbox(
             };
             any = true;
             match add_to_library(state, steam_root, provider, app_id) {
-                Ok(out) => append_host_log(
-                    steam_root,
-                    &format!(
-                        "catalog_add=ok app_id={app_id} provider={} lua={} epoch={} owned={}",
-                        out.provider_id,
-                        out.lua_path.display(),
-                        out.epoch,
-                        out.owned_count
-                    ),
-                ),
+                Ok(out) => {
+                    append_host_log(
+                        steam_root,
+                        &format!(
+                            "catalog_add=ok app_id={app_id} provider={} lua={} epoch={} owned={}",
+                            out.provider_id,
+                            out.lua_path.display(),
+                            out.epoch,
+                            out.owned_count
+                        ),
+                    );
+                    on_library_added(steam_root, app_id);
+                }
                 Err(e) => {
                     append_host_log(steam_root, &format!("catalog_add=err app_id={app_id} {e}"))
                 }
@@ -742,7 +930,12 @@ impl CefRearm {
     }
 }
 
-fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
+fn run_watch_loop(
+    steam_root: &Path,
+    state: &ConfigState,
+    use_pipe: bool,
+    patterns: stt_metadata::PatternStore,
+) {
     let mut toml_watch = stt_config::host_toml_watcher(steam_root, WATCH_DEBOUNCE);
     let mut lua_watch = {
         let host = state.host();
@@ -759,11 +952,47 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
         use_pipe,
         ..CefRearm::default()
     };
+    // steamclient64 常比 host 晚加载; init 时没挂上就在 watch 里补.
+    let mut package_rearm_ticks: u32 = 0;
+    let mut package_attached_logged = stt_steamclient::is_attached();
 
     loop {
         std::thread::sleep(WATCH_POLL);
         process_inbox(steam_root, state, &provider, &mut inbox_seen);
         cef_rearm.tick(steam_root, state);
+
+        // ~2s 一轮: 未 attach 且 catalog_add 开着则重试 package hooks.
+        package_rearm_ticks = package_rearm_ticks.wrapping_add(1);
+        if !package_attached_logged
+            && package_rearm_ticks.is_multiple_of(8)
+            && state.tools().is_enabled(ToolId::CatalogAdd)
+        {
+            let report =
+                stt_steamclient::try_install_package_hooks(&state.tools(), &patterns);
+            if stt_steamclient::is_attached() {
+                package_attached_logged = true;
+                append_host_log(steam_root, &report.summary_line());
+                if let Some(d) = report.attach_detail() {
+                    append_host_log(steam_root, &format!("package=rearm detail {d}"));
+                }
+                append_host_log(
+                    steam_root,
+                    "package=hooks attached on rearm (steamclient64 became available)",
+                );
+            } else if package_rearm_ticks == 8
+                || package_rearm_ticks == 40
+                || package_rearm_ticks.is_multiple_of(80)
+            {
+                // 少打点: 首轮 / ~10s / 之后偶发.
+                append_host_log(
+                    steam_root,
+                    &format!(
+                        "package=rearm still waiting ({})",
+                        report.attach_detail().unwrap_or("not attached")
+                    ),
+                );
+            }
+        }
 
         // 商店注入诊断: 有变化才写 log.
         let stats = stt_steamui::store_native_stats();
@@ -809,6 +1038,7 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
                             state.rules_epoch()
                         ),
                     );
+                    on_rules_reloaded(steam_root, state);
                 }
                 Err(e) => append_host_log(steam_root, &format!("reload=host_toml error={e}")),
             }
@@ -833,6 +1063,7 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
                         state.rules_epoch()
                     ),
                 );
+                on_rules_reloaded(steam_root, state);
             }
         }
 
@@ -848,6 +1079,7 @@ fn run_watch_loop(steam_root: &Path, state: &ConfigState, use_pipe: bool) {
                     state.rules_epoch()
                 ),
             );
+            on_rules_reloaded(steam_root, state);
             let host = state.host();
             lua_watch = stt_config::lua_files_watcher(steam_root, &host, WATCH_DEBOUNCE);
         }
