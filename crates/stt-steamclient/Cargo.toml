@@ -12,6 +12,7 @@ stt-config = { workspace = true }
 stt-metadata = { workspace = true }
 stt-hook = { workspace = true }
 stt-platform = { workspace = true }
+thiserror = "2"
 
 [dev-dependencies]
 # install plan tests write temp pattern TOML
