@@ -63,13 +63,13 @@ pub fn app_is_configured(is_owned: bool, has_depot_key: bool) -> bool {
 
 /// 便于单测: 从 rules 视角判断.
 pub fn configured_in_rules(rules: &stt_core::AppRules, app_id: AppId) -> bool {
-    app_is_configured(rules.is_owned(app_id), rules.depot_key(app_id).is_some())
+    app_is_configured(rules.is_owned(app_id), rules.app_has_depot_key(app_id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stt_core::AppRules;
+    use stt_core::{AppRules, CatalogBundle};
 
     #[test]
     fn non_configured_leaves_original() {
@@ -115,7 +115,10 @@ mod tests {
         rules.add_app(1);
         assert!(configured_in_rules(&rules, 1));
         let mut rules2 = AppRules::new();
-        rules2.set_depot_key(2, "ab");
+        let mut bundle = CatalogBundle::default();
+        bundle.app_depots.insert(2, vec![20]);
+        bundle.depot_keys.insert(20, "ab".into());
+        rules2.apply_catalog_bundle(&bundle);
         assert!(configured_in_rules(&rules2, 2));
     }
 }

@@ -13,6 +13,7 @@ name = "SteamTools"
 
 [dependencies]
 stt-core = { workspace = true }
+stt-catalog = { workspace = true }
 stt-platform = { workspace = true }
 stt-config = { workspace = true }
 stt-metadata = { workspace = true }

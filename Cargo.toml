@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/stt-core",
+    "crates/stt-catalog",
     "crates/stt-platform",
     "crates/stt-config",
     "crates/stt-metadata",
@@ -14,6 +15,7 @@ members = [
 ]
 default-members = [
     "crates/stt-core",
+    "crates/stt-catalog",
     "crates/stt-platform",
     "crates/stt-config",
     "crates/stt-metadata",
@@ -32,6 +34,7 @@ publish = false
 
 [workspace.dependencies]
 stt-core = { path = "crates/stt-core" }
+stt-catalog = { path = "crates/stt-catalog" }
 stt-platform = { path = "crates/stt-platform" }
 stt-config = { path = "crates/stt-config" }
 stt-metadata = { path = "crates/stt-metadata" }

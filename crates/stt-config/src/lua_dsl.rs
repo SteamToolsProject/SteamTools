@@ -33,7 +33,13 @@ pub fn eval_lua_to_bundle(source: &str) -> Result<CatalogBundle> {
             .create_function(
                 move |_, (id, _unused, key): (u32, Option<Value>, Option<String>)| {
                     let mut g = lock_bundle(&b);
-                    g.apps.push(id);
+                    if !g.apps.contains(&id) {
+                        g.apps.push(id);
+                    }
+                    let depots = g.app_depots.entry(id).or_default();
+                    if !depots.contains(&id) {
+                        depots.push(id);
+                    }
                     if let Some(k) = key {
                         if k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()) {
                             g.depot_keys.insert(id, k);
@@ -64,7 +70,7 @@ pub fn eval_lua_to_bundle(source: &str) -> Result<CatalogBundle> {
         let b = Arc::clone(&bundle);
         let f = lua
             .create_function(
-                move |_, (depot_id, gid_s, size): (u64, String, Option<u64>)| {
+                move |_, (depot_id, gid_s, size): (u32, String, Option<u64>)| {
                     if !gid_s.chars().all(|c| c.is_ascii_digit()) {
                         return Err(mlua::Error::external(format!(
                             "setmanifestid: gid must be digits, got '{gid_s}'"

@@ -1,6 +1,5 @@
-//! 宿主配置: TOML, 工具注册表, 目录 trait, 可选 Lua DSL.
+//! 宿主配置: TOML, 工具注册表, Catalog 落盘, 可选 Lua DSL.
 
-mod catalog;
 mod catalog_add;
 mod error;
 mod host_toml;
@@ -14,7 +13,6 @@ mod lua_dsl;
 #[cfg(feature = "lua")]
 mod lua_load;
 
-pub use catalog::{CatalogProvider, MockCatalogProvider};
 #[cfg(feature = "lua")]
 pub use catalog_add::remove_from_library;
 pub use catalog_add::{

@@ -12,9 +12,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use stt_catalog::MockCatalogProvider;
 use stt_config::{
     add_to_library, apply_intent, remove_from_library, ConfigIntent, ConfigSnapshot, ConfigState,
-    HostConfig, MockCatalogProvider, ToolId,
+    HostConfig, ToolId,
 };
 use stt_core::{AppId, AppRules};
 use stt_steamclient::{LicenseQueue, UiLicenseAction};
