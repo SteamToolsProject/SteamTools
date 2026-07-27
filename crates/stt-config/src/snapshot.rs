@@ -108,6 +108,8 @@ impl ConfigSnapshot {
             catalog_status: match host.catalog.mode {
                 crate::CatalogMode::Disabled => "未配置".to_owned(),
                 crate::CatalogMode::CustomHttp => "CustomHttp".to_owned(),
+                crate::CatalogMode::Lua => "Lua (config/lua/catalog.lua)".to_owned(),
+                crate::CatalogMode::Community => "Community (暂不可用)".to_owned(),
                 crate::CatalogMode::Mock => "Mock (开发模式)".to_owned(),
             },
             manifest_url: host.manifest.url,

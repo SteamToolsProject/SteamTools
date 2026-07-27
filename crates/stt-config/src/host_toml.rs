@@ -35,17 +35,29 @@ pub enum CatalogMode {
     Disabled,
     /// 从 URL 模板拉取 SteamTools wire v1.
     CustomHttp,
+    /// 从固定的 `config/lua/catalog.lua` 调用 SteamTools wire v1 扩展.
+    Lua,
+    /// 社区 adapter 占位, 当前明确不可用.
+    Community,
     /// 仅用于显式开发模式的确定性假数据.
     Mock,
 }
 
 impl CatalogMode {
-    pub const ALL: [Self; 3] = [Self::Disabled, Self::CustomHttp, Self::Mock];
+    pub const ALL: [Self; 5] = [
+        Self::Disabled,
+        Self::CustomHttp,
+        Self::Lua,
+        Self::Community,
+        Self::Mock,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
             Self::CustomHttp => "custom_http",
+            Self::Lua => "lua",
+            Self::Community => "community",
             Self::Mock => "mock",
         }
     }

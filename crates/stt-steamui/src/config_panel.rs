@@ -551,7 +551,7 @@ pub const PANEL_JS: &str = r##"
     a.appendChild(label("Catalog 源",s.catalog_status||"未配置"));
     a.appendChild(seg(s.catalog_modes,s.catalog_mode,function(v){
       push({kind:"set_catalog_mode",value:v});
-    },{disabled:"关闭",custom_http:"CustomHttp",mock:"Mock"}));
+    },{disabled:"关闭",custom_http:"CustomHttp",lua:"Lua",community:"Community",mock:"Mock"}));
     var u=card();
     var inp=d.createElement("input");
     if(typedCatalog===null) typedCatalog=s.catalog_url_template||"";
