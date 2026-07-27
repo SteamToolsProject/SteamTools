@@ -189,6 +189,32 @@ impl Default for ManifestSection {
     }
 }
 
+impl ManifestSection {
+    pub fn validate(&self) -> Result<()> {
+        const MAX_TIMEOUT_MS: u32 = 60_000;
+        if !matches!(self.url.as_str(), "opensteamtool" | "steamrun" | "wudrm") {
+            return Err(ConfigError::Invalid(
+                "manifest.url must be opensteamtool, steamrun, or wudrm".into(),
+            ));
+        }
+        let timeouts = [
+            self.timeout_resolve_ms,
+            self.timeout_connect_ms,
+            self.timeout_send_ms,
+            self.timeout_recv_ms,
+        ];
+        if timeouts
+            .into_iter()
+            .any(|timeout| timeout == 0 || timeout > MAX_TIMEOUT_MS)
+        {
+            return Err(ConfigError::Invalid(
+                "manifest timeout must be within 1..=60000 ms".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LuaSection {
     /// 额外 lua 目录; 加载器总会再挂上默认的 `<Steam>/config/lua`.
@@ -206,6 +232,7 @@ impl HostConfig {
     pub fn parse_str(s: &str) -> Result<Self> {
         let config: Self = toml::from_str(s)?;
         config.catalog.validate()?;
+        config.manifest.validate()?;
         Ok(config)
     }
 
@@ -298,6 +325,19 @@ paths = ["D:/extra/lua"]
         assert_eq!(c.manifest.url, "wudrm");
         assert_eq!(c.manifest.timeout_recv_ms, 2000);
         assert_eq!(c.lua.paths, vec!["D:/extra/lua"]);
+    }
+
+    #[test]
+    fn manifest_source_and_timeouts_are_bounded() {
+        assert!(HostConfig::parse_str("[manifest]\nurl = \"custom\"").is_err());
+        assert!(HostConfig::parse_str(
+            "[manifest]\nurl = \"wudrm\"\ntimeout_recv_ms = 0"
+        )
+        .is_err());
+        assert!(HostConfig::parse_str(
+            "[manifest]\nurl = \"steamrun\"\ntimeout_connect_ms = 60001"
+        )
+        .is_err());
     }
 
     #[test]
