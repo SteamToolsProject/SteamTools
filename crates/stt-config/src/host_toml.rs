@@ -16,12 +16,111 @@ pub struct HostConfig {
     #[serde(default)]
     pub log: LogSection,
     #[serde(default)]
+    pub catalog: CatalogSection,
+    #[serde(default)]
     pub manifest: ManifestSection,
     #[serde(default)]
     pub lua: LuaSection,
     /// 工具 id -> 是否启用; 缺省键走工具默认值.
     #[serde(default)]
     pub tools: ToolsSection,
+}
+
+/// 完整 Catalog 的来源模式.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogMode {
+    /// 不配置完整目录源, 入库操作明确失败.
+    #[default]
+    Disabled,
+    /// 从 URL 模板拉取 SteamTools wire v1.
+    CustomHttp,
+    /// 仅用于显式开发模式的确定性假数据.
+    Mock,
+}
+
+impl CatalogMode {
+    pub const ALL: [Self; 3] = [Self::Disabled, Self::CustomHttp, Self::Mock];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::CustomHttp => "custom_http",
+            Self::Mock => "mock",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == value)
+    }
+}
+
+/// 完整 Catalog 配置, 与 manifest request-code 源完全独立.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogSection {
+    #[serde(default)]
+    pub mode: CatalogMode,
+    #[serde(default)]
+    pub url_template: String,
+    #[serde(default = "default_timeout_5s")]
+    pub timeout_resolve_ms: u32,
+    #[serde(default = "default_timeout_5s")]
+    pub timeout_connect_ms: u32,
+    #[serde(default = "default_timeout_10s")]
+    pub timeout_send_ms: u32,
+    #[serde(default = "default_timeout_10s")]
+    pub timeout_recv_ms: u32,
+    #[serde(default = "default_catalog_response_limit")]
+    pub max_response_bytes: usize,
+}
+
+impl Default for CatalogSection {
+    fn default() -> Self {
+        Self {
+            mode: CatalogMode::Disabled,
+            url_template: String::new(),
+            timeout_resolve_ms: default_timeout_5s(),
+            timeout_connect_ms: default_timeout_5s(),
+            timeout_send_ms: default_timeout_10s(),
+            timeout_recv_ms: default_timeout_10s(),
+            max_response_bytes: default_catalog_response_limit(),
+        }
+    }
+}
+
+fn default_catalog_response_limit() -> usize {
+    stt_catalog::CatalogLimits::default().max_wire_bytes
+}
+
+impl CatalogSection {
+    /// 校验资源上限和当前模式需要的字段.
+    pub fn validate(&self) -> Result<()> {
+        const MAX_TIMEOUT_MS: u32 = 60_000;
+        let timeouts = [
+            self.timeout_resolve_ms,
+            self.timeout_connect_ms,
+            self.timeout_send_ms,
+            self.timeout_recv_ms,
+        ];
+        if timeouts
+            .into_iter()
+            .any(|timeout| timeout == 0 || timeout > MAX_TIMEOUT_MS)
+        {
+            return Err(ConfigError::Invalid(
+                "catalog timeout must be within 1..=60000 ms".into(),
+            ));
+        }
+        let max_wire_bytes = stt_catalog::CatalogLimits::default().max_wire_bytes;
+        if self.max_response_bytes == 0 || self.max_response_bytes > max_wire_bytes {
+            return Err(ConfigError::Invalid(format!(
+                "catalog.max_response_bytes must be within 1..={max_wire_bytes}"
+            )));
+        }
+        if self.mode == CatalogMode::CustomHttp {
+            stt_catalog::validate_url_template(&self.url_template)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +192,9 @@ pub struct ToolsSection {
 
 impl HostConfig {
     pub fn parse_str(s: &str) -> Result<Self> {
-        Ok(toml::from_str(s)?)
+        let config: Self = toml::from_str(s)?;
+        config.catalog.validate()?;
+        Ok(config)
     }
 
     pub fn load_file(path: &Path) -> Result<Self> {
@@ -150,6 +251,7 @@ mod tests {
     fn parse_minimal_defaults() {
         let c = HostConfig::parse_str("").unwrap();
         assert_eq!(c.log.level, "debug");
+        assert_eq!(c.catalog.mode, CatalogMode::Disabled);
         assert_eq!(c.manifest.url, "opensteamtool");
         assert!(c.is_tool_enabled(ToolId::CatalogAdd));
         assert!(c.is_tool_enabled(ToolId::LibraryUx));
@@ -184,5 +286,35 @@ paths = ["D:/extra/lua"]
         assert_eq!(c.manifest.url, "wudrm");
         assert_eq!(c.manifest.timeout_recv_ms, 2000);
         assert_eq!(c.lua.paths, vec!["D:/extra/lua"]);
+    }
+
+    #[test]
+    fn parse_custom_http_catalog() {
+        let config = HostConfig::parse_str(
+            r#"
+[catalog]
+mode = "custom_http"
+url_template = "http://127.0.0.1:8081/catalog/{app_id}"
+timeout_recv_ms = 2000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.catalog.mode, CatalogMode::CustomHttp);
+        assert_eq!(config.catalog.timeout_recv_ms, 2000);
+    }
+
+    #[test]
+    fn custom_http_requires_valid_template() {
+        let error = HostConfig::parse_str("[catalog]\nmode = \"custom_http\"\n").unwrap_err();
+
+        assert!(error.to_string().contains("URL template"));
+    }
+
+    #[test]
+    fn catalog_timeout_cannot_be_infinite() {
+        let error = HostConfig::parse_str("[catalog]\ntimeout_recv_ms = 0\n").unwrap_err();
+
+        assert!(error.to_string().contains("timeout"));
     }
 }

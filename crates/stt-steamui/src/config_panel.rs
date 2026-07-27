@@ -480,12 +480,12 @@ pub const PANEL_JS: &str = r##"
     return rail;
   }
   // 选项组: 一条分段控件, 当前项用 Steam 的强调蓝.
-  function seg(list,cur,cb){
+  function seg(list,cur,cb,names){
     var w=el("div",null,"display:flex;flex:none;border-radius:2px;overflow:hidden;"
       +"background:rgba(0,0,0,.24);");
     (list||[]).forEach(function(v){
       var on=v===cur;
-      var b=el("div",v,"padding:7px 14px;font-family:"+MONO+";font-size:13px;line-height:16px;"
+      var b=el("div",(names&&names[v])||v,"padding:7px 14px;font-family:"+MONO+";font-size:13px;line-height:16px;"
         +"cursor:pointer;"+(on?"background:"+ACCENT+";color:#fff;":"color:"+MUTE+";"));
       if(!on) b.className="stt-b";
       b.tabIndex=0;
@@ -507,6 +507,7 @@ pub const PANEL_JS: &str = r##"
   // 这两个要跨重绘活着: 快照每变一次就整窗重画.
   var page="tools";
   var typed="";
+  var typedCatalog=null;
 
   function renderTools(s){
     (s.tools||[]).forEach(function(x){
@@ -547,8 +548,35 @@ pub const PANEL_JS: &str = r##"
   }
   function renderSource(s){
     var a=card();
-    a.appendChild(label("上游源","入库时按这个源拉清单"));
-    a.appendChild(seg(s.manifest_sources,s.manifest_url,function(v){
+    a.appendChild(label("Catalog 源",s.catalog_status||"未配置"));
+    a.appendChild(seg(s.catalog_modes,s.catalog_mode,function(v){
+      push({kind:"set_catalog_mode",value:v});
+    },{disabled:"关闭",custom_http:"CustomHttp",mock:"Mock"}));
+    var u=card();
+    var inp=d.createElement("input");
+    if(typedCatalog===null) typedCatalog=s.catalog_url_template||"";
+    inp.className="stt-i";
+    inp.placeholder="https://catalog.example/v1/{app_id}";
+    inp.value=typedCatalog;
+    inp.style.cssText="flex:1;min-width:0;background:rgba(0,0,0,.3);border:1px solid rgba(0,0,0,.4);"
+      +"border-radius:2px;padding:8px 12px;color:"+TEXT+";font-family:"+MONO+";font-size:13.5px;"
+      +"outline:none;transition:border-color .15s;";
+    inp.addEventListener("input",function(){typedCatalog=inp.value;});
+    var save=btn("保存 URL");
+    function saveCatalogUrl(){
+      var v=(inp.value||"").trim();
+      if(!/^https?:\/\//.test(v)||v.split("{app_id}").length!==2){
+        inp.style.borderColor="#d94126";return;
+      }
+      inp.style.borderColor="rgba(0,0,0,.4)";save.textContent="…";
+      push({kind:"set_catalog_url_template",value:v});
+    }
+    inp.addEventListener("keydown",function(e){if(e.key==="Enter")saveCatalogUrl();});
+    onHit(save,saveCatalogUrl);
+    u.appendChild(inp);u.appendChild(save);
+    var m=card();
+    m.appendChild(label("Manifest 请求码源","仅用于下载阶段的 request code"));
+    m.appendChild(seg(s.manifest_sources,s.manifest_url,function(v){
       push({kind:"set_manifest_url",value:v});
     }));
     var b=card();
@@ -1010,6 +1038,8 @@ fn parse_one(item: &Value) -> Option<ConfigIntent> {
             ConfigIntent::set_tool(id, on)
         }
         "set_log_level" => ConfigIntent::set_log_level(value),
+        "set_catalog_mode" => ConfigIntent::set_catalog_mode(value),
+        "set_catalog_url_template" => ConfigIntent::set_catalog_url_template(value),
         "set_manifest_url" => ConfigIntent::set_manifest_url(value),
         "add_lua_path" => ConfigIntent::add_lua_path(value),
         "remove_lua_path" => ConfigIntent::remove_lua_path(value),
@@ -1552,6 +1582,25 @@ mod tests {
         assert_eq!(
             tick.intents,
             vec![ConfigIntent::RefreshApp(730), ConfigIntent::RemoveApp(440)]
+        );
+    }
+
+    #[test]
+    fn catalog_intents_are_parsed_separately_from_manifest() {
+        let tick = parse_panel_tick(&json!({"q":[
+            {"kind":"set_catalog_url_template","value":"http://127.0.0.1/{app_id}"},
+            {"kind":"set_catalog_mode","value":"custom_http"},
+            {"kind":"set_manifest_url","value":"wudrm"}
+        ]}));
+
+        assert_eq!(tick.intents.len(), 3);
+        assert!(matches!(
+            tick.intents[1],
+            ConfigIntent::SetCatalogMode(stt_config::CatalogMode::CustomHttp)
+        ));
+        assert_eq!(
+            tick.intents[2],
+            ConfigIntent::SetManifestUrl("wudrm".into())
         );
     }
 
