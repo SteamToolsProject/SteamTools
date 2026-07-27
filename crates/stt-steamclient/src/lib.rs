@@ -13,6 +13,8 @@ mod license;
 mod manifest;
 mod manifest_code;
 mod ownership;
+#[cfg(feature = "download-request-code")]
+mod request_code;
 #[cfg(feature = "download-token")]
 mod token;
 #[cfg(any(
@@ -61,6 +63,12 @@ pub use manifest_code::{
 pub use ownership::{
     app_is_configured, configured_in_rules, decide_ownership_rewrite, ForgedOwnershipFields,
     OwnershipRewrite,
+};
+#[cfg(feature = "download-request-code")]
+pub use request_code::{
+    inspect_manifest_code_request_frame, rewrite_manifest_code_response_frame,
+    ManifestCodeCompletion, ManifestCodeJob, ManifestCodeJobTable, ManifestCodeJobTicket,
+    ManifestCodeRegister, ManifestCodeResponseRewrite,
 };
 #[cfg(feature = "download-token")]
 pub use token::{
