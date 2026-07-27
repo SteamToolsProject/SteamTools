@@ -95,6 +95,12 @@ impl AppRules {
         self.depot_keys.get(&depot_id).map(String::as_str)
     }
 
+    pub fn depot_keys_iter(&self) -> impl Iterator<Item = (DepotId, &str)> + '_ {
+        self.depot_keys
+            .iter()
+            .map(|(&depot_id, key)| (depot_id, key.as_str()))
+    }
+
     pub fn has_depot_keys(&self) -> bool {
         !self.depot_keys.is_empty()
     }

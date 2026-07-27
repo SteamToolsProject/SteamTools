@@ -7,13 +7,11 @@ use std::sync::{Mutex, OnceLock, RwLock};
 
 use stt_core::{DepotId, ManifestOverride};
 use stt_hook::InlineHook;
-use stt_metadata::{ByteSig, PatternStore};
-use stt_platform::{module_info, module_path_by_name, sha256_file};
+use stt_metadata::PatternStore;
 
+use crate::verified::resolve_verified_symbol;
 use crate::{DownloadCapability, DownloadCapabilityStatus, DownloadKitReport};
 
-const VERIFIED_STEAMCLIENT_SHA256: &str =
-    "61dd80e84a1c5ddab034f5253436835dead86b194e214bd99a6bd644a07dde7d";
 const SYMBOL: &str = "BuildDepotDependency";
 const MAX_DEPOT_ENTRIES: usize = 4096;
 
@@ -111,65 +109,13 @@ pub fn try_install_manifest_hook(report: &mut DownloadKitReport, patterns: &Patt
         return;
     }
 
-    let Some(info) = module_info("steamclient64.dll") else {
-        capability.detail = Some("steamclient64.dll 尚未加载".to_owned());
-        return;
+    let target = match resolve_verified_symbol(patterns, SYMBOL) {
+        Ok(target) => target,
+        Err(error) => {
+            capability.detail = Some(error.to_string());
+            return;
+        }
     };
-    let Some(module_path) = module_path_by_name("steamclient64.dll") else {
-        capability.detail = Some("无法读取 steamclient64.dll 路径".to_owned());
-        return;
-    };
-    let Ok(module_sha) = sha256_file(&module_path) else {
-        capability.detail = Some("无法校验 steamclient64.dll SHA-256".to_owned());
-        return;
-    };
-    if module_sha != VERIFIED_STEAMCLIENT_SHA256 {
-        capability.detail = Some("当前 steamclient64.dll 布局尚未验证".to_owned());
-        return;
-    }
-
-    let Some(entry) = patterns
-        .map("steamclient")
-        .and_then(|map| map.get_by_name(SYMBOL))
-    else {
-        capability.status = DownloadCapabilityStatus::SymbolsMissing;
-        capability.missing = vec![SYMBOL.to_owned()];
-        return;
-    };
-    let Some(rva) = entry.rva.and_then(|value| usize::try_from(value).ok()) else {
-        capability.detail = Some("BuildDepotDependency 缺少有效 RVA".to_owned());
-        return;
-    };
-    let Some(signature) = entry.sig.as_deref() else {
-        capability.detail = Some("BuildDepotDependency 缺少入口签名".to_owned());
-        return;
-    };
-    let Ok(signature) = ByteSig::parse(signature) else {
-        capability.detail = Some("BuildDepotDependency 入口签名无效".to_owned());
-        return;
-    };
-    let Some(end) = rva.checked_add(signature.bytes.len()) else {
-        capability.detail = Some("BuildDepotDependency RVA 越界".to_owned());
-        return;
-    };
-    if end > info.size {
-        capability.detail = Some("BuildDepotDependency RVA 越界".to_owned());
-        return;
-    }
-
-    // # Safety
-    // module_info 已确认映像范围, rva/end 也已在该范围内.
-    let prologue = unsafe {
-        std::slice::from_raw_parts((info.base as *const u8).add(rva), signature.bytes.len())
-    };
-    if signature.find_in(prologue) != Some(0) {
-        capability.detail = Some("BuildDepotDependency 入口签名不匹配".to_owned());
-        return;
-    }
-
-    // # Safety
-    // 当前 DLL SHA, RVA 和入口签名均已验证, detour ABI 与勘察布局一致.
-    let target = unsafe { (info.base as *mut u8).add(rva).cast::<c_void>() };
     let mut slot = HOOK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
