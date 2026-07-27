@@ -40,7 +40,7 @@ stt-config = { path = "crates/stt-config" }
 stt-metadata = { path = "crates/stt-metadata" }
 stt-hook = { path = "crates/stt-hook" }
 stt-steamui = { path = "crates/stt-steamui" }
-stt-steamclient = { path = "crates/stt-steamclient" }
+stt-steamclient = { path = "crates/stt-steamclient", default-features = false }
 
 [workspace.lints.rust]
 nonstandard_style = { level = "deny", priority = -2 }
