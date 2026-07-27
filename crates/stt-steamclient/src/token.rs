@@ -10,6 +10,7 @@ use stt_hook::InlineHook;
 use stt_metadata::PatternStore;
 
 use crate::verified::resolve_verified_symbol;
+use crate::wire::{encode_varint, parse_field, WireValue};
 use crate::{DownloadCapability, DownloadCapabilityStatus, DownloadKitReport};
 
 const SYMBOL: &str = "BBuildAndAsyncSendFrame";
@@ -19,7 +20,6 @@ const PICS_PRODUCT_INFO_REQUEST: u32 = 8903;
 const FRAME_HEADER_SIZE: usize = 8;
 const MAX_PROTO_HEADER_SIZE: usize = 1024;
 const MAX_BODY_SIZE: usize = 65_536;
-const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
 
 type BuildAndSendFrameFn = unsafe extern "C" fn(*mut c_void, u8, *mut u8, u32) -> u8;
 
@@ -44,23 +44,6 @@ pub enum AccessTokenRewrite {
         packet: Vec<u8>,
         patched_apps: usize,
     },
-}
-
-#[derive(Debug, Clone, Copy)]
-struct WireField<'a> {
-    number: u32,
-    wire_type: u8,
-    start: usize,
-    tag_end: usize,
-    end: usize,
-    value: WireValue<'a>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum WireValue<'a> {
-    Varint(u64),
-    Bytes(&'a [u8]),
-    Fixed,
 }
 
 fn tokens() -> &'static RwLock<HashMap<AppId, u64>> {
@@ -344,83 +327,9 @@ fn rewrite_app_info(app: &[u8], tokens: &HashMap<AppId, u64>) -> Option<Option<V
     Some(Some(output))
 }
 
-fn parse_field<'a>(input: &'a [u8], cursor: &mut usize) -> Option<WireField<'a>> {
-    let start = *cursor;
-    let (tag, tag_end) = decode_varint(input, start)?;
-    let number = tag >> 3;
-    let wire_type = (tag & 0x07) as u8;
-    if number == 0 || number > MAX_FIELD_NUMBER {
-        return None;
-    }
-
-    let mut next = tag_end;
-    let value = match wire_type {
-        0 => {
-            let (value, end) = decode_varint(input, next)?;
-            next = end;
-            WireValue::Varint(value)
-        }
-        1 => {
-            next = next.checked_add(8)?;
-            if next > input.len() {
-                return None;
-            }
-            WireValue::Fixed
-        }
-        2 => {
-            let (length, data_start) = decode_varint(input, next)?;
-            let length = usize::try_from(length).ok()?;
-            next = data_start.checked_add(length)?;
-            let bytes = input.get(data_start..next)?;
-            WireValue::Bytes(bytes)
-        }
-        5 => {
-            next = next.checked_add(4)?;
-            if next > input.len() {
-                return None;
-            }
-            WireValue::Fixed
-        }
-        _ => return None,
-    };
-
-    *cursor = next;
-    Some(WireField {
-        number: number as u32,
-        wire_type,
-        start,
-        tag_end,
-        end: next,
-        value,
-    })
-}
-
-fn decode_varint(input: &[u8], start: usize) -> Option<(u64, usize)> {
-    let mut value = 0u64;
-    for index in 0..10 {
-        let byte = *input.get(start.checked_add(index)?)?;
-        if index == 9 && byte > 1 {
-            return None;
-        }
-        value |= u64::from(byte & 0x7f) << (index * 7);
-        if byte & 0x80 == 0 {
-            return Some((value, start + index + 1));
-        }
-    }
-    None
-}
-
 fn read_u32_le(input: &[u8], offset: usize) -> Option<u32> {
     let bytes = input.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
-}
-
-fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
-    while value >= 0x80 {
-        output.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    output.push(value as u8);
 }
 
 #[cfg(test)]
