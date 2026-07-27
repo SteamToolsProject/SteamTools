@@ -5,12 +5,16 @@
 mod download;
 mod hooks;
 mod install;
+#[cfg(feature = "download-key")]
+mod key;
 mod layout;
 mod license;
 #[cfg(feature = "download-manifest")]
 mod manifest;
 mod manifest_code;
 mod ownership;
+#[cfg(any(feature = "download-manifest", feature = "download-key"))]
+mod verified;
 
 pub use download::{
     plan_download_kit, DownloadCapability, DownloadCapabilityReport, DownloadCapabilityStatus,
@@ -24,6 +28,11 @@ pub use hooks::{
 pub use install::{
     plan_package_install, PackageInstallReport, PackageInstallStatus, PACKAGE_HOOK_SYMBOLS,
     PACKAGE_OPTIONAL_SYMBOLS, PACKAGE_P0_SYMBOLS,
+};
+#[cfg(feature = "download-key")]
+pub use key::{
+    depot_key_hook_stats, is_depot_key_hook_attached, replace_depot_keys,
+    try_install_depot_key_hook, DepotKeySnapshotReport,
 };
 pub use layout::{
     app_ownership, package_info, utl_vector, APP_OWNERSHIP_SIZE, APP_RELEASE_STATE_RELEASED,
