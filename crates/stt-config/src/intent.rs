@@ -258,7 +258,7 @@ fn table_at<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut Table
 }
 
 /// 先写同目录临时文件再改名: 中途断电也不会留下半份配置.
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
     let mut name: OsString = path.file_name().unwrap_or_default().to_owned();
     name.push(".tmp");
     let tmp = path.with_file_name(name);
