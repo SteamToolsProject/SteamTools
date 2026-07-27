@@ -13,6 +13,8 @@ mod license;
 mod manifest;
 mod manifest_code;
 mod ownership;
+#[cfg(feature = "download-token")]
+mod token;
 #[cfg(any(feature = "download-manifest", feature = "download-key"))]
 mod verified;
 
@@ -54,3 +56,5 @@ pub use ownership::{
     app_is_configured, configured_in_rules, decide_ownership_rewrite, ForgedOwnershipFields,
     OwnershipRewrite,
 };
+#[cfg(feature = "download-token")]
+pub use token::{rewrite_access_token_frame, AccessTokenRewrite};
