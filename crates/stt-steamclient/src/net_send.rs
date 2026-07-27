@@ -116,6 +116,12 @@ unsafe extern "C" fn hk_send_frame(
         return 0;
     }
 
+    #[cfg(feature = "download-request-code")]
+    if REQUEST_CODE_ACTIVE.load(Ordering::SeqCst) && !data.is_null() {
+        let packet = std::slice::from_raw_parts(data.cast_const(), size as usize);
+        crate::request_code::submit_manifest_code_frame(u32::from(opcode), packet);
+    }
+
     #[cfg(feature = "download-token")]
     let rewrite = if TOKEN_ACTIVE.load(Ordering::SeqCst) {
         crate::token::record_access_token_call();
