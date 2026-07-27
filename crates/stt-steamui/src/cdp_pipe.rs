@@ -237,8 +237,15 @@ pub fn poll_store_pipe(session: &mut CdpPipeSession, inject_js: &str) -> StoreCd
             }) => {
                 out.store_pages += 1;
                 // 摘按钮不算注入, 否则关掉工具反而在日志里像挂上了.
-                if mounted && !removed {
+                if removed {
+                    out.notes.push(format!("cdp_teardown ok url={}", t.url));
+                } else if mounted {
                     out.injected += 1;
+                    out.notes.push(format!("cdp_injected ok url={}", t.url));
+                }
+                // 管道模式 store_targets 存 target id, 回写按钮时 attach 用.
+                if !out.store_targets.contains(&t.target_id) {
+                    out.store_targets.push(t.target_id.clone());
                 }
                 out.pending_app_ids.extend(pending);
             }
@@ -305,6 +312,27 @@ fn inject_in_session(
         removed,
         pending,
     })
+}
+
+/// 管道模式: 对已知 target 回写入库结果到按钮.
+fn push_store_feedback_pipe(
+    session: &mut CdpPipeSession,
+    targets: &[String],
+    js: &str,
+    on_log: &mut dyn FnMut(String),
+) {
+    if js.is_empty() || targets.is_empty() {
+        return;
+    }
+    for tid in targets {
+        let Ok(sid) = session.attach(tid) else {
+            continue;
+        };
+        if let Err(e) = session.eval_value(&sid, js) {
+            on_log(format!("catalog_add=feedback_err {e}"));
+        }
+        session.detach(&sid);
+    }
 }
 
 /// 管道会话上的一个页面; 有了它面板逻辑就能跟端口版共用一份.
@@ -382,7 +410,7 @@ fn wait_for_pipe(timeout: Duration) -> Option<DevToolsPipe> {
 pub fn run_store_pipe_loop(
     poll_every: Duration,
     make_js: &mut dyn FnMut() -> String,
-    on_app: &mut dyn FnMut(u32),
+    on_app: &mut dyn FnMut(u32) -> Option<String>,
     on_log: &mut dyn FnMut(String),
     ready_timeout: Duration,
     mut panel: Option<&mut dyn PanelBridge>,
@@ -446,7 +474,9 @@ pub fn run_store_pipe_loop(
                 }
             }
             for app_id in r.pending_app_ids {
-                on_app(app_id);
+                if let Some(js) = on_app(app_id) {
+                    push_store_feedback_pipe(&mut session, &r.store_targets, &js, on_log);
+                }
             }
             // 配置页搭同一趟车; 它出问题也不能连累入库那条路.
             if let Some(p) = panel.as_mut() {
