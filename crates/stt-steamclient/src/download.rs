@@ -376,6 +376,92 @@ mod tests {
     }
 
     #[test]
+    fn each_feature_gate_disables_only_its_own_capability() {
+        let cases = [
+            DownloadFeatureSet {
+                manifest: false,
+                ..all_features()
+            },
+            DownloadFeatureSet {
+                key: false,
+                ..all_features()
+            },
+            DownloadFeatureSet {
+                token: false,
+                ..all_features()
+            },
+            DownloadFeatureSet {
+                request_code: false,
+                ..all_features()
+            },
+        ];
+
+        for (disabled, features) in cases.into_iter().enumerate() {
+            let report = plan_download_kit(
+                &enabled_tools(),
+                &complete_patterns(),
+                "steamclient",
+                features,
+                DownloadRuntimeSwitches::default(),
+                all_data(),
+            );
+            for (index, status) in statuses(&report).into_iter().enumerate() {
+                assert_eq!(
+                    status,
+                    if index == disabled {
+                        DownloadCapabilityStatus::FeatureDisabled
+                    } else {
+                        DownloadCapabilityStatus::LogicOnly
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_runtime_gate_disables_only_its_own_capability() {
+        let cases = [
+            DownloadRuntimeSwitches {
+                manifest: false,
+                ..DownloadRuntimeSwitches::default()
+            },
+            DownloadRuntimeSwitches {
+                key: false,
+                ..DownloadRuntimeSwitches::default()
+            },
+            DownloadRuntimeSwitches {
+                token: false,
+                ..DownloadRuntimeSwitches::default()
+            },
+            DownloadRuntimeSwitches {
+                request_code: false,
+                ..DownloadRuntimeSwitches::default()
+            },
+        ];
+
+        for (disabled, switches) in cases.into_iter().enumerate() {
+            let report = plan_download_kit(
+                &enabled_tools(),
+                &complete_patterns(),
+                "steamclient",
+                all_features(),
+                switches,
+                all_data(),
+            );
+            for (index, status) in statuses(&report).into_iter().enumerate() {
+                assert_eq!(
+                    status,
+                    if index == disabled {
+                        DownloadCapabilityStatus::EnvironmentDisabled
+                    } else {
+                        DownloadCapabilityStatus::LogicOnly
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn complete_prerequisites_stop_at_logic_only() {
         let report = plan_download_kit(
             &enabled_tools(),
