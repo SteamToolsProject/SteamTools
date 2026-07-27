@@ -21,6 +21,8 @@ mod token;
     feature = "download-token"
 ))]
 mod verified;
+#[cfg(any(feature = "download-token", feature = "download-request-code"))]
+mod wire;
 
 pub use download::{
     plan_download_kit, DownloadCapability, DownloadCapabilityReport, DownloadCapabilityStatus,
