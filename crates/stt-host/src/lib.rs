@@ -1042,10 +1042,38 @@ fn tool_details(
         format!("就是这个界面, 经 {}", channel_label(use_pipe)),
     );
     d.insert(
+        ToolId::DownloadKit.as_str(),
+        download_kit_detail(&tools),
+    );
+    d.insert(
         ToolId::StoreAccel.as_str(),
         format!("尚未实现; 原生注入路径: {:?}", native.status),
     );
     d
+}
+
+fn download_kit_detail(tools: &stt_config::ToolRegistry) -> String {
+    if !tools.is_enabled(ToolId::DownloadKit) {
+        return "已关闭, 下载能力不安装".to_owned();
+    }
+    let mut capabilities = Vec::new();
+    if cfg!(feature = "download-manifest") {
+        capabilities.push("manifest");
+    }
+    if cfg!(feature = "download-key") {
+        capabilities.push("key");
+    }
+    if cfg!(feature = "download-token") {
+        capabilities.push("token");
+    }
+    if cfg!(feature = "download-request-code") {
+        capabilities.push("request-code");
+    }
+    if capabilities.is_empty() {
+        "已开启, 当前构建未包含下载能力".to_owned()
+    } else {
+        format!("已开启, 编译能力: {}; hook 尚未安装", capabilities.join(","))
+    }
 }
 
 /// 处理 steamtools/inbox/*.txt: 每行一个 app_id, 按当前 Catalog 配置入库.
@@ -1502,5 +1530,14 @@ end
         assert_eq!(outcome.trace.len(), 1);
         assert_eq!(outcome.trace[0].outcome, CatalogTraceOutcome::Hit);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_kit_is_runtime_disabled_by_default() {
+        let tools = stt_config::ToolRegistry::with_defaults();
+
+        let detail = download_kit_detail(&tools);
+
+        assert_eq!(detail, "已关闭, 下载能力不安装");
     }
 }

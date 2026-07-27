@@ -214,6 +214,13 @@ mod tests {
         let accel = snap.tools.iter().find(|t| t.id == "store_accel").unwrap();
         assert!(!accel.enabled);
         assert!(accel.placeholder);
+        let download = snap
+            .tools
+            .iter()
+            .find(|t| t.id == "download_kit")
+            .unwrap();
+        assert!(!download.enabled);
+        assert!(!download.placeholder);
     }
 
     #[test]
