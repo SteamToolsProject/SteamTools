@@ -1,4 +1,4 @@
-//! 受限 WinHTTP GET transport.
+//! 受限 WinHTTP transport.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -16,7 +16,16 @@ use windows::Win32::Networking::WinHttp::{
 };
 
 const MAX_URL_CHARS: usize = 2048;
+const MAX_HEADERS: usize = 32;
+const MAX_HEADER_CHARS: usize = 16 * 1024;
 const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// transport 允许的 HTTP 方法.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+}
 
 /// WinHTTP 四段超时, 单位毫秒.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +54,24 @@ pub struct WinHttpGetOptions {
     pub max_body_bytes: usize,
 }
 
+/// 带可选请求体的 HTTP 请求资源限制.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WinHttpRequestOptions {
+    pub timeouts: WinHttpTimeouts,
+    pub max_request_body_bytes: usize,
+    pub max_response_body_bytes: usize,
+}
+
+impl Default for WinHttpRequestOptions {
+    fn default() -> Self {
+        Self {
+            timeouts: WinHttpTimeouts::default(),
+            max_request_body_bytes: 256 * 1024,
+            max_response_body_bytes: 1024 * 1024,
+        }
+    }
+}
+
 impl Default for WinHttpGetOptions {
     fn default() -> Self {
         Self {
@@ -54,7 +81,7 @@ impl Default for WinHttpGetOptions {
     }
 }
 
-/// GET 响应. 非 2xx 也会保留状态码并返回这里.
+/// HTTP 响应. 非 2xx 也会保留状态码并返回这里.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
@@ -77,6 +104,8 @@ pub enum HttpError {
     },
     #[error("HTTP response exceeds {limit} bytes (at least {actual})")]
     ResponseTooLarge { actual: usize, limit: usize },
+    #[error("HTTP request body exceeds {limit} bytes (actual {actual})")]
+    RequestTooLarge { actual: usize, limit: usize },
 }
 
 struct InternetHandle(*mut c_void);
@@ -113,10 +142,56 @@ struct ParsedUrl {
 ///
 /// URL 无效、WinHTTP 失败/超时或响应超过上限时返回 [`HttpError`].
 pub fn winhttp_get(url: &str, options: WinHttpGetOptions) -> Result<HttpResponse, HttpError> {
+    let options = WinHttpRequestOptions {
+        timeouts: options.timeouts,
+        max_request_body_bytes: 0,
+        max_response_body_bytes: options.max_body_bytes,
+    };
+    winhttp_request(HttpMethod::Get, url, &[], &[], options)
+}
+
+/// 执行一次受限 POST.
+///
+/// # Errors
+///
+/// URL/请求头无效、请求或响应超限、WinHTTP 失败/超时时返回 [`HttpError`].
+pub fn winhttp_post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    options: WinHttpRequestOptions,
+) -> Result<HttpResponse, HttpError> {
+    winhttp_request(HttpMethod::Post, url, headers, body, options)
+}
+
+/// 执行一次受限 GET/POST.
+///
+/// 只接受 HTTP/HTTPS, 禁止重定向和 URL 用户信息, 并限制请求头、请求体和响应体.
+///
+/// # Errors
+///
+/// URL/请求头无效、请求或响应超限、WinHTTP 失败/超时时返回 [`HttpError`].
+pub fn winhttp_request(
+    method: HttpMethod,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    options: WinHttpRequestOptions,
+) -> Result<HttpResponse, HttpError> {
     let parsed = parse_url(url)?;
     let timeouts = checked_timeouts(options.timeouts)?;
+    let headers = encode_headers(headers)?;
+    if body.len() > options.max_request_body_bytes {
+        return Err(HttpError::RequestTooLarge {
+            actual: body.len(),
+            limit: options.max_request_body_bytes,
+        });
+    }
+    if method == HttpMethod::Get && !body.is_empty() {
+        return Err(HttpError::InvalidOptions("GET body is not supported"));
+    }
 
-    // SAFETY: 所有字符串在调用期间有效且以 NUL 结尾; 句柄由 RAII wrapper 管理.
+    // SAFETY: URL component 在调用期间有效且以 NUL 结尾; header 带显式长度; 句柄由 RAII 管理.
     unsafe {
         let session = InternetHandle::new(
             WinHttpOpen(
@@ -142,10 +217,14 @@ pub fn winhttp_get(url: &str, options: WinHttpGetOptions) -> Result<HttpResponse
         } else {
             WINHTTP_OPEN_REQUEST_FLAGS(0)
         };
+        let verb = match method {
+            HttpMethod::Get => w!("GET"),
+            HttpMethod::Post => w!("POST"),
+        };
         let request = InternetHandle::new(
             WinHttpOpenRequest(
                 connection.0,
-                w!("GET"),
+                verb,
                 PCWSTR(parsed.object.as_ptr()),
                 PCWSTR::null(),
                 PCWSTR::null(),
@@ -176,16 +255,55 @@ pub fn winhttp_get(url: &str, options: WinHttpGetOptions) -> Result<HttpResponse
                 Some(&redirect_policy),
             ),
         )?;
-        map_result("send", WinHttpSendRequest(request.0, None, None, 0, 0, 0))?;
+        let body_len = u32::try_from(body.len())
+            .map_err(|_| HttpError::InvalidOptions("request body exceeds u32::MAX"))?;
+        let body_pointer = (!body.is_empty()).then_some(body.as_ptr().cast());
+        map_result(
+            "send",
+            WinHttpSendRequest(
+                request.0,
+                (!headers.is_empty()).then_some(headers.as_slice()),
+                body_pointer,
+                body_len,
+                body_len,
+                0,
+            ),
+        )?;
         map_result(
             "receive",
             WinHttpReceiveResponse(request.0, ptr::null_mut()),
         )?;
 
         let status = query_status(request.0)?;
-        let body = read_body(request.0, options.max_body_bytes)?;
+        let body = read_body(request.0, options.max_response_body_bytes)?;
         Ok(HttpResponse { status, body })
     }
+}
+
+fn encode_headers(headers: &[(String, String)]) -> Result<Vec<u16>, HttpError> {
+    if headers.len() > MAX_HEADERS {
+        return Err(HttpError::InvalidOptions("too many request headers"));
+    }
+
+    let mut encoded = String::new();
+    for (name, value) in headers {
+        let valid_name = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        let valid_value = !value.contains(['\0', '\r', '\n']);
+        if !valid_name || !valid_value {
+            return Err(HttpError::InvalidOptions("invalid request header"));
+        }
+        encoded.push_str(name);
+        encoded.push_str(": ");
+        encoded.push_str(value);
+        encoded.push_str("\r\n");
+    }
+    if encoded.chars().count() > MAX_HEADER_CHARS {
+        return Err(HttpError::InvalidOptions("request headers are too large"));
+    }
+    Ok(encoded.encode_utf16().collect())
 }
 
 fn checked_timeouts(timeouts: WinHttpTimeouts) -> Result<(i32, i32, i32, i32), HttpError> {
@@ -340,6 +458,9 @@ fn map_windows_error(operation: &'static str, error: WindowsError) -> HttpError 
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
     use super::*;
 
     #[test]
@@ -356,5 +477,90 @@ mod tests {
             winhttp_get("http://user:pass@127.0.0.1/x", WinHttpGetOptions::default()),
             Err(HttpError::InvalidUrl(_))
         ));
+    }
+
+    #[test]
+    fn rejects_header_injection() {
+        let headers = vec![("X-Test".to_owned(), "ok\r\nInjected: yes".to_owned())];
+
+        let error = winhttp_request(
+            HttpMethod::Get,
+            "http://127.0.0.1/",
+            &headers,
+            &[],
+            WinHttpRequestOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, HttpError::InvalidOptions(_)));
+    }
+
+    #[test]
+    fn rejects_post_body_over_limit_before_network() {
+        let options = WinHttpRequestOptions {
+            max_request_body_bytes: 2,
+            ..WinHttpRequestOptions::default()
+        };
+
+        let error = winhttp_post("http://127.0.0.1/", &[], b"abc", options).unwrap_err();
+
+        assert!(matches!(
+            error,
+            HttpError::RequestTooLarge {
+                actual: 3,
+                limit: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn post_sends_headers_and_body_to_local_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.ends_with(b"\r\n\r\npayload") {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .unwrap();
+            request
+        });
+        let options = WinHttpRequestOptions {
+            timeouts: WinHttpTimeouts {
+                resolve_ms: 1_000,
+                connect_ms: 1_000,
+                send_ms: 1_000,
+                receive_ms: 1_000,
+            },
+            ..WinHttpRequestOptions::default()
+        };
+
+        let response = winhttp_post(
+            &format!("http://127.0.0.1:{port}/submit"),
+            &[("X-Test".to_owned(), "yes".to_owned())],
+            b"payload",
+            options,
+        )
+        .unwrap();
+        let request = String::from_utf8(server.join().unwrap()).unwrap();
+
+        assert!(request.starts_with("POST /submit HTTP/1.1\r\n"));
+        assert!(request.contains("X-Test: yes\r\n"));
+        assert!(request.ends_with("\r\n\r\npayload"));
+        assert_eq!(response.status, 201);
+        assert_eq!(response.body, b"ok");
     }
 }

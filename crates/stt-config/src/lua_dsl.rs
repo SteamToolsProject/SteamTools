@@ -6,6 +6,7 @@ use mlua::{Lua, Value};
 use stt_core::{AppRules, CatalogBundle, ManifestOverride};
 
 use crate::error::{ConfigError, Result};
+use crate::lua_http::{register_lua_http, LuaHttpClient};
 
 fn lock_bundle(b: &Mutex<CatalogBundle>) -> MutexGuard<'_, CatalogBundle> {
     b.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -24,8 +25,27 @@ pub fn apply_lua_chunk(rules: &mut AppRules, source: &str) -> Result<()> {
 }
 
 pub fn eval_lua_to_bundle(source: &str) -> Result<CatalogBundle> {
+    eval_lua_to_bundle_inner(source, None)
+}
+
+/// 使用注入的受限 HTTP client 执行 Lua DSL.
+pub fn eval_lua_to_bundle_with_http(
+    source: &str,
+    client: Arc<dyn LuaHttpClient>,
+) -> Result<CatalogBundle> {
+    eval_lua_to_bundle_inner(source, Some(client))
+}
+
+fn eval_lua_to_bundle_inner(
+    source: &str,
+    http_client: Option<Arc<dyn LuaHttpClient>>,
+) -> Result<CatalogBundle> {
     let lua = Lua::new();
     let bundle = Arc::new(Mutex::new(CatalogBundle::default()));
+
+    if let Some(client) = http_client {
+        register_lua_http(&lua, client).map_err(lua_err)?;
+    }
 
     {
         let b = Arc::clone(&bundle);
