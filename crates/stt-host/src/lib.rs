@@ -1005,13 +1005,19 @@ fn plan_download_layer(
 ) -> stt_steamclient::DownloadKitReport {
     sync_download_runtime(state);
     let report = build_download_report(state, patterns);
-    #[cfg(any(feature = "download-manifest", feature = "download-key"))]
+    #[cfg(any(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token"
+    ))]
     let report = {
         let mut report = report;
         #[cfg(feature = "download-manifest")]
         stt_steamclient::try_install_manifest_hook(&mut report, patterns);
         #[cfg(feature = "download-key")]
         stt_steamclient::try_install_depot_key_hook(&mut report, patterns);
+        #[cfg(feature = "download-token")]
+        stt_steamclient::try_install_access_token_hook(&mut report, patterns);
         report
     };
     append_host_log(
@@ -1032,7 +1038,7 @@ fn build_download_report(
     let data = state.with_rules(|rules| stt_steamclient::DownloadDataAvailability {
         manifest: rules.has_manifest_overrides(),
         key: rules.has_depot_keys(),
-        token: rules.has_access_tokens(),
+        token: has_configured_access_token(rules),
         request_code,
     });
     let switches = stt_steamclient::DownloadRuntimeSwitches {
@@ -1049,6 +1055,12 @@ fn build_download_report(
         switches,
         data,
     )
+}
+
+fn has_configured_access_token(rules: &AppRules) -> bool {
+    rules
+        .owned_iter()
+        .any(|app_id| rules.access_token(app_id).is_some_and(|token| token != 0))
 }
 
 fn sync_download_runtime(state: &ConfigState) {
@@ -1086,11 +1098,41 @@ fn sync_download_runtime(state: &ConfigState) {
         let _ = stt_steamclient::replace_depot_keys(values);
     }
 
-    #[cfg(not(any(feature = "download-manifest", feature = "download-key")))]
+    #[cfg(feature = "download-token")]
+    {
+        let enabled = state.tools().is_enabled(ToolId::DownloadKit)
+            && download_env_enabled("STEAMTOOLS_DOWNLOAD_TOKEN");
+        let values = if enabled {
+            state.with_rules(|rules| {
+                rules
+                    .owned_iter()
+                    .filter_map(|app_id| {
+                        rules
+                            .access_token(app_id)
+                            .filter(|token| *token != 0)
+                            .map(|token| (app_id, token))
+                    })
+                    .collect()
+            })
+        } else {
+            std::collections::HashMap::new()
+        };
+        let _ = stt_steamclient::replace_access_tokens(values);
+    }
+
+    #[cfg(not(any(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token"
+    )))]
     let _ = state;
 }
 
-#[cfg(any(feature = "download-manifest", feature = "download-key"))]
+#[cfg(any(
+    feature = "download-manifest",
+    feature = "download-key",
+    feature = "download-token"
+))]
 fn download_hook_rearm_pending() -> bool {
     #[cfg(feature = "download-manifest")]
     if !stt_steamclient::is_manifest_hook_attached() {
@@ -1098,6 +1140,10 @@ fn download_hook_rearm_pending() -> bool {
     }
     #[cfg(feature = "download-key")]
     if !stt_steamclient::is_depot_key_hook_attached() {
+        return true;
+    }
+    #[cfg(feature = "download-token")]
+    if !stt_steamclient::is_access_token_hook_attached() {
         return true;
     }
     false
@@ -1359,6 +1405,10 @@ fn run_watch_loop(
     let mut key_attached_logged = stt_steamclient::is_depot_key_hook_attached();
     #[cfg(feature = "download-key")]
     let mut last_key_stats = stt_steamclient::depot_key_hook_stats();
+    #[cfg(feature = "download-token")]
+    let mut token_attached_logged = stt_steamclient::is_access_token_hook_attached();
+    #[cfg(feature = "download-token")]
+    let mut last_token_stats = stt_steamclient::access_token_hook_stats();
 
     loop {
         std::thread::sleep(WATCH_POLL);
@@ -1410,7 +1460,17 @@ fn run_watch_loop(
             append_host_log(steam_root, "download_key=hook lost, scheduling rearm");
         }
 
-        #[cfg(any(feature = "download-manifest", feature = "download-key"))]
+        #[cfg(feature = "download-token")]
+        if token_attached_logged && !stt_steamclient::is_access_token_hook_attached() {
+            token_attached_logged = false;
+            append_host_log(steam_root, "download_token=hook lost, scheduling rearm");
+        }
+
+        #[cfg(any(
+            feature = "download-manifest",
+            feature = "download-key",
+            feature = "download-token"
+        ))]
         if package_rearm_ticks.is_multiple_of(8)
             && state.tools().is_enabled(ToolId::DownloadKit)
             && download_hook_rearm_pending()
@@ -1479,6 +1539,37 @@ fn run_watch_loop(
             }
         }
 
+        #[cfg(feature = "download-token")]
+        if !token_attached_logged
+            && package_rearm_ticks.is_multiple_of(8)
+            && state.tools().is_enabled(ToolId::DownloadKit)
+        {
+            let mut report = build_download_report(state, &patterns);
+            stt_steamclient::try_install_access_token_hook(&mut report, &patterns);
+            let token = report
+                .capabilities
+                .iter()
+                .find(|item| item.capability == stt_steamclient::DownloadCapability::AccessToken);
+            if stt_steamclient::is_access_token_hook_attached() {
+                token_attached_logged = true;
+                append_host_log(steam_root, "download_token=hook attached on rearm");
+            } else if package_rearm_ticks == 8
+                || package_rearm_ticks == 40
+                || package_rearm_ticks.is_multiple_of(80)
+            {
+                let status = token
+                    .map(|item| format!("{:?}", item.status))
+                    .unwrap_or_else(|| "MissingReport".to_owned());
+                let detail = token
+                    .and_then(|item| item.detail.as_deref())
+                    .unwrap_or("not attached");
+                append_host_log(
+                    steam_root,
+                    &format!("download_token=rearm waiting status={status} detail={detail}"),
+                );
+            }
+        }
+
         #[cfg(feature = "download-manifest")]
         {
             let stats = stt_steamclient::manifest_hook_stats();
@@ -1503,6 +1594,21 @@ fn run_watch_loop(
                     &format!("download_key_stats calls={} served={}", stats.0, stats.1),
                 );
                 last_key_stats = stats;
+            }
+        }
+
+        #[cfg(feature = "download-token")]
+        {
+            let stats = stt_steamclient::access_token_hook_stats();
+            if stats != last_token_stats {
+                append_host_log(
+                    steam_root,
+                    &format!(
+                        "download_token_stats calls={} frames={} apps={}",
+                        stats.0, stats.1, stats.2
+                    ),
+                );
+                last_token_stats = stats;
             }
         }
 
@@ -1761,5 +1867,31 @@ end
             .capabilities
             .iter()
             .all(|item| item.status == stt_steamclient::DownloadCapabilityStatus::ToolDisabled));
+    }
+
+    #[test]
+    fn token_without_configured_app_is_not_available() {
+        let mut rules = AppRules::new();
+        rules.set_access_token(42, 123);
+
+        assert!(!has_configured_access_token(&rules));
+    }
+
+    #[test]
+    fn configured_app_with_nonzero_token_is_available() {
+        let mut rules = AppRules::new();
+        rules.add_app(42);
+        rules.set_access_token(42, 123);
+
+        assert!(has_configured_access_token(&rules));
+    }
+
+    #[test]
+    fn configured_app_with_zero_token_is_not_available() {
+        let mut rules = AppRules::new();
+        rules.add_app(42);
+        rules.set_access_token(42, 0);
+
+        assert!(!has_configured_access_token(&rules));
     }
 }
