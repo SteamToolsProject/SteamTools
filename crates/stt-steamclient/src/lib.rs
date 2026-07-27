@@ -6,6 +6,7 @@ mod hooks;
 mod install;
 mod layout;
 mod license;
+mod manifest_code;
 mod ownership;
 
 pub use hooks::{
@@ -23,6 +24,11 @@ pub use layout::{
     PACKAGE_STATUS_INVALID,
 };
 pub use license::{plan_init_fake_license, LicenseNotifyPlan, LicenseQueue, UiLicenseAction};
+pub use manifest_code::{
+    ManifestCodeFailureKind, ManifestCodeProvider, ManifestCodeProviderResult, ManifestCodeRequest,
+    ManifestCodeResolution, ManifestCodeResolverChain, ManifestCodeStage, ManifestCodeTraceEntry,
+    ManifestCodeTraceOutcome, ManifestCodeUnresolved,
+};
 pub use ownership::{
     app_is_configured, configured_in_rules, decide_ownership_rewrite, ForgedOwnershipFields,
     OwnershipRewrite,
