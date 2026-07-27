@@ -2,6 +2,7 @@
 //!
 //! 偏移常量见 `layout`; hook 见 `hooks` (可 `STEAMTOOLS_PACKAGE=off` 关掉).
 
+mod download;
 mod hooks;
 mod install;
 mod layout;
@@ -28,6 +29,10 @@ pub use manifest_code::{
     ManifestCodeFailureKind, ManifestCodeProvider, ManifestCodeProviderResult, ManifestCodeRequest,
     ManifestCodeResolution, ManifestCodeResolverChain, ManifestCodeStage, ManifestCodeTraceEntry,
     ManifestCodeTraceOutcome, ManifestCodeUnresolved,
+};
+pub use download::{
+    plan_download_kit, DownloadCapability, DownloadCapabilityReport, DownloadCapabilityStatus,
+    DownloadDataAvailability, DownloadFeatureSet, DownloadKitReport, DownloadRuntimeSwitches,
 };
 pub use ownership::{
     app_is_configured, configured_in_rules, decide_ownership_rewrite, ForgedOwnershipFields,

@@ -95,6 +95,10 @@ impl AppRules {
         self.depot_keys.get(&depot_id).map(String::as_str)
     }
 
+    pub fn has_depot_keys(&self) -> bool {
+        !self.depot_keys.is_empty()
+    }
+
     pub fn app_depots(&self, app_id: AppId) -> &[DepotId] {
         self.app_depots
             .get(&app_id)
@@ -120,6 +124,10 @@ impl AppRules {
         self.access_tokens.get(&app_id).copied()
     }
 
+    pub fn has_access_tokens(&self) -> bool {
+        !self.access_tokens.is_empty()
+    }
+
     pub fn set_manifest_override(&mut self, depot_id: DepotId, over: ManifestOverride) {
         if self.manifest_overrides.get(&depot_id) == Some(&over) {
             return;
@@ -130,6 +138,10 @@ impl AppRules {
 
     pub fn manifest_override(&self, depot_id: DepotId) -> Option<&ManifestOverride> {
         self.manifest_overrides.get(&depot_id)
+    }
+
+    pub fn has_manifest_overrides(&self) -> bool {
+        !self.manifest_overrides.is_empty()
     }
 
     pub fn set_purchase_time(&mut self, app_id: AppId, unix_secs: u32) {
