@@ -1004,9 +1004,13 @@ fn plan_download_layer(
     patterns: &stt_metadata::PatternStore,
 ) -> stt_steamclient::DownloadKitReport {
     sync_manifest_overrides(state);
-    let mut report = build_download_report(state, patterns);
+    let report = build_download_report(state, patterns);
     #[cfg(feature = "download-manifest")]
-    stt_steamclient::try_install_manifest_hook(&mut report, patterns);
+    let report = {
+        let mut report = report;
+        stt_steamclient::try_install_manifest_hook(&mut report, patterns);
+        report
+    };
     append_host_log(
         steam_root,
         &format!("download_kit {}", report.summary_line()),
