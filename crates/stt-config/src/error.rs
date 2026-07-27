@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error(transparent)]
+    Catalog(#[from] stt_catalog::CatalogError),
     #[error("io error on {path}: {source}")]
     Io {
         path: PathBuf,

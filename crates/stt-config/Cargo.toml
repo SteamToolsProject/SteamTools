@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Host TOML, tool registry, Lua DSL, catalog trait"
+description = "Host TOML, tool registry, Lua DSL and catalog persistence"
 
 [features]
 default = ["lua"]
@@ -12,6 +12,7 @@ lua = ["dep:mlua"]
 
 [dependencies]
 stt-core = { workspace = true }
+stt-catalog = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 # 配置页保存时定点改键, 不冲掉用户手写的注释与键序; 已经是 toml 0.8 的内部依赖.
