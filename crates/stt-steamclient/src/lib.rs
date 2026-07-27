@@ -12,7 +12,7 @@ mod license;
 #[cfg(feature = "download-manifest")]
 mod manifest;
 mod manifest_code;
-#[cfg(feature = "download-token")]
+#[cfg(any(feature = "download-token", feature = "download-request-code"))]
 mod net_send;
 mod ownership;
 #[cfg(feature = "download-request-code")]
@@ -22,7 +22,8 @@ mod token;
 #[cfg(any(
     feature = "download-manifest",
     feature = "download-key",
-    feature = "download-token"
+    feature = "download-token",
+    feature = "download-request-code"
 ))]
 mod verified;
 #[cfg(any(feature = "download-token", feature = "download-request-code"))]
@@ -68,9 +69,13 @@ pub use ownership::{
 };
 #[cfg(feature = "download-request-code")]
 pub use request_code::{
-    inspect_manifest_code_request_frame, rewrite_manifest_code_response_frame,
-    ManifestCodeCompletion, ManifestCodeJob, ManifestCodeJobTable, ManifestCodeJobTicket,
-    ManifestCodeRegister, ManifestCodeResponseRewrite,
+    cancel_manifest_code_work, complete_manifest_code_work, inspect_manifest_code_request_frame,
+    is_manifest_code_send_hook_attached, manifest_code_hook_stats, register_manifest_code_worker,
+    replace_manifest_code_depots, rewrite_manifest_code_response_frame,
+    rewrite_manifest_code_runtime_response, try_install_manifest_code_send_hook,
+    ManifestCodeCompletion, ManifestCodeDepotSnapshotReport, ManifestCodeJob, ManifestCodeJobTable,
+    ManifestCodeJobTicket, ManifestCodeRegister, ManifestCodeResolveWork,
+    ManifestCodeResponseRewrite,
 };
 #[cfg(feature = "download-token")]
 pub use token::{
