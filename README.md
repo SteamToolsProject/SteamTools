@@ -26,6 +26,7 @@
 - [x] M4b：商店「入库」按钮 (CDP 注入 + 页内队列回传) → `config/lua/stt_{app_id}.lua`
 - [x] M4c：配置页 (标签行入口 + 面板 → `steamtools.toml` 热生效，本机已冒烟)
 - [x] M6-1：`stt-catalog`、Catalog wire v1、集中校验与 AppId/DepotId 明确建模
+- [x] M6-2：受限 WinHTTP、`CustomHttp` 真 Catalog、独立 `[catalog]` 配置与后台 worker
 
 ```powershell
 cargo test
