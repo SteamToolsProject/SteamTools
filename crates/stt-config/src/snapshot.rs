@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::intent::{LOG_LEVELS, MANIFEST_SOURCES};
+use crate::intent::{CATALOG_MODES, LOG_LEVELS, MANIFEST_SOURCES};
 use crate::tools::ToolId;
 use crate::ConfigState;
 
@@ -42,6 +42,10 @@ pub struct ConfigSnapshot {
     pub tools: Vec<ToolView>,
     pub log_level: String,
     pub log_levels: &'static [&'static str],
+    pub catalog_mode: String,
+    pub catalog_modes: &'static [&'static str],
+    pub catalog_url_template: String,
+    pub catalog_status: String,
     pub manifest_url: String,
     pub manifest_sources: &'static [&'static str],
     /// 额外 lua 目录 (默认目录不在其中, 单独给).
@@ -98,6 +102,14 @@ impl ConfigSnapshot {
             // `host` 已经是 `state.host()` 给的副本, 直接搬走字段, 别再克隆一遍.
             log_level: host.log.level,
             log_levels: LOG_LEVELS,
+            catalog_mode: host.catalog.mode.as_str().to_owned(),
+            catalog_modes: CATALOG_MODES,
+            catalog_url_template: host.catalog.url_template,
+            catalog_status: match host.catalog.mode {
+                crate::CatalogMode::Disabled => "未配置".to_owned(),
+                crate::CatalogMode::CustomHttp => "CustomHttp".to_owned(),
+                crate::CatalogMode::Mock => "Mock (开发模式)".to_owned(),
+            },
             manifest_url: host.manifest.url,
             manifest_sources: MANIFEST_SOURCES,
             lua_paths: host.lua.paths,
@@ -207,7 +219,7 @@ mod tests {
         let state = ConfigState::new();
         state.apply_host(
             HostConfig::parse_str(
-                "[tools.enabled]\nlibrary_ux = false\n\n[manifest]\nurl = \"wudrm\"\n",
+                "[tools.enabled]\nlibrary_ux = false\n\n[catalog]\nmode = \"mock\"\n\n[manifest]\nurl = \"wudrm\"\n",
             )
             .unwrap(),
         );
@@ -221,6 +233,8 @@ mod tests {
                 .enabled
         );
         assert_eq!(snap.manifest_url, "wudrm");
+        assert_eq!(snap.catalog_mode, "mock");
+        assert!(snap.catalog_status.contains("开发模式"));
         assert_eq!(snap.note, "saved");
     }
 }

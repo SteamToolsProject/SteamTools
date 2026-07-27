@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 use crate::error::{ConfigError, Result};
-use crate::host_toml::{HostConfig, HOST_TOML_NAME};
+use crate::host_toml::{CatalogMode, HostConfig, HOST_TOML_NAME};
 use crate::tools::ToolId;
 use crate::ConfigState;
 
@@ -18,6 +18,9 @@ pub const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
 /// 允许的上游源 id (真实实现还没接, 先只认这几个名字).
 pub const MANIFEST_SOURCES: &[&str] = &["opensteamtool", "steamrun", "wudrm"];
+
+/// 配置页允许切换的完整 Catalog 模式.
+pub const CATALOG_MODES: &[&str] = &["disabled", "custom_http", "mock"];
 
 /// 额外 lua 目录的条数上限.
 const MAX_LUA_PATHS: usize = 8;
@@ -33,6 +36,8 @@ pub enum ConfigIntent {
         on: bool,
     },
     SetLogLevel(String),
+    SetCatalogMode(CatalogMode),
+    SetCatalogUrlTemplate(String),
     SetManifestUrl(String),
     AddLuaPath(String),
     RemoveLuaPath(String),
@@ -57,6 +62,17 @@ impl ConfigIntent {
         MANIFEST_SOURCES
             .contains(&source)
             .then(|| Self::SetManifestUrl(source.to_owned()))
+    }
+
+    pub fn set_catalog_mode(mode: &str) -> Option<Self> {
+        CatalogMode::parse(mode).map(Self::SetCatalogMode)
+    }
+
+    pub fn set_catalog_url_template(template: &str) -> Option<Self> {
+        let template = template.trim();
+        stt_catalog::validate_url_template(template)
+            .is_ok()
+            .then(|| Self::SetCatalogUrlTemplate(template.to_owned()))
     }
 
     pub fn add_lua_path(path: &str) -> Option<Self> {
@@ -93,6 +109,15 @@ impl ConfigIntent {
             Self::SetLogLevel(level) => {
                 host.log.level = level.clone();
                 Ok(format!("log.level={level}"))
+            }
+            Self::SetCatalogMode(mode) => {
+                host.catalog.mode = *mode;
+                host.catalog.validate()?;
+                Ok(format!("catalog.mode={}", mode.as_str()))
+            }
+            Self::SetCatalogUrlTemplate(template) => {
+                host.catalog.url_template = template.clone();
+                Ok("catalog.url_template 已更新".into())
             }
             Self::SetManifestUrl(source) => {
                 host.manifest.url = source.clone();
@@ -185,6 +210,14 @@ pub fn save_host_change(
             let table = table_at(&mut doc, &["log"])?;
             table["level"] = toml_edit::value(level.as_str());
         }
+        ConfigIntent::SetCatalogMode(mode) => {
+            let table = table_at(&mut doc, &["catalog"])?;
+            table["mode"] = toml_edit::value(mode.as_str());
+        }
+        ConfigIntent::SetCatalogUrlTemplate(template) => {
+            let table = table_at(&mut doc, &["catalog"])?;
+            table["url_template"] = toml_edit::value(template.as_str());
+        }
         ConfigIntent::SetManifestUrl(source) => {
             let table = table_at(&mut doc, &["manifest"])?;
             table["url"] = toml_edit::value(source.as_str());
@@ -263,6 +296,41 @@ mod tests {
     fn set_manifest_url_refuses_arbitrary_urls() {
         assert!(ConfigIntent::set_manifest_url("wudrm").is_some());
         assert!(ConfigIntent::set_manifest_url("http://evil.test/x").is_none());
+    }
+
+    #[test]
+    fn catalog_intents_are_bounded() {
+        assert_eq!(
+            ConfigIntent::set_catalog_mode("mock"),
+            Some(ConfigIntent::SetCatalogMode(CatalogMode::Mock))
+        );
+        assert!(ConfigIntent::set_catalog_mode("community").is_none());
+        assert!(
+            ConfigIntent::set_catalog_url_template("https://catalog.test/v1/{app_id}").is_some()
+        );
+        assert!(ConfigIntent::set_catalog_url_template("http://x/no-placeholder").is_none());
+    }
+
+    #[test]
+    fn catalog_changes_keep_manifest_source() {
+        let root = tempfile::tempdir().unwrap();
+        let state = ConfigState::new();
+        apply_intent(
+            &state,
+            root.path(),
+            &ConfigIntent::set_catalog_url_template("http://127.0.0.1/{app_id}").unwrap(),
+        )
+        .unwrap();
+        apply_intent(
+            &state,
+            root.path(),
+            &ConfigIntent::set_catalog_mode("custom_http").unwrap(),
+        )
+        .unwrap();
+
+        let fresh = HostConfig::load_from_steam_root(root.path()).unwrap();
+        assert_eq!(fresh.catalog.mode, CatalogMode::CustomHttp);
+        assert_eq!(fresh.manifest.url, "opensteamtool");
     }
 
     #[test]
