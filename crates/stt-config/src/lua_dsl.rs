@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use mlua::{Lua, Value};
+use mlua::{Lua, Table};
 use stt_core::{AppRules, CatalogBundle, ManifestOverride};
 
 use crate::error::{ConfigError, Result};
@@ -15,9 +15,10 @@ fn lock_bundle(b: &Mutex<CatalogBundle>) -> MutexGuard<'_, CatalogBundle> {
 /// 执行一段 Lua 配置并合并进 `rules`.
 ///
 /// 兼容面 (小写注册):
-/// - `addappid(id [, unused, key64hex])`
+/// - `addappid(id [, purchase_time, key64hex])`
 /// - `addtoken(appId, tokenDecimalString)`
 /// - `setmanifestid(depotId, gidString [, size])`
+/// - `setappdepots(appId, { depotId, ... })`
 pub fn apply_lua_chunk(rules: &mut AppRules, source: &str) -> Result<()> {
     let bundle = eval_lua_to_bundle(source)?;
     rules.apply_catalog_bundle(&bundle);
@@ -51,18 +52,24 @@ fn eval_lua_to_bundle_inner(
         let b = Arc::clone(&bundle);
         let f = lua
             .create_function(
-                move |_, (id, _unused, key): (u32, Option<Value>, Option<String>)| {
+                move |_, (id, purchase_time, key): (u32, Option<u32>, Option<String>)| {
                     let mut g = lock_bundle(&b);
-                    if !g.apps.contains(&id) {
-                        g.apps.push(id);
-                    }
-                    let depots = g.app_depots.entry(id).or_default();
-                    if !depots.contains(&id) {
-                        depots.push(id);
-                    }
                     if let Some(k) = key {
                         if k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()) {
                             g.depot_keys.insert(id, k);
+                        }
+                        if g.apps.contains(&id) {
+                            let depots = g.app_depots.entry(id).or_default();
+                            if !depots.contains(&id) {
+                                depots.push(id);
+                            }
+                        }
+                    } else {
+                        if !g.apps.contains(&id) {
+                            g.apps.push(id);
+                        }
+                        if let Some(purchase_time) = purchase_time.filter(|value| *value != 0) {
+                            g.purchase_times.insert(id, purchase_time);
                         }
                     }
                     Ok(())
@@ -70,6 +77,32 @@ fn eval_lua_to_bundle_inner(
             )
             .map_err(lua_err)?;
         lua.globals().set("addappid", f).map_err(lua_err)?;
+    }
+
+    {
+        let b = Arc::clone(&bundle);
+        let f = lua
+            .create_function(move |_, (app_id, values): (u32, Table)| {
+                const MAX_DEPOTS_PER_APP: usize = 4096;
+                let mut depots = Vec::new();
+                for value in values.sequence_values::<u32>() {
+                    let depot_id = value?;
+                    if depot_id == 0 || depots.len() >= MAX_DEPOTS_PER_APP {
+                        return Err(mlua::Error::external("setappdepots: invalid depot list"));
+                    }
+                    if !depots.contains(&depot_id) {
+                        depots.push(depot_id);
+                    }
+                }
+                let mut g = lock_bundle(&b);
+                if !g.apps.contains(&app_id) {
+                    g.apps.push(app_id);
+                }
+                g.app_depots.insert(app_id, depots);
+                Ok(())
+            })
+            .map_err(lua_err)?;
+        lua.globals().set("setappdepots", f).map_err(lua_err)?;
     }
 
     {
@@ -141,6 +174,7 @@ setmanifestid(228980, "9876543210")
         let mut rules = AppRules::new();
         apply_lua_chunk(&mut rules, src).unwrap();
         assert!(rules.is_owned(1361510));
+        assert_eq!(rules.app_depots(1361510), &[1361510]);
         assert_eq!(rules.depot_key(1361510).map(|s| s.len()), Some(64));
         assert_eq!(rules.access_token(1361510), Some(1234567890));
         assert_eq!(
@@ -153,7 +187,21 @@ setmanifestid(228980, "9876543210")
     fn short_key_ignored() {
         let mut rules = AppRules::new();
         apply_lua_chunk(&mut rules, r#"addappid(1, 0, "ab")"#).unwrap();
-        assert!(rules.is_owned(1));
+        assert!(!rules.is_owned(1));
         assert!(rules.depot_key(1).is_none());
+    }
+
+    #[test]
+    fn explicit_app_depots_and_purchase_time_survive_lua() {
+        let mut rules = AppRules::new();
+        apply_lua_chunk(
+            &mut rules,
+            "addappid(42, 123)\naddappid(43, 0, \"\")\nsetappdepots(42, {43})",
+        )
+        .unwrap();
+
+        assert_eq!(rules.app_depots(42), &[43]);
+        assert_eq!(rules.purchase_time(42), Some(123));
+        assert!(!rules.is_owned(43));
     }
 }
