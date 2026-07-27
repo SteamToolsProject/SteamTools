@@ -158,8 +158,19 @@ fn on_library_removed(steam_root: &Path, state: &ConfigState, app_id: AppId) {
 }
 
 /// lua 全量重载后: 与 owned 做差再 notify.
-fn on_rules_reloaded(steam_root: &Path, state: &ConfigState) {
+fn on_rules_reloaded(
+    steam_root: &Path,
+    state: &ConfigState,
+    patterns: &stt_metadata::PatternStore,
+) {
     sync_download_runtime(state);
+    append_host_log(
+        steam_root,
+        &format!(
+            "download_kit_reload {}",
+            build_download_report(state, patterns).summary_line()
+        ),
+    );
     sync_configured_from_state(state);
     let Some(q) = license_queue() else {
         return;
@@ -1889,7 +1900,7 @@ fn run_watch_loop(
                             state.rules_epoch()
                         ),
                     );
-                    on_rules_reloaded(steam_root, state);
+                    on_rules_reloaded(steam_root, state, &patterns);
                 }
                 Err(e) => append_host_log(steam_root, &format!("reload=host_toml error={e}")),
             }
@@ -1914,7 +1925,7 @@ fn run_watch_loop(
                         state.rules_epoch()
                     ),
                 );
-                on_rules_reloaded(steam_root, state);
+                on_rules_reloaded(steam_root, state, &patterns);
             }
         }
 
@@ -1930,7 +1941,7 @@ fn run_watch_loop(
                     state.rules_epoch()
                 ),
             );
-            on_rules_reloaded(steam_root, state);
+            on_rules_reloaded(steam_root, state, &patterns);
             let host = state.host();
             lua_watch = stt_config::lua_files_watcher(steam_root, &host, WATCH_DEBOUNCE);
         }
