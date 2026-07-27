@@ -1542,6 +1542,7 @@ fn run_watch_loop(
     // steamclient64 常比 host 晚加载; init 时没挂上就在 watch 里补.
     let mut package_rearm_ticks: u32 = 0;
     let mut package_attached_logged = stt_steamclient::is_attached();
+    let mut last_package_hook_stats = ((0, 0), (0, None));
     #[cfg(feature = "download-manifest")]
     let mut manifest_attached_logged = stt_steamclient::is_manifest_hook_attached();
     #[cfg(feature = "download-manifest")]
@@ -1566,6 +1567,25 @@ fn run_watch_loop(
 
         // ~2s 一轮: 未 attach 且 catalog_add 开着则重试 package hooks.
         package_rearm_ticks = package_rearm_ticks.wrapping_add(1);
+        let package_hook_stats = (
+            stt_steamclient::hook_stats(),
+            stt_steamclient::package_info_stats(),
+        );
+        if package_hook_stats != last_package_hook_stats {
+            let ((checks, forged), (package0_calls, package0_status)) = package_hook_stats;
+            append_host_log(
+                steam_root,
+                &format!(
+                    "package_stats checks={} forged={} package0_calls={} package0_status={}",
+                    checks,
+                    forged,
+                    package0_calls,
+                    package0_status
+                        .map_or_else(|| "unknown".to_owned(), |status| status.to_string())
+                ),
+            );
+            last_package_hook_stats = package_hook_stats;
+        }
         if !package_attached_logged
             && package_rearm_ticks.is_multiple_of(8)
             && state.tools().is_enabled(ToolId::CatalogAdd)
