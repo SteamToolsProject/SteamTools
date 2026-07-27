@@ -579,19 +579,20 @@ pub fn notify_license_changed(queue: &LicenseQueue) -> LicenseNotifyPlan {
         return plan;
     }
 
-    let plan = queue.plan_notify(status, true);
+    let mut plan = queue.plan_notify(status, true);
     if plan.should_mark_license_changed {
         // # Safety
         // Status==Available 且 plan 给出要写的 id 列表.
-        unsafe {
-            for id in &plan.remove_ids {
-                let _ = remove_app_id(pkg, *id);
-            }
-            if !plan.insert_ids.is_empty() {
-                let _ = append_app_ids(pkg, &plan.insert_ids);
-            }
+        let memory_applied = unsafe {
+            let removed = plan.remove_ids.iter().all(|id| remove_app_id(pkg, *id));
+            let inserted = plan.insert_ids.is_empty() || append_app_ids(pkg, &plan.insert_ids);
+            removed && inserted
+        };
+        if memory_applied {
+            plan.client_applied = mark_license_and_process();
         }
-        let _ = mark_license_and_process();
+    } else if plan.skip_reason == Some("no_changes") {
+        plan.client_applied = true;
     }
     apply_ui_actions(&plan);
     plan
