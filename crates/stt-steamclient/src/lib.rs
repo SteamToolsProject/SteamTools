@@ -15,7 +15,11 @@ mod manifest_code;
 mod ownership;
 #[cfg(feature = "download-token")]
 mod token;
-#[cfg(any(feature = "download-manifest", feature = "download-key"))]
+#[cfg(any(
+    feature = "download-manifest",
+    feature = "download-key",
+    feature = "download-token"
+))]
 mod verified;
 
 pub use download::{
@@ -57,4 +61,8 @@ pub use ownership::{
     OwnershipRewrite,
 };
 #[cfg(feature = "download-token")]
-pub use token::{rewrite_access_token_frame, AccessTokenRewrite};
+pub use token::{
+    access_token_hook_stats, is_access_token_hook_attached, replace_access_tokens,
+    rewrite_access_token_frame, try_install_access_token_hook, AccessTokenRewrite,
+    AccessTokenSnapshotReport,
+};
