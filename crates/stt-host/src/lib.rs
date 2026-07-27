@@ -2103,11 +2103,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let state = ConfigState::new();
+        let epoch = state.rules_epoch();
 
         let error = add_from_config(&state, &dir, 42).unwrap_err();
 
         assert!(error.to_string().contains("disabled"));
         assert!(!stt_config::catalog_lua_path(&dir, 42).exists());
+        assert_eq!(state.rules_epoch(), epoch);
+        assert!(!state.with_rules(|rules| rules.is_owned(42)));
         let _ = fs::remove_dir_all(&dir);
     }
 
