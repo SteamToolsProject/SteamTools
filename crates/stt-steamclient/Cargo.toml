@@ -1,0 +1,21 @@
+[package]
+name = "stt-steamclient"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "steamclient package/ownership logic, license queue, optional hooks"
+
+[dependencies]
+stt-core = { workspace = true }
+stt-config = { workspace = true }
+stt-metadata = { workspace = true }
+stt-hook = { workspace = true }
+stt-platform = { workspace = true }
+
+[dev-dependencies]
+# install plan tests write temp pattern TOML
+tempfile = "3"
+
+[lints]
+workspace = true
