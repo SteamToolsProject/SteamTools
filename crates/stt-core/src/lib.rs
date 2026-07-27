@@ -140,6 +140,14 @@ impl AppRules {
         self.manifest_overrides.get(&depot_id)
     }
 
+    pub fn manifest_overrides_iter(
+        &self,
+    ) -> impl Iterator<Item = (DepotId, &ManifestOverride)> + '_ {
+        self.manifest_overrides
+            .iter()
+            .map(|(&depot_id, over)| (depot_id, over))
+    }
+
     pub fn has_manifest_overrides(&self) -> bool {
         !self.manifest_overrides.is_empty()
     }

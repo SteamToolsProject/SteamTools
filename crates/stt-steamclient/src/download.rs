@@ -134,6 +134,7 @@ pub enum DownloadCapabilityStatus {
     PatternMissing,
     SymbolsMissing,
     LogicOnly,
+    HooksAttached,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +143,7 @@ pub struct DownloadCapabilityReport {
     pub status: DownloadCapabilityStatus,
     pub resolved: Vec<String>,
     pub missing: Vec<String>,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,13 +163,19 @@ impl DownloadKitReport {
     pub fn detail_for_ui(&self) -> String {
         self.capabilities
             .iter()
-            .map(|report| match report.status {
-                DownloadCapabilityStatus::SymbolsMissing => format!(
-                    "{}=SymbolsMissing({})",
-                    report.capability.as_str(),
-                    report.missing.join(",")
-                ),
-                status => format!("{}={status:?}", report.capability.as_str()),
+            .map(|report| {
+                let base = match report.status {
+                    DownloadCapabilityStatus::SymbolsMissing => format!(
+                        "{}=SymbolsMissing({})",
+                        report.capability.as_str(),
+                        report.missing.join(",")
+                    ),
+                    status => format!("{}={status:?}", report.capability.as_str()),
+                };
+                match report.detail.as_deref() {
+                    Some(detail) => format!("{base} ({detail})"),
+                    None => base,
+                }
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -223,6 +231,7 @@ fn plan_capability(
             status,
             resolved: Vec::new(),
             missing: Vec::new(),
+            detail: None,
         };
     }
 
@@ -232,6 +241,7 @@ fn plan_capability(
             status: DownloadCapabilityStatus::PatternMissing,
             resolved: Vec::new(),
             missing: Vec::new(),
+            detail: None,
         };
     };
     let mut resolved = Vec::new();
@@ -253,6 +263,7 @@ fn plan_capability(
         status,
         resolved,
         missing,
+        detail: None,
     }
 }
 

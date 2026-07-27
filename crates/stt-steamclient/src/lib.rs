@@ -7,9 +7,15 @@ mod hooks;
 mod install;
 mod layout;
 mod license;
+#[cfg(feature = "download-manifest")]
+mod manifest;
 mod manifest_code;
 mod ownership;
 
+pub use download::{
+    plan_download_kit, DownloadCapability, DownloadCapabilityReport, DownloadCapabilityStatus,
+    DownloadDataAvailability, DownloadFeatureSet, DownloadKitReport, DownloadRuntimeSwitches,
+};
 pub use hooks::{
     add_configured_app, apply_ui_actions, hook_stats, is_attached, notify_license_changed,
     register_runtime, remove_configured_app, runtime_queue, set_configured_apps,
@@ -25,14 +31,15 @@ pub use layout::{
     PACKAGE_STATUS_INVALID,
 };
 pub use license::{plan_init_fake_license, LicenseNotifyPlan, LicenseQueue, UiLicenseAction};
+#[cfg(feature = "download-manifest")]
+pub use manifest::{
+    is_manifest_hook_attached, manifest_hook_stats, replace_manifest_overrides,
+    try_install_manifest_hook,
+};
 pub use manifest_code::{
     ManifestCodeFailureKind, ManifestCodeProvider, ManifestCodeProviderResult, ManifestCodeRequest,
     ManifestCodeResolution, ManifestCodeResolverChain, ManifestCodeStage, ManifestCodeTraceEntry,
     ManifestCodeTraceOutcome, ManifestCodeUnresolved,
-};
-pub use download::{
-    plan_download_kit, DownloadCapability, DownloadCapabilityReport, DownloadCapabilityStatus,
-    DownloadDataAvailability, DownloadFeatureSet, DownloadKitReport, DownloadRuntimeSwitches,
 };
 pub use ownership::{
     app_is_configured, configured_in_rules, decide_ownership_rewrite, ForgedOwnershipFields,
