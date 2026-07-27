@@ -37,7 +37,7 @@ pub use download::{
 };
 pub use hooks::{
     add_configured_app, apply_ui_actions, hook_stats, is_attached, notify_license_changed,
-    register_runtime, remove_configured_app, runtime_queue, set_configured_apps,
+    package_info_stats, register_runtime, remove_configured_app, runtime_queue, set_configured_apps,
     set_ui_action_handler, try_install_package_hooks,
 };
 pub use install::{

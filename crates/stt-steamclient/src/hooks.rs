@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use stt_config::{ToolId, ToolRegistry};
@@ -50,6 +50,8 @@ static HOOKS: Mutex<Option<PackageHooks>> = Mutex::new(None);
 static ATTACHED: AtomicBool = AtomicBool::new(false);
 static CHECK_HITS: AtomicU64 = AtomicU64::new(0);
 static FORGE_HITS: AtomicU64 = AtomicU64::new(0);
+static PACKAGE0_HITS: AtomicU64 = AtomicU64::new(0);
+static PACKAGE0_STATUS: AtomicU32 = AtomicU32::new(u32::MAX);
 
 static RUNTIME: OnceLock<PackageRuntime> = OnceLock::new();
 
@@ -146,6 +148,14 @@ pub fn hook_stats() -> (u64, u64) {
     (
         CHECK_HITS.load(Ordering::Relaxed),
         FORGE_HITS.load(Ordering::Relaxed),
+    )
+}
+
+pub fn package_info_stats() -> (u64, Option<u32>) {
+    let status = PACKAGE0_STATUS.load(Ordering::Relaxed);
+    (
+        PACKAGE0_HITS.load(Ordering::Relaxed),
+        (status != u32::MAX).then_some(status),
     )
 }
 
@@ -350,6 +360,13 @@ unsafe extern "C" fn hk_get_package_info(
     };
     if package_id == INJECTED_PACKAGE_ID && !p.is_null() {
         INJECTED_PKG.store(p, Ordering::SeqCst);
+        PACKAGE0_HITS.fetch_add(1, Ordering::Relaxed);
+        // # Safety
+        // p 是原 GetPackageInfo 返回的 package0, 布局由 exact-SHA 门禁钉死.
+        PACKAGE0_STATUS.store(
+            unsafe { read_u32(p as *mut u8, package_info::STATUS) },
+            Ordering::Relaxed,
+        );
     }
     p
 }
