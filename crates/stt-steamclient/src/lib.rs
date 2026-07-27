@@ -12,6 +12,8 @@ mod license;
 #[cfg(feature = "download-manifest")]
 mod manifest;
 mod manifest_code;
+#[cfg(feature = "download-token")]
+mod net_send;
 mod ownership;
 #[cfg(feature = "download-request-code")]
 mod request_code;
