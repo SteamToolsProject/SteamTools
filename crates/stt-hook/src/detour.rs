@@ -149,6 +149,11 @@ impl TrampolineHook {
         let mut original = [0u8; MAX_STEAL];
         ptr::copy_nonoverlapping(target, original.as_mut_ptr(), steal_len);
 
+        // detour 里用 CALL 进 trampoline 时多压 8 字节返回地址.
+        // 序言若含 mov rax,rsp / mov [rsp+disp], … 必须按 +8 修正, 否则写穿栈必崩.
+        let mut stolen = original;
+        fixup_stolen_for_call_frame(&mut stolen[..steal_len]);
+
         let trampoline_size = steal_len + PATCH_LEN;
         let trampoline = VirtualAlloc(
             None,
@@ -160,7 +165,7 @@ impl TrampolineHook {
             return Err(HookError::TrampolineAlloc);
         }
         let trampoline = trampoline as *mut u8;
-        ptr::copy_nonoverlapping(original.as_ptr(), trampoline, steal_len);
+        ptr::copy_nonoverlapping(stolen.as_ptr(), trampoline, steal_len);
         let back = abs_jmp_patch(target as u64 + steal_len as u64);
         ptr::copy_nonoverlapping(back.as_ptr(), trampoline.add(steal_len), PATCH_LEN);
         let _ = FlushInstructionCache(
@@ -249,6 +254,123 @@ fn abs_jmp_patch(dest: u64) -> [u8; PATCH_LEN] {
     patch[10] = 0xFF;
     patch[11] = 0xE0;
     patch
+}
+
+/// 把「原函数入口」序言改成适合「从 detour CALL 进来」的栈布局.
+///
+/// 原入口: `[rsp]=返回调用方, [rsp+8]=home rcx, …`
+/// CALL trampoline 后: `[rsp]=返回 detour, [rsp+8]=返回调用方, [rsp+10h]=home rcx, …`
+/// 故所有 `[rsp+d]` / `mov rax,rsp` 之后的 `[rax+d]` 的 d 都要 +8.
+fn fixup_stolen_for_call_frame(code: &mut [u8]) {
+    let mut i = 0;
+    let mut rax_is_rsp = false;
+    while i < code.len() {
+        // mov rax, rsp
+        if i + 2 < code.len() && code[i] == 0x48 && code[i + 1] == 0x8B && code[i + 2] == 0xC4 {
+            rax_is_rsp = true;
+            i += 3;
+            continue;
+        }
+        // mov [rsp+disp8], r64: 48 89 xx 24 dd  (ModRM: mod=01, r/m=100, SIB=0x24)
+        if i + 4 < code.len()
+            && code[i] == 0x48
+            && code[i + 1] == 0x89
+            && code[i + 3] == 0x24
+            && (code[i + 2] & 0xC7) == 0x44
+        {
+            code[i + 4] = code[i + 4].wrapping_add(8);
+            i += 5;
+            continue;
+        }
+        // mov [rsp+disp8], r32: 89 xx 24 dd
+        if i + 3 < code.len()
+            && code[i] == 0x89
+            && code[i + 2] == 0x24
+            && (code[i + 1] & 0xC7) == 0x44
+        {
+            code[i + 3] = code[i + 3].wrapping_add(8);
+            i += 4;
+            continue;
+        }
+        // mov [rax+disp8], r32: 89 50 dd / 89 48 dd 等 (mod=01, r/m=000=rax)
+        if rax_is_rsp
+            && i + 2 < code.len()
+            && code[i] == 0x89
+            && (code[i + 1] & 0xC7) == 0x40
+        {
+            code[i + 2] = code[i + 2].wrapping_add(8);
+            i += 3;
+            continue;
+        }
+        // mov [rax+disp8], r64: 48 89 40 dd / 48 89 48 dd
+        if rax_is_rsp
+            && i + 3 < code.len()
+            && code[i] == 0x48
+            && code[i + 1] == 0x89
+            && (code[i + 2] & 0xC7) == 0x40
+        {
+            code[i + 3] = code[i + 3].wrapping_add(8);
+            i += 4;
+            continue;
+        }
+        // push r64: 50-57 或 41 50-57 — 之后仍可能用 rsp, 但 rax 不再等于入口 rsp
+        if code[i] >= 0x50 && code[i] <= 0x57 {
+            rax_is_rsp = false;
+            i += 1;
+            continue;
+        }
+        if i + 1 < code.len() && code[i] == 0x41 && code[i + 1] >= 0x50 && code[i + 1] <= 0x57 {
+            rax_is_rsp = false;
+            i += 2;
+            continue;
+        }
+        // sub rsp, imm8: 48 83 EC xx
+        if i + 3 < code.len()
+            && code[i] == 0x48
+            && code[i + 1] == 0x83
+            && code[i + 2] == 0xEC
+        {
+            rax_is_rsp = false;
+            i += 4;
+            continue;
+        }
+        // 未知字节: 单步前进 (不完美, 但只用于已知短序言)
+        i += 1;
+    }
+}
+
+#[cfg(test)]
+mod fixup_tests {
+    use super::fixup_stolen_for_call_frame;
+
+    #[test]
+    fn fixes_check_app_ownership_style_prologue() {
+        // mov rax,rsp; mov [rax+10h],edx; mov [rax+8],rcx; push rbp; push rbx
+        let mut code = [
+            0x48, 0x8B, 0xC4, // mov rax, rsp
+            0x89, 0x50, 0x10, // mov [rax+10h], edx
+            0x48, 0x89, 0x48, 0x08, // mov [rax+8], rcx
+            0x55, // push rbp
+            0x53, // push rbx
+        ];
+        fixup_stolen_for_call_frame(&mut code);
+        assert_eq!(code[5], 0x18, "[rax+10h] -> [rax+18h]");
+        assert_eq!(code[9], 0x10, "[rax+8] -> [rax+10h]");
+    }
+
+    #[test]
+    fn fixes_get_package_info_style_prologue() {
+        // mov [rsp+18h],rbx; mov [rsp+10h],edx; push rbp; push rsi; push rdi; sub rsp,20h
+        let mut code = [
+            0x48, 0x89, 0x5C, 0x24, 0x18, // mov [rsp+18h], rbx
+            0x89, 0x54, 0x24, 0x10, // mov [rsp+10h], edx
+            0x55, 0x56, 0x57, // pushes
+            0x48, 0x83, 0xEC, 0x20, // sub rsp, 20h
+        ];
+        fixup_stolen_for_call_frame(&mut code);
+        assert_eq!(code[4], 0x20, "[rsp+18h] -> [rsp+20h]");
+        assert_eq!(code[8], 0x18, "[rsp+10h] -> [rsp+18h]");
+    }
 }
 
 unsafe fn with_rwx(addr: *mut u8, len: usize, f: impl FnOnce()) -> Result<()> {
