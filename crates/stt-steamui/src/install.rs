@@ -102,7 +102,8 @@ pub fn plan_library_ux_install(
     let status = if !hooks_ok {
         LibraryUxInstallStatus::SymbolsMissing
     } else {
-        // 有 pattern 条目仍不够: 未验证 CSteamApp 布局前不 attach.
+        // 有 pattern 条目仍不够: CSteamApp 字段偏移 / RunFrame 入口未在本机
+        // SteamUI 上钉死前不 attach 业务 detour (写 PurchasedTime 会踩内存).
         LibraryUxInstallStatus::LogicOnly
     };
 
