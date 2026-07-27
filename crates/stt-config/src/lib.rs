@@ -12,6 +12,8 @@ mod watch;
 mod lua_dsl;
 #[cfg(feature = "lua")]
 mod lua_load;
+#[cfg(feature = "lua")]
+mod lua_http;
 
 #[cfg(feature = "lua")]
 pub use catalog_add::remove_from_library;
@@ -33,7 +35,11 @@ pub use tools::{builtin_manifests, ToolId, ToolManifest, ToolRegistry};
 pub use watch::DebouncedWatcher;
 
 #[cfg(feature = "lua")]
-pub use lua_dsl::{apply_lua_chunk, eval_lua_to_bundle};
+pub use lua_dsl::{apply_lua_chunk, eval_lua_to_bundle, eval_lua_to_bundle_with_http};
+#[cfg(feature = "lua")]
+pub use lua_http::{
+    LuaHttpClient, LuaHttpErrorKind, LuaHttpMethod, LuaHttpRequest, LuaHttpResponse,
+};
 #[cfg(feature = "lua")]
 pub use lua_load::{
     default_lua_dir, list_lua_files, list_lua_files_in_dirs, load_lua_directories, lua_search_dirs,

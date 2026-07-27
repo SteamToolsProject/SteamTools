@@ -90,7 +90,10 @@ fn map_http_error(error: HttpError) -> CatalogError {
         HttpError::ResponseTooLarge { actual, limit } => {
             CatalogError::PayloadTooLarge { actual, limit }
         }
-        HttpError::InvalidUrl(_) | HttpError::InvalidOptions(_) | HttpError::Windows { .. } => {
+        HttpError::RequestTooLarge { .. }
+        | HttpError::InvalidUrl(_)
+        | HttpError::InvalidOptions(_)
+        | HttpError::Windows { .. } => {
             provider_error(ProviderErrorKind::Unavailable, error.to_string())
         }
     }
