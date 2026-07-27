@@ -20,7 +20,7 @@ pub const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 pub const MANIFEST_SOURCES: &[&str] = &["opensteamtool", "steamrun", "wudrm"];
 
 /// 配置页允许切换的完整 Catalog 模式.
-pub const CATALOG_MODES: &[&str] = &["disabled", "custom_http", "mock"];
+pub const CATALOG_MODES: &[&str] = &["disabled", "custom_http", "lua", "community", "mock"];
 
 /// 额外 lua 目录的条数上限.
 const MAX_LUA_PATHS: usize = 8;
@@ -304,7 +304,10 @@ mod tests {
             ConfigIntent::set_catalog_mode("mock"),
             Some(ConfigIntent::SetCatalogMode(CatalogMode::Mock))
         );
-        assert!(ConfigIntent::set_catalog_mode("community").is_none());
+        assert_eq!(
+            ConfigIntent::set_catalog_mode("community"),
+            Some(ConfigIntent::SetCatalogMode(CatalogMode::Community))
+        );
         assert!(
             ConfigIntent::set_catalog_url_template("https://catalog.test/v1/{app_id}").is_some()
         );

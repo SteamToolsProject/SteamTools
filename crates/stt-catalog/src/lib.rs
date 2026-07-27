@@ -3,13 +3,19 @@
 //! 该 crate 不执行 HTTP, 也不负责 Lua/TOML 落盘. provider 返回的数据必须先通过
 //! [`validate_bundle`], 才能交给配置层持久化.
 
+mod chain;
+mod community;
 mod error;
 mod http;
 mod mock;
 mod validate;
 mod wire;
 
-pub use error::{CatalogError, CatalogResult, ProviderErrorKind};
+pub use chain::CatalogProviderChain;
+pub use community::CommunityCatalogProvider;
+pub use error::{
+    CatalogError, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, ProviderErrorKind,
+};
 pub use http::{validate_url_template, CustomHttpCatalogProvider};
 pub use mock::MockCatalogProvider;
 pub use validate::{validate_bundle, CatalogLimits};
@@ -18,6 +24,14 @@ pub use wire::{
 };
 
 use stt_core::{AppId, CatalogBundle};
+
+/// Catalog 获取结果及 provider chain 诊断.
+#[derive(Debug, Clone)]
+pub struct CatalogFetchOutcome {
+    pub bundle: CatalogBundle,
+    pub source: String,
+    pub trace: Vec<CatalogTraceEntry>,
+}
 
 /// 按 AppId 获取完整入库元数据的运行时 provider.
 ///
@@ -32,4 +46,16 @@ pub trait CatalogProvider: Send + Sync {
     ///
     /// provider 不可用, 条目不存在或数据未通过契约校验时返回 [`CatalogError`].
     fn fetch(&self, app_id: AppId) -> CatalogResult<CatalogBundle>;
+
+    /// 获取 Catalog 并报告最终来源. 单 provider 默认生成一条命中记录.
+    fn fetch_with_trace(&self, app_id: AppId) -> CatalogResult<CatalogFetchOutcome> {
+        Ok(CatalogFetchOutcome {
+            bundle: self.fetch(app_id)?,
+            source: self.id().to_owned(),
+            trace: vec![CatalogTraceEntry {
+                provider: self.id().to_owned(),
+                outcome: CatalogTraceOutcome::Hit,
+            }],
+        })
+    }
 }
