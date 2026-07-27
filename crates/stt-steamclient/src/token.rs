@@ -1,19 +1,15 @@
 //! PICS access token 的受限 frame 与 protobuf wire 改写.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 use stt_core::AppId;
-use stt_hook::InlineHook;
 use stt_metadata::PatternStore;
 
-use crate::verified::resolve_verified_symbol;
 use crate::wire::{encode_varint, parse_field, WireValue};
-use crate::{DownloadCapability, DownloadCapabilityStatus, DownloadKitReport};
+use crate::{DownloadCapability, DownloadKitReport};
 
-const SYMBOL: &str = "BBuildAndAsyncSendFrame";
 const BINARY_OPCODE: u32 = 2;
 const PROTO_FLAG: u32 = 0x8000_0000;
 const PICS_PRODUCT_INFO_REQUEST: u32 = 8903;
@@ -21,14 +17,9 @@ const FRAME_HEADER_SIZE: usize = 8;
 const MAX_PROTO_HEADER_SIZE: usize = 1024;
 const MAX_BODY_SIZE: usize = 65_536;
 
-type BuildAndSendFrameFn = unsafe extern "C" fn(*mut c_void, u8, *mut u8, u32) -> u8;
-
-static TARGET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static ATTACHED: AtomicBool = AtomicBool::new(false);
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static PATCHED_FRAMES: AtomicU64 = AtomicU64::new(0);
 static PATCHED_APPS: AtomicU64 = AtomicU64::new(0);
-static HOOK: Mutex<Option<InlineHook>> = Mutex::new(None);
 static TOKENS: OnceLock<RwLock<HashMap<AppId, u64>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -70,7 +61,7 @@ pub fn replace_access_tokens(values: HashMap<AppId, u64>) -> AccessTokenSnapshot
 }
 
 pub fn is_access_token_hook_attached() -> bool {
-    ATTACHED.load(Ordering::SeqCst)
+    crate::net_send::is_consumer_attached(DownloadCapability::AccessToken)
 }
 
 pub fn access_token_hook_stats() -> (u64, u64, u64) {
@@ -83,135 +74,31 @@ pub fn access_token_hook_stats() -> (u64, u64, u64) {
 
 /// planner 的 token 项通过全部门禁后, 再验证当前 DLL 并尝试 attach.
 pub fn try_install_access_token_hook(report: &mut DownloadKitReport, patterns: &PatternStore) {
-    let Some(capability) = report
-        .capabilities
-        .iter_mut()
-        .find(|item| item.capability == DownloadCapability::AccessToken)
-    else {
-        return;
-    };
-
-    if is_access_token_hook_attached() {
-        capability.status = DownloadCapabilityStatus::HooksAttached;
-        capability.detail = Some("access token hook 已挂上".to_owned());
-        return;
-    }
-    if capability.status != DownloadCapabilityStatus::LogicOnly {
-        return;
-    }
-
-    let target = match resolve_verified_symbol(patterns, SYMBOL) {
-        Ok(target) => target,
-        Err(error) => {
-            capability.detail = Some(error.to_string());
-            return;
-        }
-    };
-    let mut slot = HOOK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(hook) = slot.as_mut() {
-        if !hook.is_installed() {
-            if let Err(error) = unsafe { hook.attach() } {
-                capability.detail = Some(format!("access token hook reattach 失败: {error}"));
-                return;
-            }
-        }
-        ATTACHED.store(true, Ordering::SeqCst);
-        capability.status = DownloadCapabilityStatus::HooksAttached;
-        capability.detail = Some("access token hook 已挂上".to_owned());
-        return;
-    }
-
-    // # Safety
-    // 当前 DLL SHA, RVA 和入口签名已由 resolve_verified_symbol 验证.
-    let mut hook =
-        match unsafe { InlineHook::new(target, hk_build_and_async_send_frame as *const c_void) } {
-            Ok(hook) => hook,
-            Err(error) => {
-                capability.detail = Some(format!("access token hook 初始化失败: {error}"));
-                return;
-            }
-        };
-    TARGET.store(target, Ordering::SeqCst);
-    if let Err(error) = unsafe { hook.attach() } {
-        TARGET.store(std::ptr::null_mut(), Ordering::SeqCst);
-        capability.detail = Some(format!("access token hook attach 失败: {error}"));
-        return;
-    }
-    *slot = Some(hook);
-    ATTACHED.store(true, Ordering::SeqCst);
-    capability.status = DownloadCapabilityStatus::HooksAttached;
-    capability.detail = Some("access token hook 已挂上".to_owned());
+    crate::net_send::try_install_consumer(
+        report,
+        patterns,
+        DownloadCapability::AccessToken,
+        "access token",
+    );
 }
 
-/// # Safety
-/// 由已验证 ABI 的 BBuildAndAsyncSendFrame 入口调用; 指针沿用原函数契约.
-unsafe extern "C" fn hk_build_and_async_send_frame(
-    object: *mut c_void,
-    opcode: u8,
-    data: *mut u8,
-    size: u32,
-) -> u8 {
+pub(crate) fn record_access_token_call() {
     CALLS.fetch_add(1, Ordering::Relaxed);
-    let target = TARGET.load(Ordering::SeqCst);
-    if target.is_null() {
-        return 0;
-    }
-
-    let rewrite = if data.is_null() {
-        AccessTokenRewrite::Passthrough
-    } else {
-        let packet = std::slice::from_raw_parts(data.cast_const(), size as usize);
-        let guard = tokens()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rewrite_access_token_frame(u32::from(opcode), packet, &guard)
-    };
-
-    match rewrite {
-        AccessTokenRewrite::Passthrough => call_original_while_unhooked(|| {
-            let original: BuildAndSendFrameFn = std::mem::transmute(target);
-            original(object, opcode, data, size)
-        })
-        .unwrap_or(0),
-        AccessTokenRewrite::Rewritten {
-            mut packet,
-            patched_apps,
-        } => {
-            let Ok(rewritten_size) = u32::try_from(packet.len()) else {
-                return call_original_while_unhooked(|| {
-                    let original: BuildAndSendFrameFn = std::mem::transmute(target);
-                    original(object, opcode, data, size)
-                })
-                .unwrap_or(0);
-            };
-            PATCHED_FRAMES.fetch_add(1, Ordering::Relaxed);
-            PATCHED_APPS.fetch_add(patched_apps as u64, Ordering::Relaxed);
-            call_original_while_unhooked(|| {
-                let original: BuildAndSendFrameFn = std::mem::transmute(target);
-                original(object, opcode, packet.as_mut_ptr(), rewritten_size)
-            })
-            .unwrap_or(0)
-        }
-    }
 }
 
-/// # Safety
-/// `call` 只能调用 TARGET 指向的原入口; 调用期间入口补丁已卸下.
-unsafe fn call_original_while_unhooked(call: impl FnOnce() -> u8) -> Option<u8> {
-    let mut slot = HOOK
-        .lock()
+pub(crate) fn record_access_token_patch(patched_apps: usize) {
+    PATCHED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    PATCHED_APPS.fetch_add(patched_apps as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn rewrite_access_token_snapshot_frame(
+    opcode: u32,
+    packet: &[u8],
+) -> AccessTokenRewrite {
+    let guard = tokens()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let hook = slot.as_mut()?;
-    if hook.detach().is_err() {
-        return None;
-    }
-    let result = call();
-    if hook.attach().is_err() {
-        ATTACHED.store(false, Ordering::SeqCst);
-    }
-    Some(result)
+    rewrite_access_token_frame(opcode, packet, &guard)
 }
 
 /// 只改写二进制 EMsg 8903 frame 中已配置 app 的 access token.
