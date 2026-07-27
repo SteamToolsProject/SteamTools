@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 pub type AppId = u32;
-pub type DepotId = u64;
+pub type DepotId = u32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestOverride {
@@ -15,7 +15,8 @@ pub struct ManifestOverride {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogBundle {
     pub apps: Vec<AppId>,
-    pub depot_keys: HashMap<AppId, String>,
+    pub app_depots: HashMap<AppId, Vec<DepotId>>,
+    pub depot_keys: HashMap<DepotId, String>,
     pub access_tokens: HashMap<AppId, u64>,
     pub manifests: HashMap<DepotId, ManifestOverride>,
     pub purchase_times: HashMap<AppId, u32>,
@@ -24,7 +25,8 @@ pub struct CatalogBundle {
 #[derive(Debug, Clone, Default)]
 pub struct AppRules {
     owned: HashSet<AppId>,
-    depot_keys: HashMap<AppId, String>,
+    app_depots: HashMap<AppId, Vec<DepotId>>,
+    depot_keys: HashMap<DepotId, String>,
     access_tokens: HashMap<AppId, u64>,
     manifest_overrides: HashMap<DepotId, ManifestOverride>,
     purchase_time: HashMap<AppId, u32>,
@@ -61,7 +63,16 @@ impl AppRules {
 
     pub fn remove_app(&mut self, app_id: AppId) {
         let mut changed = self.owned.remove(&app_id);
-        changed |= self.depot_keys.remove(&app_id).is_some();
+        if let Some(depots) = self.app_depots.remove(&app_id) {
+            for depot_id in depots {
+                let still_used = self.app_depots.values().any(|ids| ids.contains(&depot_id));
+                if !still_used {
+                    self.depot_keys.remove(&depot_id);
+                    self.manifest_overrides.remove(&depot_id);
+                }
+            }
+            changed = true;
+        }
         changed |= self.access_tokens.remove(&app_id).is_some();
         changed |= self.purchase_time.remove(&app_id).is_some();
         if changed {
@@ -69,20 +80,32 @@ impl AppRules {
         }
     }
 
-    pub fn set_depot_key(&mut self, app_id: AppId, key_hex: impl Into<String>) {
+    pub fn set_depot_key(&mut self, depot_id: DepotId, key_hex: impl Into<String>) {
         let key = key_hex.into();
-        let owned_new = self.owned.insert(app_id);
-        let key_changed = self.depot_keys.get(&app_id).map(String::as_str) != Some(key.as_str());
+        let key_changed = self.depot_keys.get(&depot_id).map(String::as_str) != Some(key.as_str());
         if key_changed {
-            self.depot_keys.insert(app_id, key);
+            self.depot_keys.insert(depot_id, key);
         }
-        if owned_new || key_changed {
+        if key_changed {
             self.bump();
         }
     }
 
-    pub fn depot_key(&self, app_id: AppId) -> Option<&str> {
-        self.depot_keys.get(&app_id).map(String::as_str)
+    pub fn depot_key(&self, depot_id: DepotId) -> Option<&str> {
+        self.depot_keys.get(&depot_id).map(String::as_str)
+    }
+
+    pub fn app_depots(&self, app_id: AppId) -> &[DepotId] {
+        self.app_depots
+            .get(&app_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn app_has_depot_key(&self, app_id: AppId) -> bool {
+        self.app_depots(app_id)
+            .iter()
+            .any(|depot_id| self.depot_keys.contains_key(depot_id))
     }
 
     pub fn set_access_token(&mut self, app_id: AppId, token: u64) {
@@ -128,10 +151,15 @@ impl AppRules {
         for &app in &bundle.apps {
             changed |= self.owned.insert(app);
         }
-        for (&app, key) in &bundle.depot_keys {
-            changed |= self.owned.insert(app);
-            if self.depot_keys.get(&app).map(String::as_str) != Some(key.as_str()) {
-                self.depot_keys.insert(app, key.clone());
+        for (&app, depots) in &bundle.app_depots {
+            if self.app_depots.get(&app) != Some(depots) {
+                self.app_depots.insert(app, depots.clone());
+                changed = true;
+            }
+        }
+        for (&depot, key) in &bundle.depot_keys {
+            if self.depot_keys.get(&depot).map(String::as_str) != Some(key.as_str()) {
+                self.depot_keys.insert(depot, key.clone());
                 changed = true;
             }
         }
@@ -182,11 +210,13 @@ mod tests {
     #[test]
     fn remove_app_clears_related_fields() {
         let mut rules = AppRules::new();
-        rules.set_depot_key(1, "ab");
+        rules.add_app(1);
+        rules.app_depots.insert(1, vec![2]);
+        rules.set_depot_key(2, "ab");
         rules.set_purchase_time(1, 123);
         rules.remove_app(1);
         assert!(!rules.is_owned(1));
-        assert!(rules.depot_key(1).is_none());
+        assert!(rules.depot_key(2).is_none());
         assert!(rules.purchase_time(1).is_none());
     }
 
@@ -195,7 +225,8 @@ mod tests {
         let mut rules = AppRules::new();
         let mut bundle = CatalogBundle::default();
         bundle.apps.push(42);
-        bundle.depot_keys.insert(42, "aa".into());
+        bundle.app_depots.insert(42, vec![7]);
+        bundle.depot_keys.insert(7, "aa".into());
         bundle.access_tokens.insert(42, 99);
         bundle.manifests.insert(
             7,
@@ -206,7 +237,7 @@ mod tests {
         );
         rules.apply_catalog_bundle(&bundle);
         assert!(rules.is_owned(42));
-        assert_eq!(rules.depot_key(42), Some("aa"));
+        assert_eq!(rules.depot_key(7), Some("aa"));
         assert_eq!(rules.access_token(42), Some(99));
         assert_eq!(
             rules.manifest_override(7).map(|m| m.manifest_gid),
@@ -217,5 +248,17 @@ mod tests {
         let epoch = rules.epoch();
         rules.apply_catalog_bundle(&bundle);
         assert_eq!(rules.epoch(), epoch, "identical re-apply is a no-op");
+    }
+
+    #[test]
+    fn app_has_depot_key_uses_explicit_relationship() {
+        let mut rules = AppRules::new();
+        let mut bundle = CatalogBundle::default();
+        bundle.apps.push(42);
+        bundle.app_depots.insert(42, vec![43]);
+        bundle.depot_keys.insert(43, "aa".into());
+        rules.apply_catalog_bundle(&bundle);
+
+        assert!(rules.app_has_depot_key(42));
     }
 }

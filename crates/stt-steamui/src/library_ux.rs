@@ -101,7 +101,7 @@ impl LibraryUx {
     /// FillInAppOverview: 配置里有该 app 则返回购买时间 (unix 秒).
     pub fn purchase_time_for(rules: &AppRules, app_id: AppId) -> Option<u32> {
         // 当前模型: addappid 会进 owned; 有 depot key 也算配置项.
-        if rules.is_owned(app_id) || rules.depot_key(app_id).is_some() {
+        if rules.is_owned(app_id) || rules.app_has_depot_key(app_id) {
             rules.purchase_time(app_id)
         } else {
             None
