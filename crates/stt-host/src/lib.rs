@@ -1071,79 +1071,108 @@ fn has_configured_access_token(rules: &AppRules) -> bool {
         .any(|app_id| rules.access_token(app_id).is_some_and(|token| token != 0))
 }
 
-fn sync_download_runtime(state: &ConfigState) {
+#[cfg(any(
+    feature = "download-manifest",
+    feature = "download-key",
+    feature = "download-token",
+    feature = "download-request-code"
+))]
+#[derive(Debug, Default)]
+struct DownloadRuntimeSnapshot {
     #[cfg(feature = "download-manifest")]
-    {
-        let enabled = state.tools().is_enabled(ToolId::DownloadKit)
-            && download_env_enabled("STEAMTOOLS_DOWNLOAD_MANIFEST");
-        let values = if enabled {
-            state.with_rules(|rules| {
-                rules
-                    .manifest_overrides_iter()
-                    .map(|(depot_id, over)| (depot_id, over.clone()))
-                    .collect()
-            })
-        } else {
-            std::collections::HashMap::new()
-        };
-        stt_steamclient::replace_manifest_overrides(values);
-    }
-
+    manifests: std::collections::HashMap<stt_core::DepotId, stt_core::ManifestOverride>,
     #[cfg(feature = "download-key")]
-    {
-        let enabled = state.tools().is_enabled(ToolId::DownloadKit)
-            && download_env_enabled("STEAMTOOLS_DOWNLOAD_KEY");
-        let values = if enabled {
-            state.with_rules(|rules| {
-                rules
-                    .depot_keys_iter()
-                    .map(|(depot_id, key)| (depot_id, key.to_owned()))
-                    .collect()
-            })
-        } else {
-            std::collections::HashMap::new()
-        };
-        let _ = stt_steamclient::replace_depot_keys(values);
-    }
-
+    keys: std::collections::HashMap<stt_core::DepotId, String>,
     #[cfg(feature = "download-token")]
-    {
-        let enabled = state.tools().is_enabled(ToolId::DownloadKit)
-            && download_env_enabled("STEAMTOOLS_DOWNLOAD_TOKEN");
-        let values = if enabled {
-            state.with_rules(|rules| {
-                rules
-                    .owned_iter()
-                    .filter_map(|app_id| {
-                        rules
-                            .access_token(app_id)
-                            .filter(|token| *token != 0)
-                            .map(|token| (app_id, token))
-                    })
-                    .collect()
-            })
+    tokens: std::collections::HashMap<AppId, u64>,
+    #[cfg(feature = "download-request-code")]
+    request_code_depots: HashSet<stt_core::DepotId>,
+}
+
+#[cfg(any(
+    feature = "download-manifest",
+    feature = "download-key",
+    feature = "download-token",
+    feature = "download-request-code"
+))]
+fn capture_download_runtime_snapshot(state: &ConfigState) -> DownloadRuntimeSnapshot {
+    let tool_enabled = state.tools().is_enabled(ToolId::DownloadKit);
+    #[cfg(feature = "download-manifest")]
+    let manifest_enabled =
+        tool_enabled && download_env_enabled("STEAMTOOLS_DOWNLOAD_MANIFEST");
+    #[cfg(feature = "download-key")]
+    let key_enabled = tool_enabled && download_env_enabled("STEAMTOOLS_DOWNLOAD_KEY");
+    #[cfg(feature = "download-token")]
+    let token_enabled = tool_enabled && download_env_enabled("STEAMTOOLS_DOWNLOAD_TOKEN");
+    #[cfg(feature = "download-request-code")]
+    let request_code_enabled =
+        tool_enabled && download_env_enabled("STEAMTOOLS_DOWNLOAD_REQUEST_CODE");
+
+    state.with_rules(|rules| DownloadRuntimeSnapshot {
+        #[cfg(feature = "download-manifest")]
+        manifests: if manifest_enabled {
+            rules
+                .manifest_overrides_iter()
+                .map(|(depot_id, over)| (depot_id, over.clone()))
+                .collect()
         } else {
             std::collections::HashMap::new()
-        };
-        let _ = stt_steamclient::replace_access_tokens(values);
-    }
-
-    #[cfg(feature = "download-request-code")]
-    {
-        let enabled = state.tools().is_enabled(ToolId::DownloadKit)
-            && download_env_enabled("STEAMTOOLS_DOWNLOAD_REQUEST_CODE");
-        let depots = if enabled {
-            state.with_rules(|rules| {
-                rules
-                    .owned_iter()
-                    .flat_map(|app_id| rules.app_depots(app_id).iter().copied())
-                    .collect::<HashSet<_>>()
-            })
+        },
+        #[cfg(feature = "download-key")]
+        keys: if key_enabled {
+            rules
+                .depot_keys_iter()
+                .map(|(depot_id, key)| (depot_id, key.to_owned()))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        },
+        #[cfg(feature = "download-token")]
+        tokens: if token_enabled {
+            rules
+                .owned_iter()
+                .filter_map(|app_id| {
+                    rules
+                        .access_token(app_id)
+                        .filter(|token| *token != 0)
+                        .map(|token| (app_id, token))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        },
+        #[cfg(feature = "download-request-code")]
+        request_code_depots: if request_code_enabled {
+            rules
+                .owned_iter()
+                .flat_map(|app_id| rules.app_depots(app_id).iter().copied())
+                .collect()
         } else {
             HashSet::new()
-        };
-        let _ = stt_steamclient::replace_manifest_code_depots(depots);
-    }
+        },
+    })
+}
+
+fn sync_download_runtime(state: &ConfigState) {
+    #[cfg(any(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    let snapshot = capture_download_runtime_snapshot(state);
+
+    #[cfg(feature = "download-manifest")]
+    stt_steamclient::replace_manifest_overrides(snapshot.manifests);
+
+    #[cfg(feature = "download-key")]
+    let _ = stt_steamclient::replace_depot_keys(snapshot.keys);
+
+    #[cfg(feature = "download-token")]
+    let _ = stt_steamclient::replace_access_tokens(snapshot.tokens);
+
+    #[cfg(feature = "download-request-code")]
+    let _ = stt_steamclient::replace_manifest_code_depots(snapshot.request_code_depots);
 
     #[cfg(not(any(
         feature = "download-manifest",
@@ -1842,6 +1871,101 @@ mod windows_entry {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    use std::io::{Read, Write};
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    use std::net::TcpListener;
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    use std::thread::JoinHandle;
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    use std::time::Instant;
+
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    struct FakeCatalogServer {
+        template: String,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    impl FakeCatalogServer {
+        fn spawn(body: Vec<u8>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let thread = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+            });
+            Self {
+                template: format!("http://127.0.0.1:{port}/catalog/{{app_id}}"),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    impl Drop for FakeCatalogServer {
+        fn drop(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn placeholder_init_empty() {
@@ -1988,5 +2112,77 @@ end
         rules.set_access_token(42, 0);
 
         assert!(!has_configured_access_token(&rules));
+    }
+
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    #[test]
+    fn store_catalog_job_reaches_atomic_lua_core_snapshots_and_license_notify() {
+        let body = format!(
+            r#"{{"schema_version":1,"apps":[{{"app_id":42,"access_token":"123","depots":[{{"depot_id":43,"key":"{}","manifest":{{"gid":"99","size":"100"}}}}]}}]}}"#,
+            "ab".repeat(32)
+        )
+        .into_bytes();
+        let server = FakeCatalogServer::spawn(body);
+        let root = tempfile::tempdir().unwrap();
+        stt_platform::ensure_data_dir(root.path()).unwrap();
+        let state = ConfigState::new();
+        let mut host = HostConfig::default();
+        host.catalog.mode = CatalogMode::CustomHttp;
+        host.catalog.url_template = server.template.clone();
+        host.tools.enabled.insert("download_kit".to_owned(), true);
+        state.apply_host(host);
+
+        let queue = Arc::new(LicenseQueue::new());
+        let configured = Arc::new(Mutex::new(HashSet::new()));
+        let _ = LICENSE_QUEUE.set(Arc::clone(&queue));
+        let _ = CONFIGURED_APPS.set(Arc::clone(&configured));
+        stt_steamclient::register_runtime(Arc::clone(&queue), Arc::clone(&configured));
+        stt_steamclient::set_ui_action_handler(apply_ui_license_action);
+
+        let note = Arc::new(Mutex::new(String::new()));
+        let (jobs, feedback) = spawn_catalog_worker(root.path(), &state, &note);
+        queue_catalog_job(
+            &jobs,
+            CatalogJob {
+                app_id: 42,
+                source: CatalogJobSource::StoreCdp,
+            },
+        )
+        .unwrap();
+
+        let feedback = feedback.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(feedback.contains("已入库 42"), "{feedback}");
+        let lua_path = stt_config::catalog_lua_path(root.path(), 42);
+        let lua = fs::read_to_string(&lua_path).unwrap();
+        assert!(lua.contains("addappid(43, 0,"), "{lua}");
+        assert!(!lua_path.with_file_name("stt_42.lua.tmp").exists());
+        assert!(state.rules_epoch() > 0);
+        assert!(state.with_rules(|rules| rules.is_owned(42)));
+
+        let snapshot = capture_download_runtime_snapshot(&state);
+        assert_eq!(snapshot.manifests.get(&43).unwrap().manifest_gid, 99);
+        assert_eq!(snapshot.keys.get(&43).map(String::len), Some(64));
+        assert_eq!(snapshot.tokens.get(&42), Some(&123));
+        assert_eq!(snapshot.request_code_depots, HashSet::from([43]));
+        assert!(queue.injected_contains(42));
+        assert!(configured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&42));
+
+        let note = note
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(note.contains("已入库 42"), "{note}");
+        let log = fs::read_to_string(stt_platform::host_log_path(root.path())).unwrap();
+        assert!(log.contains("catalog_add=ok source=store_cdp app_id=42"), "{log}");
+        assert!(log.contains("provider=custom_http"), "{log}");
+        assert!(log.contains("package=notify logic insert=1"), "{log}");
     }
 }
