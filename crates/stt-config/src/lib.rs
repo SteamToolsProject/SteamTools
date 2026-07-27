@@ -14,6 +14,8 @@ mod lua_dsl;
 mod lua_load;
 #[cfg(feature = "lua")]
 mod lua_http;
+#[cfg(feature = "lua")]
+mod lua_catalog;
 
 #[cfg(feature = "lua")]
 pub use catalog_add::remove_from_library;
@@ -34,6 +36,8 @@ pub use snapshot::{managed_apps, ConfigSnapshot, HostFacts, ToolDetails, ToolVie
 pub use tools::{builtin_manifests, ToolId, ToolManifest, ToolRegistry};
 pub use watch::DebouncedWatcher;
 
+#[cfg(feature = "lua")]
+pub use lua_catalog::LuaCatalogProvider;
 #[cfg(feature = "lua")]
 pub use lua_dsl::{apply_lua_chunk, eval_lua_to_bundle, eval_lua_to_bundle_with_http};
 #[cfg(feature = "lua")]
