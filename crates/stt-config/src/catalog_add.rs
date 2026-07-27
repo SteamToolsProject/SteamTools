@@ -67,10 +67,7 @@ pub fn write_catalog_lua(
     })?;
     let path = catalog_lua_path(steam_root, app_id);
     let body = format_catalog_lua(app_id, bundle);
-    std::fs::write(&path, body).map_err(|source| ConfigError::Io {
-        path: path.clone(),
-        source,
-    })?;
+    crate::intent::write_atomic(&path, &body)?;
     Ok(path)
 }
 
@@ -204,6 +201,24 @@ mod tests {
         let (_root, _state, out) = add_app_42();
         let text = std::fs::read_to_string(&out.lua_path).unwrap();
         assert!(text.contains("addappid(42)"), "lua 缺 addappid: {text}");
+    }
+
+    #[test]
+    fn replaces_existing_lua_atomically_without_leaving_temp_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = catalog_lua_path(root.path(), 42);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old").unwrap();
+        let provider = MockCatalogProvider::new()
+            .with_auto_generate(true)
+            .with_simple_app(42, 43, &"ab".repeat(32), 100);
+        let state = ConfigState::new();
+
+        add_to_library(&state, root.path(), &provider, 42).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("addappid(42)"), "{text}");
+        assert!(!path.with_file_name("stt_42.lua.tmp").exists());
     }
 
     #[test]
