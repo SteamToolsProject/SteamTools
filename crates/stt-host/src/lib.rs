@@ -72,7 +72,7 @@ fn apply_ui_license_action(action: UiLicenseAction) {
 
 /// 入库成功后: 入队 + notify (有 hook 则改 client, 否则纯逻辑).
 fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) {
-    sync_manifest_overrides(state);
+    sync_download_runtime(state);
     stt_steamclient::add_configured_app(app_id);
     let Some(q) = license_queue() else {
         append_host_log(steam_root, "package=notify skip=no_license_queue");
@@ -86,7 +86,7 @@ fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) {
 
 /// 移除成功后.
 fn on_library_removed(steam_root: &Path, state: &ConfigState, app_id: AppId) {
-    sync_manifest_overrides(state);
+    sync_download_runtime(state);
     stt_steamclient::remove_configured_app(app_id);
     let Some(q) = license_queue() else {
         append_host_log(steam_root, "package=notify skip=no_license_queue");
@@ -99,7 +99,7 @@ fn on_library_removed(steam_root: &Path, state: &ConfigState, app_id: AppId) {
 
 /// lua 全量重载后: 与 owned 做差再 notify.
 fn on_rules_reloaded(steam_root: &Path, state: &ConfigState) {
-    sync_manifest_overrides(state);
+    sync_download_runtime(state);
     sync_configured_from_state(state);
     let Some(q) = license_queue() else {
         return;
@@ -1003,12 +1003,15 @@ fn plan_download_layer(
     state: &ConfigState,
     patterns: &stt_metadata::PatternStore,
 ) -> stt_steamclient::DownloadKitReport {
-    sync_manifest_overrides(state);
+    sync_download_runtime(state);
     let report = build_download_report(state, patterns);
-    #[cfg(feature = "download-manifest")]
+    #[cfg(any(feature = "download-manifest", feature = "download-key"))]
     let report = {
         let mut report = report;
+        #[cfg(feature = "download-manifest")]
         stt_steamclient::try_install_manifest_hook(&mut report, patterns);
+        #[cfg(feature = "download-key")]
+        stt_steamclient::try_install_depot_key_hook(&mut report, patterns);
         report
     };
     append_host_log(
@@ -1048,7 +1051,7 @@ fn build_download_report(
     )
 }
 
-fn sync_manifest_overrides(state: &ConfigState) {
+fn sync_download_runtime(state: &ConfigState) {
     #[cfg(feature = "download-manifest")]
     {
         let enabled = state.tools().is_enabled(ToolId::DownloadKit)
@@ -1066,8 +1069,38 @@ fn sync_manifest_overrides(state: &ConfigState) {
         stt_steamclient::replace_manifest_overrides(values);
     }
 
-    #[cfg(not(feature = "download-manifest"))]
+    #[cfg(feature = "download-key")]
+    {
+        let enabled = state.tools().is_enabled(ToolId::DownloadKit)
+            && download_env_enabled("STEAMTOOLS_DOWNLOAD_KEY");
+        let values = if enabled {
+            state.with_rules(|rules| {
+                rules
+                    .depot_keys_iter()
+                    .map(|(depot_id, key)| (depot_id, key.to_owned()))
+                    .collect()
+            })
+        } else {
+            std::collections::HashMap::new()
+        };
+        let _ = stt_steamclient::replace_depot_keys(values);
+    }
+
+    #[cfg(not(any(feature = "download-manifest", feature = "download-key")))]
     let _ = state;
+}
+
+#[cfg(any(feature = "download-manifest", feature = "download-key"))]
+fn download_hook_rearm_pending() -> bool {
+    #[cfg(feature = "download-manifest")]
+    if !stt_steamclient::is_manifest_hook_attached() {
+        return true;
+    }
+    #[cfg(feature = "download-key")]
+    if !stt_steamclient::is_depot_key_hook_attached() {
+        return true;
+    }
+    false
 }
 
 /// 各工具此刻的运行状态 —— 开着不等于跑起来了, 这些原来只进 host.log.
@@ -1322,6 +1355,10 @@ fn run_watch_loop(
     let mut manifest_attached_logged = stt_steamclient::is_manifest_hook_attached();
     #[cfg(feature = "download-manifest")]
     let mut last_manifest_stats = stt_steamclient::manifest_hook_stats();
+    #[cfg(feature = "download-key")]
+    let mut key_attached_logged = stt_steamclient::is_depot_key_hook_attached();
+    #[cfg(feature = "download-key")]
+    let mut last_key_stats = stt_steamclient::depot_key_hook_stats();
 
     loop {
         std::thread::sleep(WATCH_POLL);
@@ -1367,12 +1404,25 @@ fn run_watch_loop(
             append_host_log(steam_root, "download_manifest=hook lost, scheduling rearm");
         }
 
+        #[cfg(feature = "download-key")]
+        if key_attached_logged && !stt_steamclient::is_depot_key_hook_attached() {
+            key_attached_logged = false;
+            append_host_log(steam_root, "download_key=hook lost, scheduling rearm");
+        }
+
+        #[cfg(any(feature = "download-manifest", feature = "download-key"))]
+        if package_rearm_ticks.is_multiple_of(8)
+            && state.tools().is_enabled(ToolId::DownloadKit)
+            && download_hook_rearm_pending()
+        {
+            sync_download_runtime(state);
+        }
+
         #[cfg(feature = "download-manifest")]
         if !manifest_attached_logged
             && package_rearm_ticks.is_multiple_of(8)
             && state.tools().is_enabled(ToolId::DownloadKit)
         {
-            sync_manifest_overrides(state);
             let mut report = build_download_report(state, &patterns);
             stt_steamclient::try_install_manifest_hook(&mut report, &patterns);
             let manifest = report.capabilities.iter().find(|item| {
@@ -1398,6 +1448,37 @@ fn run_watch_loop(
             }
         }
 
+        #[cfg(feature = "download-key")]
+        if !key_attached_logged
+            && package_rearm_ticks.is_multiple_of(8)
+            && state.tools().is_enabled(ToolId::DownloadKit)
+        {
+            let mut report = build_download_report(state, &patterns);
+            stt_steamclient::try_install_depot_key_hook(&mut report, &patterns);
+            let key = report
+                .capabilities
+                .iter()
+                .find(|item| item.capability == stt_steamclient::DownloadCapability::DepotKey);
+            if stt_steamclient::is_depot_key_hook_attached() {
+                key_attached_logged = true;
+                append_host_log(steam_root, "download_key=hook attached on rearm");
+            } else if package_rearm_ticks == 8
+                || package_rearm_ticks == 40
+                || package_rearm_ticks.is_multiple_of(80)
+            {
+                let status = key
+                    .map(|item| format!("{:?}", item.status))
+                    .unwrap_or_else(|| "MissingReport".to_owned());
+                let detail = key
+                    .and_then(|item| item.detail.as_deref())
+                    .unwrap_or("not attached");
+                append_host_log(
+                    steam_root,
+                    &format!("download_key=rearm waiting status={status} detail={detail}"),
+                );
+            }
+        }
+
         #[cfg(feature = "download-manifest")]
         {
             let stats = stt_steamclient::manifest_hook_stats();
@@ -1410,6 +1491,18 @@ fn run_watch_loop(
                     ),
                 );
                 last_manifest_stats = stats;
+            }
+        }
+
+        #[cfg(feature = "download-key")]
+        {
+            let stats = stt_steamclient::depot_key_hook_stats();
+            if stats != last_key_stats {
+                append_host_log(
+                    steam_root,
+                    &format!("download_key_stats calls={} served={}", stats.0, stats.1),
+                );
+                last_key_stats = stats;
             }
         }
 
