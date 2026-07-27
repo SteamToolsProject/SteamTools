@@ -25,6 +25,8 @@ pub struct LicenseNotifyPlan {
     pub remove_ids: Vec<AppId>,
     pub ui_actions: Vec<UiLicenseAction>,
     pub should_mark_license_changed: bool,
+    /// 本次变更是否已经写入 Steam client 并完成通知.
+    pub client_applied: bool,
     pub skip_reason: Option<&'static str>,
 }
 
@@ -147,6 +149,7 @@ impl LicenseQueue {
                 remove_ids: Vec::new(),
                 ui_actions: Vec::new(),
                 should_mark_license_changed: false,
+                client_applied: false,
                 skip_reason: Some("package_status_not_available"),
             };
         }
@@ -160,6 +163,7 @@ impl LicenseQueue {
                     remove_ids: Vec::new(),
                     ui_actions: Vec::new(),
                     should_mark_license_changed: false,
+                    client_applied: false,
                     skip_reason: Some("fake_license_not_ready"),
                 };
             }
@@ -208,6 +212,7 @@ impl LicenseQueue {
             remove_ids,
             ui_actions,
             should_mark_license_changed: should_mark,
+            client_applied: false,
             skip_reason: if should_mark {
                 None
             } else {
@@ -235,7 +240,12 @@ impl LicenseNotifyPlan {
             }
         }
         format!(
-            "package=notify logic insert={} remove={} mark={} ui={}",
+            "package=notify mode={} insert={} remove={} mark={} ui={}",
+            if self.client_applied {
+                "client"
+            } else {
+                "logic"
+            },
             self.insert_ids.len(),
             self.remove_ids.len(),
             self.should_mark_license_changed,
@@ -321,7 +331,9 @@ mod tests {
         q.queue_addition(5);
         let plan = q.plan_notify_logic_only();
         assert!(plan.should_mark_license_changed);
+        assert!(!plan.client_applied);
         assert_eq!(plan.insert_ids, vec![5]);
+        assert!(plan.summary_line().contains("mode=logic"));
         assert!(q.injected_contains(5));
         assert_eq!(q.pending_add_len(), 0);
     }

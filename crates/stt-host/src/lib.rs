@@ -73,18 +73,75 @@ fn apply_ui_license_action(action: UiLicenseAction) {
     }
 }
 
-/// 入库成功后: 入队 + notify (有 hook 则改 client, 否则纯逻辑).
-fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogJobResult {
+    Success,
+    Partial,
+    Failure,
+}
+
+impl CatalogJobResult {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Partial => "partial",
+            Self::Failure => "failure",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Success => "成功",
+            Self::Partial => "部分成功",
+            Self::Failure => "失败",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibraryAddedResult {
+    result: CatalogJobResult,
+    detail: String,
+}
+
+/// 入库成功后: 入队 + notify; package 降级必须反馈为部分成功.
+fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) -> LibraryAddedResult {
     sync_download_runtime(state);
     stt_steamclient::add_configured_app(app_id);
     let Some(q) = license_queue() else {
         append_host_log(steam_root, "package=notify skip=no_license_queue");
-        return;
+        return LibraryAddedResult {
+            result: CatalogJobResult::Partial,
+            detail: "license_queue_unavailable".to_owned(),
+        };
     };
     q.queue_addition(app_id);
     let plan = stt_steamclient::notify_license_changed(&q);
     append_host_log(steam_root, &plan.summary_line());
     library_ux().on_rules_app_present(app_id);
+    if plan.client_applied {
+        LibraryAddedResult {
+            result: CatalogJobResult::Success,
+            detail: "package_notified".to_owned(),
+        }
+    } else {
+        let detail = plan
+            .skip_reason
+            .map(|reason| format!("package_notify_{reason}"))
+            .unwrap_or_else(|| "package_notify_not_applied".to_owned());
+        LibraryAddedResult {
+            result: CatalogJobResult::Partial,
+            detail,
+        }
+    }
+}
+
+fn catalog_job_note(result: CatalogJobResult, app_id: AppId, detail: &str) -> String {
+    format!("{}: 入库 {app_id}: {detail}", result.label())
+}
+
+fn catalog_button_label(result: CatalogJobResult, app_id: AppId) -> String {
+    format!("入库{} {app_id}", result.label())
 }
 
 /// 移除成功后.
@@ -543,32 +600,43 @@ fn spawn_catalog_worker(
             while let Ok(job) = jobs_rx.recv() {
                 match add_from_config(&state, &root, job.app_id) {
                     Ok(out) => {
+                        let applied = on_library_added(&root, &state, job.app_id);
                         append_host_log(
                             &root,
                             &format!(
-                                "catalog_add=ok source={} app_id={} provider={} trace={} lua={} epoch={} owned={}",
+                                "catalog_add={} result={} source={} app_id={} provider={} trace={} lua={} epoch={} owned={} detail={}",
+                                if applied.result == CatalogJobResult::Success {
+                                    "ok"
+                                } else {
+                                    "partial"
+                                },
+                                applied.result.as_str(),
                                 job.source.as_str(),
                                 job.app_id,
                                 out.provider_id,
                                 catalog_trace_text(&out.provider_trace),
                                 out.lua_path.display(),
                                 out.epoch,
-                                out.owned_count
+                                out.owned_count,
+                                applied.detail
                             ),
                         );
-                        on_library_added(&root, &state, job.app_id);
                         set_shared_note(
                             &note,
-                            format!(
-                                "已入库 {} ({}, owned={})",
-                                job.app_id, out.provider_id, out.owned_count
+                            catalog_job_note(
+                                applied.result,
+                                job.app_id,
+                                &format!(
+                                    "已落盘; provider={}; owned={}; {}",
+                                    out.provider_id, out.owned_count, applied.detail
+                                ),
                             ),
                         );
                         if matches!(job.source, CatalogJobSource::StoreCdp) {
                             let _ = feedback_tx.send(stt_steamui::store_button_result_js(
                                 job.app_id,
                                 true,
-                                &format!("已入库 {}", job.app_id),
+                                &catalog_button_label(applied.result, job.app_id),
                             ));
                         }
                     }
@@ -577,17 +645,25 @@ fn spawn_catalog_worker(
                         append_host_log(
                             &root,
                             &format!(
-                                "catalog_add=err source={} app_id={} {error_text}",
+                                "catalog_add=err result={} source={} app_id={} {error_text}",
+                                CatalogJobResult::Failure.as_str(),
                                 job.source.as_str(),
                                 job.app_id
                             ),
                         );
-                        set_shared_note(&note, format!("失败: 入库 {}: {error_text}", job.app_id));
+                        set_shared_note(
+                            &note,
+                            catalog_job_note(
+                                CatalogJobResult::Failure,
+                                job.app_id,
+                                &error_text,
+                            ),
+                        );
                         if matches!(job.source, CatalogJobSource::StoreCdp) {
                             let _ = feedback_tx.send(stt_steamui::store_button_result_js(
                                 job.app_id,
                                 false,
-                                "入库失败",
+                                &catalog_button_label(CatalogJobResult::Failure, job.app_id),
                             ));
                         }
                     }
@@ -1095,18 +1171,19 @@ struct DownloadRuntimeSnapshot {
     feature = "download-token",
     feature = "download-request-code"
 ))]
-fn capture_download_runtime_snapshot(state: &ConfigState) -> DownloadRuntimeSnapshot {
+fn capture_download_runtime_snapshot(
+    state: &ConfigState,
+    switches: stt_steamclient::DownloadRuntimeSwitches,
+) -> DownloadRuntimeSnapshot {
     let tool_enabled = state.tools().is_enabled(ToolId::DownloadKit);
     #[cfg(feature = "download-manifest")]
-    let manifest_enabled =
-        tool_enabled && download_env_enabled("STEAMTOOLS_DOWNLOAD_MANIFEST");
+    let manifest_enabled = tool_enabled && switches.manifest;
     #[cfg(feature = "download-key")]
-    let key_enabled = tool_enabled && download_env_enabled("STEAMTOOLS_DOWNLOAD_KEY");
+    let key_enabled = tool_enabled && switches.key;
     #[cfg(feature = "download-token")]
-    let token_enabled = tool_enabled && download_env_enabled("STEAMTOOLS_DOWNLOAD_TOKEN");
+    let token_enabled = tool_enabled && switches.token;
     #[cfg(feature = "download-request-code")]
-    let request_code_enabled =
-        tool_enabled && download_env_enabled("STEAMTOOLS_DOWNLOAD_REQUEST_CODE");
+    let request_code_enabled = tool_enabled && switches.request_code;
 
     state.with_rules(|rules| DownloadRuntimeSnapshot {
         #[cfg(feature = "download-manifest")]
@@ -1160,7 +1237,15 @@ fn sync_download_runtime(state: &ConfigState) {
         feature = "download-token",
         feature = "download-request-code"
     ))]
-    let snapshot = capture_download_runtime_snapshot(state);
+    let snapshot = capture_download_runtime_snapshot(
+        state,
+        stt_steamclient::DownloadRuntimeSwitches {
+            manifest: download_env_enabled("STEAMTOOLS_DOWNLOAD_MANIFEST"),
+            key: download_env_enabled("STEAMTOOLS_DOWNLOAD_KEY"),
+            token: download_env_enabled("STEAMTOOLS_DOWNLOAD_TOKEN"),
+            request_code: download_env_enabled("STEAMTOOLS_DOWNLOAD_REQUEST_CODE"),
+        },
+    );
 
     #[cfg(feature = "download-manifest")]
     stt_steamclient::replace_manifest_overrides(snapshot.manifests);
@@ -2156,7 +2241,7 @@ end
         .unwrap();
 
         let feedback = feedback.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(feedback.contains("已入库 42"), "{feedback}");
+        assert!(feedback.contains("入库部分成功 42"), "{feedback}");
         let lua_path = stt_config::catalog_lua_path(root.path(), 42);
         let lua = fs::read_to_string(&lua_path).unwrap();
         assert!(lua.contains("addappid(43, 0,"), "{lua}");
@@ -2164,7 +2249,10 @@ end
         assert!(state.rules_epoch() > 0);
         assert!(state.with_rules(|rules| rules.is_owned(42)));
 
-        let snapshot = capture_download_runtime_snapshot(&state);
+        let snapshot = capture_download_runtime_snapshot(
+            &state,
+            stt_steamclient::DownloadRuntimeSwitches::default(),
+        );
         assert_eq!(snapshot.manifests.get(&43).unwrap().manifest_gid, 99);
         assert_eq!(snapshot.keys.get(&43).map(String::len), Some(64));
         assert_eq!(snapshot.tokens.get(&42), Some(&123));
@@ -2179,10 +2267,78 @@ end
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        assert!(note.contains("已入库 42"), "{note}");
+        assert!(note.starts_with("部分成功: 入库 42"), "{note}");
+        let panel = ConfigSnapshot::from_state(&state, root.path(), "test", &note);
+        assert_eq!(panel.note, note);
         let log = fs::read_to_string(stt_platform::host_log_path(root.path())).unwrap();
-        assert!(log.contains("catalog_add=ok source=store_cdp app_id=42"), "{log}");
+        assert!(
+            log.contains("catalog_add=partial result=partial source=store_cdp app_id=42"),
+            "{log}"
+        );
         assert!(log.contains("provider=custom_http"), "{log}");
-        assert!(log.contains("package=notify logic insert=1"), "{log}");
+        assert!(log.contains("package=notify mode=logic insert=1"), "{log}");
+    }
+
+    #[test]
+    fn catalog_feedback_uses_the_same_three_outcome_labels() {
+        for (result, label) in [
+            (CatalogJobResult::Success, "成功"),
+            (CatalogJobResult::Partial, "部分成功"),
+            (CatalogJobResult::Failure, "失败"),
+        ] {
+            assert!(catalog_job_note(result, 42, "detail").starts_with(label));
+            assert!(catalog_button_label(result, 42).contains(label));
+            assert!(!result.as_str().is_empty());
+        }
+    }
+
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    #[test]
+    fn each_runtime_switch_clears_only_its_own_snapshot() {
+        let state = ConfigState::new();
+        let mut host = HostConfig::default();
+        host.tools.enabled.insert("download_kit".to_owned(), true);
+        state.apply_host(host);
+        state.apply_lua(
+            concat!(
+                "addappid(42)\n",
+                "addappid(43, 0, \"abababababababababababababababababababababababababababababababab\")\n",
+                "addtoken(42, \"123\")\n",
+                "setmanifestid(43, \"99\")\n",
+                "setappdepots(42, {43})\n"
+            ),
+        )
+        .unwrap();
+
+        let cases = [
+            stt_steamclient::DownloadRuntimeSwitches {
+                manifest: false,
+                ..stt_steamclient::DownloadRuntimeSwitches::default()
+            },
+            stt_steamclient::DownloadRuntimeSwitches {
+                key: false,
+                ..stt_steamclient::DownloadRuntimeSwitches::default()
+            },
+            stt_steamclient::DownloadRuntimeSwitches {
+                token: false,
+                ..stt_steamclient::DownloadRuntimeSwitches::default()
+            },
+            stt_steamclient::DownloadRuntimeSwitches {
+                request_code: false,
+                ..stt_steamclient::DownloadRuntimeSwitches::default()
+            },
+        ];
+        for (index, switches) in cases.into_iter().enumerate() {
+            let snapshot = capture_download_runtime_snapshot(&state, switches);
+            assert_eq!(snapshot.manifests.is_empty(), index == 0);
+            assert_eq!(snapshot.keys.is_empty(), index == 1);
+            assert_eq!(snapshot.tokens.is_empty(), index == 2);
+            assert_eq!(snapshot.request_code_depots.is_empty(), index == 3);
+        }
     }
 }
