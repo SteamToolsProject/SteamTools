@@ -1013,7 +1013,8 @@ fn plan_download_layer(
     #[cfg(any(
         feature = "download-manifest",
         feature = "download-key",
-        feature = "download-token"
+        feature = "download-token",
+        feature = "download-request-code"
     ))]
     let report = {
         let mut report = report;
@@ -1023,6 +1024,8 @@ fn plan_download_layer(
         stt_steamclient::try_install_depot_key_hook(&mut report, patterns);
         #[cfg(feature = "download-token")]
         stt_steamclient::try_install_access_token_hook(&mut report, patterns);
+        #[cfg(feature = "download-request-code")]
+        stt_steamclient::try_install_manifest_code_hooks(&mut report, patterns);
         report
     };
     append_host_log(
@@ -1154,7 +1157,8 @@ fn sync_download_runtime(state: &ConfigState) {
 #[cfg(any(
     feature = "download-manifest",
     feature = "download-key",
-    feature = "download-token"
+    feature = "download-token",
+    feature = "download-request-code"
 ))]
 fn download_hook_rearm_pending() -> bool {
     #[cfg(feature = "download-manifest")]
@@ -1167,6 +1171,10 @@ fn download_hook_rearm_pending() -> bool {
     }
     #[cfg(feature = "download-token")]
     if !stt_steamclient::is_access_token_hook_attached() {
+        return true;
+    }
+    #[cfg(feature = "download-request-code")]
+    if !stt_steamclient::is_manifest_code_hook_attached() {
         return true;
     }
     false
@@ -1432,6 +1440,10 @@ fn run_watch_loop(
     let mut token_attached_logged = stt_steamclient::is_access_token_hook_attached();
     #[cfg(feature = "download-token")]
     let mut last_token_stats = stt_steamclient::access_token_hook_stats();
+    #[cfg(feature = "download-request-code")]
+    let mut request_code_attached_logged = stt_steamclient::is_manifest_code_hook_attached();
+    #[cfg(feature = "download-request-code")]
+    let mut last_request_code_stats = stt_steamclient::manifest_code_hook_stats();
 
     loop {
         std::thread::sleep(WATCH_POLL);
@@ -1489,10 +1501,20 @@ fn run_watch_loop(
             append_host_log(steam_root, "download_token=hook lost, scheduling rearm");
         }
 
+        #[cfg(feature = "download-request-code")]
+        if request_code_attached_logged && !stt_steamclient::is_manifest_code_hook_attached() {
+            request_code_attached_logged = false;
+            append_host_log(
+                steam_root,
+                "download_request_code=hook lost, scheduling rearm",
+            );
+        }
+
         #[cfg(any(
             feature = "download-manifest",
             feature = "download-key",
-            feature = "download-token"
+            feature = "download-token",
+            feature = "download-request-code"
         ))]
         if package_rearm_ticks.is_multiple_of(8)
             && state.tools().is_enabled(ToolId::DownloadKit)
@@ -1593,6 +1615,41 @@ fn run_watch_loop(
             }
         }
 
+        #[cfg(feature = "download-request-code")]
+        if !request_code_attached_logged
+            && package_rearm_ticks.is_multiple_of(8)
+            && state.tools().is_enabled(ToolId::DownloadKit)
+        {
+            let mut report = build_download_report(state, &patterns);
+            stt_steamclient::try_install_manifest_code_hooks(&mut report, &patterns);
+            let request_code = report.capabilities.iter().find(|item| {
+                item.capability == stt_steamclient::DownloadCapability::RequestCode
+            });
+            if stt_steamclient::is_manifest_code_hook_attached() {
+                request_code_attached_logged = true;
+                append_host_log(
+                    steam_root,
+                    "download_request_code=hooks attached on rearm",
+                );
+            } else if package_rearm_ticks == 8
+                || package_rearm_ticks == 40
+                || package_rearm_ticks.is_multiple_of(80)
+            {
+                let status = request_code
+                    .map(|item| format!("{:?}", item.status))
+                    .unwrap_or_else(|| "MissingReport".to_owned());
+                let detail = request_code
+                    .and_then(|item| item.detail.as_deref())
+                    .unwrap_or("not attached");
+                append_host_log(
+                    steam_root,
+                    &format!(
+                        "download_request_code=rearm waiting status={status} detail={detail}"
+                    ),
+                );
+            }
+        }
+
         #[cfg(feature = "download-manifest")]
         {
             let stats = stt_steamclient::manifest_hook_stats();
@@ -1632,6 +1689,21 @@ fn run_watch_loop(
                     ),
                 );
                 last_token_stats = stats;
+            }
+        }
+
+        #[cfg(feature = "download-request-code")]
+        {
+            let stats = stt_steamclient::manifest_code_hook_stats();
+            if stats != last_request_code_stats {
+                append_host_log(
+                    steam_root,
+                    &format!(
+                        "download_request_code_stats calls={} submitted={} dropped={} completed={} patched={}",
+                        stats.0, stats.1, stats.2, stats.3, stats.4
+                    ),
+                );
+                last_request_code_stats = stats;
             }
         }
 
