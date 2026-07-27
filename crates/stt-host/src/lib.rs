@@ -71,7 +71,8 @@ fn apply_ui_license_action(action: UiLicenseAction) {
 }
 
 /// 入库成功后: 入队 + notify (有 hook 则改 client, 否则纯逻辑).
-fn on_library_added(steam_root: &Path, app_id: AppId) {
+fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) {
+    sync_manifest_overrides(state);
     stt_steamclient::add_configured_app(app_id);
     let Some(q) = license_queue() else {
         append_host_log(steam_root, "package=notify skip=no_license_queue");
@@ -84,7 +85,8 @@ fn on_library_added(steam_root: &Path, app_id: AppId) {
 }
 
 /// 移除成功后.
-fn on_library_removed(steam_root: &Path, app_id: AppId) {
+fn on_library_removed(steam_root: &Path, state: &ConfigState, app_id: AppId) {
+    sync_manifest_overrides(state);
     stt_steamclient::remove_configured_app(app_id);
     let Some(q) = license_queue() else {
         append_host_log(steam_root, "package=notify skip=no_license_queue");
@@ -97,6 +99,7 @@ fn on_library_removed(steam_root: &Path, app_id: AppId) {
 
 /// lua 全量重载后: 与 owned 做差再 notify.
 fn on_rules_reloaded(steam_root: &Path, state: &ConfigState) {
+    sync_manifest_overrides(state);
     sync_configured_from_state(state);
     let Some(q) = license_queue() else {
         return;
@@ -548,7 +551,7 @@ fn spawn_catalog_worker(
                                 out.owned_count
                             ),
                         );
-                        on_library_added(&root, job.app_id);
+                        on_library_added(&root, &state, job.app_id);
                         set_shared_note(
                             &note,
                             format!(
@@ -653,7 +656,7 @@ impl HostPanel {
             }
             ConfigIntent::RemoveApp(_) => {
                 let out = remove_from_library(&self.state, &self.steam_root, app_id)?;
-                on_library_removed(&self.steam_root, app_id);
+                on_library_removed(&self.steam_root, &self.state, app_id);
                 Ok(format!("已移除 {app_id} (owned={})", out.owned_count))
             }
             _ => Err(stt_config::ConfigError::Invalid("不是 app 意图".into())),
@@ -1000,6 +1003,21 @@ fn plan_download_layer(
     state: &ConfigState,
     patterns: &stt_metadata::PatternStore,
 ) -> stt_steamclient::DownloadKitReport {
+    sync_manifest_overrides(state);
+    let mut report = build_download_report(state, patterns);
+    #[cfg(feature = "download-manifest")]
+    stt_steamclient::try_install_manifest_hook(&mut report, patterns);
+    append_host_log(
+        steam_root,
+        &format!("download_kit {}", report.summary_line()),
+    );
+    report
+}
+
+fn build_download_report(
+    state: &ConfigState,
+    patterns: &stt_metadata::PatternStore,
+) -> stt_steamclient::DownloadKitReport {
     let request_code = matches!(
         state.host().manifest.url.as_str(),
         "opensteamtool" | "steamrun" | "wudrm"
@@ -1016,19 +1034,36 @@ fn plan_download_layer(
         token: download_env_enabled("STEAMTOOLS_DOWNLOAD_TOKEN"),
         request_code: download_env_enabled("STEAMTOOLS_DOWNLOAD_REQUEST_CODE"),
     };
-    let report = stt_steamclient::plan_download_kit(
+    stt_steamclient::plan_download_kit(
         &state.tools(),
         patterns,
         "steamclient",
         stt_steamclient::DownloadFeatureSet::compiled(),
         switches,
         data,
-    );
-    append_host_log(
-        steam_root,
-        &format!("download_kit {}", report.summary_line()),
-    );
-    report
+    )
+}
+
+fn sync_manifest_overrides(state: &ConfigState) {
+    #[cfg(feature = "download-manifest")]
+    {
+        let enabled = state.tools().is_enabled(ToolId::DownloadKit)
+            && download_env_enabled("STEAMTOOLS_DOWNLOAD_MANIFEST");
+        let values = if enabled {
+            state.with_rules(|rules| {
+                rules
+                    .manifest_overrides_iter()
+                    .map(|(depot_id, over)| (depot_id, over.clone()))
+                    .collect()
+            })
+        } else {
+            std::collections::HashMap::new()
+        };
+        stt_steamclient::replace_manifest_overrides(values);
+    }
+
+    #[cfg(not(feature = "download-manifest"))]
+    let _ = state;
 }
 
 /// 各工具此刻的运行状态 —— 开着不等于跑起来了, 这些原来只进 host.log.
@@ -1161,7 +1196,7 @@ fn process_inbox(
                             out.owned_count
                         ),
                     );
-                    on_library_added(steam_root, app_id);
+                    on_library_added(steam_root, state, app_id);
                 }
                 Err(error) => append_host_log(
                     steam_root,
@@ -1279,6 +1314,10 @@ fn run_watch_loop(
     // steamclient64 常比 host 晚加载; init 时没挂上就在 watch 里补.
     let mut package_rearm_ticks: u32 = 0;
     let mut package_attached_logged = stt_steamclient::is_attached();
+    #[cfg(feature = "download-manifest")]
+    let mut manifest_attached_logged = stt_steamclient::is_manifest_hook_attached();
+    #[cfg(feature = "download-manifest")]
+    let mut last_manifest_stats = stt_steamclient::manifest_hook_stats();
 
     loop {
         std::thread::sleep(WATCH_POLL);
@@ -1315,6 +1354,58 @@ fn run_watch_loop(
                         report.attach_detail().unwrap_or("not attached")
                     ),
                 );
+            }
+        }
+
+        #[cfg(feature = "download-manifest")]
+        if manifest_attached_logged && !stt_steamclient::is_manifest_hook_attached() {
+            manifest_attached_logged = false;
+            append_host_log(steam_root, "download_manifest=hook lost, scheduling rearm");
+        }
+
+        #[cfg(feature = "download-manifest")]
+        if !manifest_attached_logged
+            && package_rearm_ticks.is_multiple_of(8)
+            && state.tools().is_enabled(ToolId::DownloadKit)
+        {
+            sync_manifest_overrides(state);
+            let mut report = build_download_report(state, &patterns);
+            stt_steamclient::try_install_manifest_hook(&mut report, &patterns);
+            let manifest = report.capabilities.iter().find(|item| {
+                item.capability == stt_steamclient::DownloadCapability::ManifestOverride
+            });
+            if stt_steamclient::is_manifest_hook_attached() {
+                manifest_attached_logged = true;
+                append_host_log(steam_root, "download_manifest=hook attached on rearm");
+            } else if package_rearm_ticks == 8
+                || package_rearm_ticks == 40
+                || package_rearm_ticks.is_multiple_of(80)
+            {
+                let status = manifest
+                    .map(|item| format!("{:?}", item.status))
+                    .unwrap_or_else(|| "MissingReport".to_owned());
+                let detail = manifest
+                    .and_then(|item| item.detail.as_deref())
+                    .unwrap_or("not attached");
+                append_host_log(
+                    steam_root,
+                    &format!("download_manifest=rearm waiting status={status} detail={detail}"),
+                );
+            }
+        }
+
+        #[cfg(feature = "download-manifest")]
+        {
+            let stats = stt_steamclient::manifest_hook_stats();
+            if stats != last_manifest_stats {
+                append_host_log(
+                    steam_root,
+                    &format!(
+                        "download_manifest_stats calls={} patched={}",
+                        stats.0, stats.1
+                    ),
+                );
+                last_manifest_stats = stats;
             }
         }
 
