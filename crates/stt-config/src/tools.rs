@@ -7,6 +7,7 @@ pub enum ToolId {
     CatalogAdd,
     LibraryUx,
     ConfigUi,
+    DownloadKit,
     StoreAccel,
 }
 
@@ -15,6 +16,7 @@ impl ToolId {
         ToolId::CatalogAdd,
         ToolId::LibraryUx,
         ToolId::ConfigUi,
+        ToolId::DownloadKit,
         ToolId::StoreAccel,
     ];
 
@@ -23,6 +25,7 @@ impl ToolId {
             ToolId::CatalogAdd => "catalog_add",
             ToolId::LibraryUx => "library_ux",
             ToolId::ConfigUi => "config_ui",
+            ToolId::DownloadKit => "download_kit",
             ToolId::StoreAccel => "store_accel",
         }
     }
@@ -32,6 +35,7 @@ impl ToolId {
             "catalog_add" => Some(Self::CatalogAdd),
             "library_ux" => Some(Self::LibraryUx),
             "config_ui" => Some(Self::ConfigUi),
+            "download_kit" => Some(Self::DownloadKit),
             "store_accel" => Some(Self::StoreAccel),
             _ => None,
         }
@@ -54,6 +58,7 @@ impl ToolId {
             ToolId::CatalogAdd => "入库 / 清单",
             ToolId::LibraryUx => "库 UX",
             ToolId::ConfigUi => "配置页",
+            ToolId::DownloadKit => "下载套件",
             ToolId::StoreAccel => "商店加速",
         }
     }
@@ -81,7 +86,7 @@ pub fn builtin_manifests() -> Vec<ToolManifest> {
             id,
             name: id.display_name(),
             default_enabled: id.default_enabled(),
-            needs_client: matches!(id, ToolId::StoreAccel),
+            needs_client: matches!(id, ToolId::DownloadKit | ToolId::StoreAccel),
         })
         .collect()
 }
@@ -150,6 +155,7 @@ mod tests {
         assert!(reg.is_enabled(ToolId::CatalogAdd));
         assert!(reg.is_enabled(ToolId::LibraryUx));
         assert!(reg.is_enabled(ToolId::ConfigUi));
+        assert!(!reg.is_enabled(ToolId::DownloadKit));
         assert!(!reg.is_enabled(ToolId::StoreAccel));
     }
 
