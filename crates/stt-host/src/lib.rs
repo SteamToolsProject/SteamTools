@@ -9,13 +9,17 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use stt_catalog::MockCatalogProvider;
+use stt_catalog::{
+    CatalogError, CatalogLimits, CatalogProvider, CustomHttpCatalogProvider, MockCatalogProvider,
+    ProviderErrorKind,
+};
 use stt_config::{
-    add_to_library, apply_intent, remove_from_library, ConfigIntent, ConfigSnapshot, ConfigState,
-    HostConfig, ToolId,
+    add_to_library, apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent,
+    ConfigSnapshot, ConfigState, HostConfig, ToolId,
 };
 use stt_core::{AppId, AppRules};
 use stt_steamclient::{LicenseQueue, UiLicenseAction};
@@ -132,6 +136,52 @@ fn tools_enabled_line(state: &ConfigState) -> String {
     format!("tools_enabled={}\n", enabled.join(","))
 }
 
+fn catalog_mode_line(state: &ConfigState) -> String {
+    format!("catalog_mode={}", state.host().catalog.mode.as_str())
+}
+
+fn build_catalog_provider(
+    config: &CatalogSection,
+) -> stt_catalog::CatalogResult<Box<dyn CatalogProvider>> {
+    match config.mode {
+        CatalogMode::Disabled => Err(CatalogError::Provider {
+            provider: "disabled".to_owned(),
+            kind: ProviderErrorKind::Unavailable,
+            detail: "catalog source is disabled".to_owned(),
+        }),
+        CatalogMode::Mock => Ok(Box::new(
+            MockCatalogProvider::new().with_auto_generate(true),
+        )),
+        CatalogMode::CustomHttp => {
+            let options = stt_platform::WinHttpGetOptions {
+                timeouts: stt_platform::WinHttpTimeouts {
+                    resolve_ms: config.timeout_resolve_ms,
+                    connect_ms: config.timeout_connect_ms,
+                    send_ms: config.timeout_send_ms,
+                    receive_ms: config.timeout_recv_ms,
+                },
+                max_body_bytes: config
+                    .max_response_bytes
+                    .min(CatalogLimits::default().max_wire_bytes),
+            };
+            Ok(Box::new(CustomHttpCatalogProvider::new(
+                config.url_template.clone(),
+                options,
+            )?))
+        }
+    }
+}
+
+fn add_from_config(
+    state: &ConfigState,
+    steam_root: &Path,
+    app_id: AppId,
+) -> stt_config::Result<stt_config::AddToLibraryOutcome> {
+    let host = state.host();
+    let provider = build_catalog_provider(&host.catalog)?;
+    add_to_library(state, steam_root, provider.as_ref(), app_id)
+}
+
 /// 调试通道给谁用: 入库按钮和配置页都靠它, 有一个开着就得装 hook.
 fn needs_cef_channel(state: &ConfigState) -> bool {
     let tools = state.tools();
@@ -206,6 +256,9 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     let cfg_path = HostConfig::resolve_path(steam_root)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(defaults)".into());
+    let mut config_lines = tools_enabled_line(&state);
+    config_lines.push_str(&catalog_mode_line(&state));
+    config_lines.push('\n');
 
     let body = format!(
         "SteamTools host init\n\
@@ -224,7 +277,7 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         steam_root = steam_root.display(),
         data_dir = data.display(),
         cfg_path = cfg_path,
-        tools = tools_enabled_line(&state),
+        tools = config_lines,
         lua_dirs = lua_report.dirs_scanned,
         lua_files_ok = lua_report.files_ok,
         lua_files_err = lua_report.files_err,
@@ -335,6 +388,111 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CatalogJobSource {
+    StoreCdp,
+    ConfigRefresh,
+}
+
+impl CatalogJobSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StoreCdp => "store_cdp",
+            Self::ConfigRefresh => "config_refresh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CatalogJob {
+    app_id: AppId,
+    source: CatalogJobSource,
+}
+
+fn queue_catalog_job(sender: &SyncSender<CatalogJob>, job: CatalogJob) -> stt_config::Result<()> {
+    sender.try_send(job).map_err(|error| {
+        let detail = match error {
+            TrySendError::Full(_) => "catalog worker queue is full",
+            TrySendError::Disconnected(_) => "catalog worker is unavailable",
+        };
+        stt_config::ConfigError::Invalid(detail.into())
+    })
+}
+
+fn spawn_catalog_worker(
+    steam_root: &Path,
+    state: &ConfigState,
+    note: &Arc<Mutex<String>>,
+) -> (SyncSender<CatalogJob>, Receiver<String>) {
+    const QUEUE_CAPACITY: usize = 32;
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<CatalogJob>(QUEUE_CAPACITY);
+    let (feedback_tx, feedback_rx) = mpsc::channel::<String>();
+    let root = steam_root.to_path_buf();
+    let state = state.clone();
+    let note = Arc::clone(note);
+
+    let spawn = std::thread::Builder::new()
+        .name("stt-catalog-worker".into())
+        .spawn(move || {
+            while let Ok(job) = jobs_rx.recv() {
+                match add_from_config(&state, &root, job.app_id) {
+                    Ok(out) => {
+                        append_host_log(
+                            &root,
+                            &format!(
+                                "catalog_add=ok source={} app_id={} provider={} lua={} epoch={} owned={}",
+                                job.source.as_str(),
+                                job.app_id,
+                                out.provider_id,
+                                out.lua_path.display(),
+                                out.epoch,
+                                out.owned_count
+                            ),
+                        );
+                        on_library_added(&root, job.app_id);
+                        set_shared_note(
+                            &note,
+                            format!(
+                                "已入库 {} ({}, owned={})",
+                                job.app_id, out.provider_id, out.owned_count
+                            ),
+                        );
+                        if matches!(job.source, CatalogJobSource::StoreCdp) {
+                            let _ = feedback_tx.send(stt_steamui::store_button_result_js(
+                                job.app_id,
+                                true,
+                                &format!("已入库 {}", job.app_id),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        append_host_log(
+                            &root,
+                            &format!(
+                                "catalog_add=err source={} app_id={} {error}",
+                                job.source.as_str(),
+                                job.app_id
+                            ),
+                        );
+                        set_shared_note(&note, format!("失败: 入库 {}: {error}", job.app_id));
+                        if matches!(job.source, CatalogJobSource::StoreCdp) {
+                            let _ = feedback_tx.send(stt_steamui::store_button_result_js(
+                                job.app_id,
+                                false,
+                                "入库失败",
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+
+    if let Err(error) = spawn {
+        append_host_log(steam_root, &format!("catalog_worker=spawn_err {error}"));
+    }
+    (jobs_tx, feedback_rx)
+}
+
 /// 配置页的宿主侧: 出快照, 收意图, 落盘.
 struct HostPanel {
     steam_root: std::path::PathBuf,
@@ -349,6 +507,8 @@ struct HostPanel {
     recon_done: bool,
     /// 各工具的运行状态 (init 时算一次), 给工具中心显示.
     details: stt_config::ToolDetails,
+    /// Catalog 拉取只入队, 不阻塞 CDP/面板回调.
+    catalog_jobs: SyncSender<CatalogJob>,
     /// 受管 app 的缓存与它对应的 rules epoch —— 算一次要扫目录, 别每轮来.
     managed: Vec<u32>,
     managed_epoch: Option<u64>,
@@ -381,10 +541,15 @@ impl HostPanel {
     fn apply_app_intent(&self, intent: &ConfigIntent, app_id: u32) -> stt_config::Result<String> {
         match intent {
             ConfigIntent::RefreshApp(_) => {
-                let provider = MockCatalogProvider::new().with_auto_generate(true);
-                let out = add_to_library(&self.state, &self.steam_root, &provider, app_id)?;
-                on_library_added(&self.steam_root, app_id);
-                Ok(format!("已刷新 {app_id} (owned={})", out.owned_count))
+                set_shared_note(&self.note, format!("正在刷新 {app_id}"));
+                queue_catalog_job(
+                    &self.catalog_jobs,
+                    CatalogJob {
+                        app_id,
+                        source: CatalogJobSource::ConfigRefresh,
+                    },
+                )?;
+                Ok(format!("已排队刷新 {app_id}"))
             }
             ConfigIntent::RemoveApp(_) => {
                 let out = remove_from_library(&self.state, &self.steam_root, app_id)?;
@@ -430,7 +595,9 @@ impl stt_steamui::PanelBridge for HostPanel {
             match done {
                 Ok(done) => {
                     append_host_log(&self.steam_root, &format!("config_ui=saved {done}"));
-                    set_shared_note(&self.note, format!("已保存 {done}"));
+                    if !matches!(intent, ConfigIntent::RefreshApp(_)) {
+                        set_shared_note(&self.note, format!("已保存 {done}"));
+                    }
                 }
                 Err(e) => {
                     append_host_log(&self.steam_root, &format!("config_ui=err {e}"));
@@ -468,8 +635,8 @@ fn spawn_store_cdp_bridge(
     let _ = std::thread::Builder::new()
         .name("stt-store-cdp".into())
         .spawn(move || {
-            let provider = MockCatalogProvider::new().with_auto_generate(true);
             let note = Arc::new(Mutex::new(String::new()));
+            let (catalog_jobs, catalog_feedback) = spawn_catalog_worker(&root, &state, &note);
             let mut panel = HostPanel {
                 steam_root: root.clone(),
                 state: state.clone(),
@@ -477,54 +644,49 @@ fn spawn_store_cdp_bridge(
                 note: Arc::clone(&note),
                 recon_done: false,
                 details,
+                catalog_jobs: catalog_jobs.clone(),
                 managed: Vec::new(),
                 managed_epoch: None,
             };
             // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
             // 工具关掉就换成摘按钮的脚本, 让开关当场看得见.
             let mut make_js = || {
-                if state.tools().is_enabled(ToolId::CatalogAdd) {
+                let mut script = if state.tools().is_enabled(ToolId::CatalogAdd) {
                     stt_steamui::cdp_store_inject_js()
                 } else {
                     stt_steamui::store_teardown_js()
+                };
+                while let Ok(feedback) = catalog_feedback.try_recv() {
+                    script.push_str(";\n");
+                    script.push_str(&feedback);
                 }
+                script
             };
-            // 返回值: 回写商店按钮的短 JS; 面板 note 同步一份.
-            // 当前上游是 Mock, 成功 = 元数据 lua 落盘, 不是真能下载.
+            // 点击只入有界队列; HTTP 和落盘由 catalog worker 执行.
             let mut on_app = |app_id: u32| -> Option<String> {
-                match add_to_library(&state, &root, &provider, app_id) {
-                    Ok(out) => {
+                let job = CatalogJob {
+                    app_id,
+                    source: CatalogJobSource::StoreCdp,
+                };
+                match queue_catalog_job(&catalog_jobs, job) {
+                    Ok(()) => Some(stt_steamui::store_button_result_js(
+                        app_id,
+                        false,
+                        "正在拉取",
+                    )),
+                    Err(error) => {
                         append_host_log(
                             &root,
                             &format!(
-                                "catalog_add=ok source=store_cdp app_id={app_id} provider={} lua={} epoch={} owned={}",
-                                out.provider_id,
-                                out.lua_path.display(),
-                                out.epoch,
-                                out.owned_count
+                                "catalog_add=queue_err source=store_cdp app_id={app_id} {error}"
                             ),
                         );
-                        on_library_added(&root, app_id);
-                        set_shared_note(
-                            &note,
-                            format!(
-                                "已入库 {app_id} (Mock, owned={})",
-                                out.owned_count
-                            ),
-                        );
+                        set_shared_note(&note, format!("失败: 入库 {app_id}: {error}"));
                         Some(stt_steamui::store_button_result_js(
                             app_id,
-                            true,
-                            &format!("已入库 {app_id}"),
+                            false,
+                            "队列不可用",
                         ))
-                    }
-                    Err(e) => {
-                        append_host_log(
-                            &root,
-                            &format!("catalog_add=err source=store_cdp app_id={app_id} {e}"),
-                        );
-                        set_shared_note(&note, format!("失败: 入库 {app_id}: {e}"));
-                        Some(stt_steamui::store_button_result_js(app_id, false, "失败"))
                     }
                 }
             };
@@ -733,6 +895,11 @@ fn tool_details(
     caught: bool,
 ) -> stt_config::ToolDetails {
     let tools = state.tools();
+    let catalog = match state.host().catalog.mode {
+        CatalogMode::Disabled => "Catalog 未配置",
+        CatalogMode::CustomHttp => "Catalog: CustomHttp",
+        CatalogMode::Mock => "Catalog: Mock 开发模式",
+    };
     let mut d = stt_config::ToolDetails::new();
     d.insert(
         ToolId::CatalogAdd.as_str(),
@@ -740,13 +907,13 @@ fn tool_details(
             "已关闭, 商店页不挂入库按钮".to_owned()
         } else if caught {
             format!(
-                "经 {} 注入商店页; {}",
+                "{catalog}; 经 {} 注入商店页; {}",
                 channel_label(use_pipe),
                 package.detail_for_ui()
             )
         } else {
             format!(
-                "调试通道没截到 steamwebhelper; {}",
+                "{catalog}; 调试通道没截到 steamwebhelper; {}",
                 package.detail_for_ui()
             )
         },
@@ -781,11 +948,10 @@ fn tool_details(
     d
 }
 
-/// 处理 steamtools/inbox/*.txt: 每行一个 app_id, 走 Mock AddToLibrary.
+/// 处理 steamtools/inbox/*.txt: 每行一个 app_id, 按当前 Catalog 配置入库.
 fn process_inbox(
     steam_root: &Path,
     state: &ConfigState,
-    provider: &MockCatalogProvider,
     seen: &mut std::collections::HashSet<std::path::PathBuf>,
 ) {
     let dir = stt_platform::inbox_dir(steam_root);
@@ -829,7 +995,7 @@ fn process_inbox(
                 continue;
             };
             any = true;
-            match add_to_library(state, steam_root, provider, app_id) {
+            match add_from_config(state, steam_root, app_id) {
                 Ok(out) => {
                     append_host_log(
                         steam_root,
@@ -942,7 +1108,6 @@ fn run_watch_loop(
         let host = state.host();
         stt_config::lua_files_watcher(steam_root, &host, WATCH_DEBOUNCE)
     };
-    let provider = MockCatalogProvider::new().with_auto_generate(true);
     let mut inbox_seen: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
 
@@ -959,7 +1124,7 @@ fn run_watch_loop(
 
     loop {
         std::thread::sleep(WATCH_POLL);
-        process_inbox(steam_root, state, &provider, &mut inbox_seen);
+        process_inbox(steam_root, state, &mut inbox_seen);
         cef_rearm.tick(steam_root, state);
 
         // ~2s 一轮: 未 attach 且 catalog_add 开着则重试 package hooks.
@@ -1024,7 +1189,11 @@ fn run_watch_loop(
                 Ok(()) => {
                     append_host_log(
                         steam_root,
-                        &format!("reload=host_toml {}", tools_enabled_line(state).trim()),
+                        &format!(
+                            "reload=host_toml {} {}",
+                            tools_enabled_line(state).trim(),
+                            catalog_mode_line(state)
+                        ),
                     );
                     let host = state.host();
                     lua_watch = stt_config::lua_files_watcher(steam_root, &host, WATCH_DEBOUNCE);
@@ -1167,5 +1336,33 @@ mod tests {
         assert!(text.contains("owned_count=1"), "{text}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_catalog_does_not_fall_back_to_synthetic_mock() {
+        let dir = std::env::temp_dir().join(format!(
+            "steamtools-host-catalog-disabled-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state = ConfigState::new();
+
+        let error = add_from_config(&state, &dir, 42).unwrap_err();
+
+        assert!(error.to_string().contains("disabled"));
+        assert!(!stt_config::catalog_lua_path(&dir, 42).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mock_provider_requires_explicit_mode() {
+        let mut config = CatalogSection::default();
+        assert!(build_catalog_provider(&config).is_err());
+
+        config.mode = CatalogMode::Mock;
+        let provider = build_catalog_provider(&config).unwrap();
+
+        assert_eq!(provider.id(), "mock");
     }
 }
