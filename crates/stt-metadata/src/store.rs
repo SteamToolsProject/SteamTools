@@ -95,6 +95,22 @@ impl PatternStore {
         }
     }
 
+    /// 仅用 pattern 里的 RVA (不扫映像). 大 DLL 上避免整模块拷贝.
+    pub fn find_by_rva_only(
+        &self,
+        component: &str,
+        name: &str,
+        module_base: usize,
+    ) -> Option<usize> {
+        if self.failed.contains(component) {
+            return None;
+        }
+        let map = self.maps.get(component)?;
+        let entry = map.get_by_name(name)?;
+        let rva = entry.rva?;
+        Some(module_base.wrapping_add(rva as usize))
+    }
+
     pub fn take_missing(&self) -> Vec<String> {
         let mut g = self
             .missing
