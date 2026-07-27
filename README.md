@@ -18,13 +18,14 @@
 
 ## 当前状态
 
-- [x] workspace：`stt-core` / `stt-platform` / `stt-config` / `stt-metadata` / `stt-hook` / `stt-steamui` / `stt-host` / loaders
+- [x] workspace：`stt-core` / `stt-catalog` / `stt-platform` / `stt-config` / `stt-metadata` / `stt-hook` / `stt-steamui` / `stt-steamclient` / `stt-host` / loaders
 - [x] M1：双 loader + `SteamTools.dll` + `host.log`（本机已冒烟）
 - [x] M2：`steamtools.toml`、工具开关、mlua、Catalog Mock、lua 扫盘/watch
 - [x] M3：SHA-256、pattern TOML、符号解析、可卸载 detour、无害自测 hook
 - [x] M4a：库 UX 状态机 + 可降级安装规划 (尚无业务 detour)
 - [x] M4b：商店「入库」按钮 (CDP 注入 + 页内队列回传) → `config/lua/stt_{app_id}.lua`
 - [x] M4c：配置页 (标签行入口 + 面板 → `steamtools.toml` 热生效，本机已冒烟)
+- [x] M6-1：`stt-catalog`、Catalog wire v1、集中校验与 AppId/DepotId 明确建模
 
 ```powershell
 cargo test
@@ -37,7 +38,8 @@ cargo build -p stt-host -p stt-loader-dwmapi -p stt-loader-xinput --release
 
 ```text
 loader (dwmapi/xinput) → stt-host
-  → stt-config (TOML + mlua) / stt-metadata / stt-platform
+  → stt-catalog (provider + wire) / stt-config (TOML + mlua + 持久化)
+  → stt-metadata / stt-platform
   → stt-core ← stt-hook（M3 脚手架）← stt-steamui + stt-steamclient（后置）
 ```
 
