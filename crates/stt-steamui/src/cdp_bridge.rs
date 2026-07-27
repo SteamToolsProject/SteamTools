@@ -75,6 +75,7 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
   btn.className="btn_blue_steamui btn_medium";
   btn.setAttribute("role","button");
   btn.setAttribute("data-stt-store-btn","1");
+  btn.setAttribute("data-stt-app", String(appId));
   btn.style.cssText="cursor:pointer;margin-left:2px;";
   var label=document.createElement("span");
   label.textContent="入库";
@@ -116,6 +117,39 @@ pub fn store_teardown_js() -> String {
     STORE_TEARDOWN_JS.to_owned()
 }
 
+/// 把一次入库结果写回商店按钮 (短脚本, 可每轮 evaluate).
+///
+/// 只改带 `data-stt-store-btn` 且 `data-stt-app` 对得上的按钮; 对不上就不动,
+/// 避免把别的 app 页按钮改错. 成功/失败都不再停在「已排队」.
+pub fn store_button_result_js(app_id: u32, ok: bool, label: &str) -> String {
+    let safe: String = label
+        .chars()
+        .map(|c| match c {
+            '\\' | '"' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
+            _ => c,
+        })
+        .take(24)
+        .collect();
+    let cls = if ok {
+        "btn_blue_steamui btn_medium"
+    } else {
+        "btn_grey_steamui btn_medium"
+    };
+    format!(
+        "(function(){{\n  var id=String({app_id});\n  \
+  var nodes=document.querySelectorAll('[data-stt-store-btn]');\n  \
+  for(var i=0;i<nodes.length;i++){{\n    var b=nodes[i];\n    \
+    var marked=b.getAttribute('data-stt-app');\n    \
+    if(marked && marked!==id) continue;\n    \
+    b.setAttribute('data-stt-app', id);\n    \
+    b.className='{cls}';\n    \
+    b.style.cursor='default';\n    \
+    var sp=b.querySelector('span');\n    \
+    if(sp) sp.textContent='{safe}';\n    \
+    else b.textContent='{safe}';\n  }}\n  return 'ok';\n}})()"
+    )
+}
+
 /// 一次轮询结果.
 #[derive(Debug, Default, Clone)]
 pub struct StoreCdpPoll {
@@ -124,6 +158,10 @@ pub struct StoreCdpPoll {
     pub injected: usize,
     pub pending_app_ids: Vec<u32>,
     pub notes: Vec<String>,
+    /// 本轮摸到的商店 app 页 (端口模式 = ws URL; 管道模式 = target id).
+    ///
+    /// 入库结果要回写按钮时, 宿主拿这份名单再 eval 一次短脚本.
+    pub store_targets: Vec<String>,
 }
 
 /// 列出调试目标并注入/取队列 (单次, 可失败).
@@ -242,6 +280,10 @@ pub fn poll_store_cdp(host_port: &str, inject_js: &str) -> StoreCdpPoll {
                     out.notes
                         .push(format!("cdp_injected ok url={}", clip(&url, 96)));
                 }
+                // 已确认是商店 app 页: 记下 ws, 供入库结果回写按钮.
+                if !out.store_targets.contains(&ws_url) {
+                    out.store_targets.push(ws_url.clone());
+                }
                 for id in res.pending {
                     if !out.pending_app_ids.contains(&id) {
                         out.pending_app_ids.push(id);
@@ -279,7 +321,7 @@ pub fn poll_store_cdp_default() -> StoreCdpPoll {
 /// 后台循环: 注入按钮, 并把点击排下的 app_id 回调出去.
 pub fn run_store_cdp_loop(
     poll_every: Duration,
-    on_app: &mut dyn FnMut(u32),
+    on_app: &mut dyn FnMut(u32) -> Option<String>,
     on_log: &mut dyn FnMut(String),
 ) {
     run_store_cdp_loop_with_js(
@@ -292,10 +334,12 @@ pub fn run_store_cdp_loop(
 }
 
 /// 同上, 但每次轮询用 `make_js()` 现生成脚本, 并可捎带配置页.
+///
+/// `on_app` 返回值: 可选的短 JS, 在本轮商店页上 evaluate, 用来改按钮文案.
 pub fn run_store_cdp_loop_with_js(
     poll_every: Duration,
     make_js: &mut dyn FnMut() -> String,
-    on_app: &mut dyn FnMut(u32),
+    on_app: &mut dyn FnMut(u32) -> Option<String>,
     on_log: &mut dyn FnMut(String),
     mut panel: Option<&mut dyn PanelBridge>,
 ) {
@@ -359,7 +403,9 @@ pub fn run_store_cdp_loop_with_js(
                 }
             }
             for app_id in r.pending_app_ids {
-                on_app(app_id);
+                if let Some(js) = on_app(app_id) {
+                    push_store_feedback_cdp(&r.store_targets, &js, on_log);
+                }
             }
         }
         // 配置页搭同一趟车; 它出问题也不能连累入库那条路.
@@ -599,6 +645,35 @@ fn session_inject_and_drain(ws_url: &str, inject_js: &str) -> Result<InjectOutco
         removed,
         pending,
     })
+}
+
+/// 在已知商店页 ws 上跑一段短脚本 (入库结果回写按钮).
+fn session_eval_js(ws_url: &str, js: &str) -> Result<(), String> {
+    let mut ws = WsClient::connect(ws_url, Duration::from_millis(1500))?;
+    ws.eval_value(js)
+        .map_err(|e| format!("eval feedback: {e}"))?;
+    Ok(())
+}
+
+/// 把反馈脚本推到本轮摸到的商店页; 失败只记 note, 不拖垮轮询.
+///
+/// `targets` 在端口模式下是完整 `ws://` URL (见 `poll_store_cdp`).
+pub fn push_store_feedback_cdp(
+    targets: &[String],
+    js: &str,
+    on_log: &mut dyn FnMut(String),
+) {
+    if js.is_empty() || targets.is_empty() {
+        return;
+    }
+    for ws_url in targets {
+        if !ws_url.starts_with("ws://") {
+            continue;
+        }
+        if let Err(e) = session_eval_js(ws_url, js) {
+            on_log(format!("catalog_add=feedback_err {e}"));
+        }
+    }
 }
 
 /// 注入脚本的返回值里, 哪些算"这轮真动了页面".
@@ -1129,6 +1204,8 @@ mod tests {
     fn cdp_js_renders_the_store_button() {
         let s = cdp_store_inject_js();
         assert!(s.contains("data-stt-store-btn"));
+        // 结果回写靠 data-stt-app 对号入座.
+        assert!(s.contains("data-stt-app"));
         // 兜底按钮要能在购买区渲染好之后搬回购物车旁.
         assert!(s.contains("data-stt-fallback"));
         assert!(s.contains("\"moved \""));
@@ -1140,6 +1217,20 @@ mod tests {
         assert!(s.contains("demo_above_purchase"));
         assert!(s.contains("data-ds-bundleid"));
         assert!(s.contains("margin-left:2px"));
+    }
+
+    #[test]
+    fn feedback_js_targets_our_button_and_escapes_label() {
+        let js = store_button_result_js(570, true, "已入库 570");
+        assert!(js.contains("data-stt-store-btn"));
+        assert!(js.contains("data-stt-app"));
+        assert!(js.contains("570"));
+        assert!(js.contains("已入库 570"));
+        // 引号/换行不能原样进脚本, 否则 evaluate 直接炸.
+        let bad = store_button_result_js(1, false, "失败: \"x\ny");
+        assert!(bad.contains("失败:  x y"));
+        assert!(!bad.contains("\"x"));
+        assert!(!bad.contains("x\ny"));
     }
 
     /// 页面 CSP 只放行 27060, 发不出去; 留着只会每次点击都报一条控制台错误.
