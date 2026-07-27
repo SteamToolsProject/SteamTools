@@ -4,6 +4,7 @@
 
 mod child_pipe;
 mod hash;
+mod http;
 mod module;
 
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ pub use child_pipe::{
     CHILD_WRITE_FD, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOW_SIZE,
 };
 pub use hash::{sha256_bytes, sha256_file};
+pub use http::{winhttp_get, HttpError, HttpResponse, WinHttpGetOptions, WinHttpTimeouts};
 pub use module::{
     enumerate_modules, main_module_base, module_handle, module_info, module_info_by_handle,
     module_path, module_path_by_name, proc_address, read_module_bytes, ModuleInfo,
