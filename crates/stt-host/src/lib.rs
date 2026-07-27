@@ -8,6 +8,7 @@
 #![allow(non_snake_case)]
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use stt_config::{
@@ -236,8 +237,11 @@ struct HostPanel {
     steam_root: std::path::PathBuf,
     state: ConfigState,
     channel: String,
-    /// 最近一次保存结果, 下一份快照带给页面.
-    note: String,
+    /// 最近一次操作结果 (配置保存 / 商店入库), 下一份快照带给页面.
+    ///
+    /// 用 `Arc<Mutex<_>>`: 商店点击回调与面板快照不在同一条借用链上,
+    /// 但必须看到同一条 note, 否则入库成败只进 host.log.
+    note: Arc<Mutex<String>>,
     /// 勘察样本只留第一份.
     recon_done: bool,
     /// 各工具的运行状态 (init 时算一次), 给工具中心显示.
@@ -245,6 +249,18 @@ struct HostPanel {
     /// 受管 app 的缓存与它对应的 rules epoch —— 算一次要扫目录, 别每轮来.
     managed: Vec<u32>,
     managed_epoch: Option<u64>,
+}
+
+fn set_shared_note(note: &Arc<Mutex<String>>, text: impl Into<String>) {
+    // poison 也恢复: note 只是 UI 文案, 丢一次旧值比卡死回调划算.
+    let mut g = note.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *g = text.into();
+}
+
+fn shared_note(note: &Arc<Mutex<String>>) -> String {
+    note.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 impl HostPanel {
@@ -285,11 +301,12 @@ impl stt_steamui::PanelBridge for HostPanel {
             tool_details: self.details.clone(),
             managed: self.managed_cached().to_vec(),
         };
+        let note = shared_note(&self.note);
         Some(ConfigSnapshot::new(
             &self.state,
             &self.steam_root,
             &self.channel,
-            &self.note,
+            &note,
             &facts,
         ))
     }
@@ -308,11 +325,11 @@ impl stt_steamui::PanelBridge for HostPanel {
             match done {
                 Ok(done) => {
                     append_host_log(&self.steam_root, &format!("config_ui=saved {done}"));
-                    self.note = format!("已保存 {done}");
+                    set_shared_note(&self.note, format!("已保存 {done}"));
                 }
                 Err(e) => {
                     append_host_log(&self.steam_root, &format!("config_ui=err {e}"));
-                    self.note = format!("失败: {e}");
+                    set_shared_note(&self.note, format!("失败: {e}"));
                 }
             }
         }
@@ -347,11 +364,12 @@ fn spawn_store_cdp_bridge(
         .name("stt-store-cdp".into())
         .spawn(move || {
             let provider = MockCatalogProvider::new().with_auto_generate(true);
+            let note = Arc::new(Mutex::new(String::new()));
             let mut panel = HostPanel {
                 steam_root: root.clone(),
                 state: state.clone(),
                 channel: channel_label(use_pipe),
-                note: String::new(),
+                note: Arc::clone(&note),
                 recon_done: false,
                 details,
                 managed: Vec::new(),
@@ -366,22 +384,42 @@ fn spawn_store_cdp_bridge(
                     stt_steamui::store_teardown_js()
                 }
             };
-            let mut on_app = |app_id: u32| {
+            // 返回值: 回写商店按钮的短 JS; 面板 note 同步一份.
+            // 当前上游是 Mock, 成功 = 元数据 lua 落盘, 不是真能下载.
+            let mut on_app = |app_id: u32| -> Option<String> {
                 match add_to_library(&state, &root, &provider, app_id) {
-                    Ok(out) => append_host_log(
-                        &root,
-                        &format!(
-                            "catalog_add=ok source=store_cdp app_id={app_id} provider={} lua={} epoch={} owned={}",
-                            out.provider_id,
-                            out.lua_path.display(),
-                            out.epoch,
-                            out.owned_count
-                        ),
-                    ),
-                    Err(e) => append_host_log(
-                        &root,
-                        &format!("catalog_add=err source=store_cdp app_id={app_id} {e}"),
-                    ),
+                    Ok(out) => {
+                        append_host_log(
+                            &root,
+                            &format!(
+                                "catalog_add=ok source=store_cdp app_id={app_id} provider={} lua={} epoch={} owned={}",
+                                out.provider_id,
+                                out.lua_path.display(),
+                                out.epoch,
+                                out.owned_count
+                            ),
+                        );
+                        set_shared_note(
+                            &note,
+                            format!(
+                                "已入库 {app_id} (Mock, owned={})",
+                                out.owned_count
+                            ),
+                        );
+                        Some(stt_steamui::store_button_result_js(
+                            app_id,
+                            true,
+                            &format!("已入库 {app_id}"),
+                        ))
+                    }
+                    Err(e) => {
+                        append_host_log(
+                            &root,
+                            &format!("catalog_add=err source=store_cdp app_id={app_id} {e}"),
+                        );
+                        set_shared_note(&note, format!("失败: 入库 {app_id}: {e}"));
+                        Some(stt_steamui::store_button_result_js(app_id, false, "失败"))
+                    }
                 }
             };
             let mut on_log = |line: String| append_host_log(&root, &line);
