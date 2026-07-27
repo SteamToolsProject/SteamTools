@@ -24,6 +24,7 @@ pub(crate) fn is_consumer_attached(capability: DownloadCapability) -> bool {
     ATTACHED.load(Ordering::SeqCst) && consumer_active(capability).load(Ordering::SeqCst)
 }
 
+#[cfg(feature = "download-request-code")]
 pub(crate) fn deactivate_consumer(capability: DownloadCapability) {
     consumer_active(capability).store(false, Ordering::SeqCst);
 }
