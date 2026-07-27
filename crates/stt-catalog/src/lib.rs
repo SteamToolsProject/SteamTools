@@ -4,11 +4,13 @@
 //! [`validate_bundle`], 才能交给配置层持久化.
 
 mod error;
+mod http;
 mod mock;
 mod validate;
 mod wire;
 
 pub use error::{CatalogError, CatalogResult, ProviderErrorKind};
+pub use http::{validate_url_template, CustomHttpCatalogProvider};
 pub use mock::MockCatalogProvider;
 pub use validate::{validate_bundle, CatalogLimits};
 pub use wire::{

@@ -14,6 +14,7 @@ sha2 = "0.10"
 # Pipes/FileSystem: DevTools pipe (CDP over inherited fd 3/4) for stt-steamui.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
@@ -23,6 +24,7 @@ windows = { version = "0.58", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+thiserror = "2"
 
 [lints]
 workspace = true
