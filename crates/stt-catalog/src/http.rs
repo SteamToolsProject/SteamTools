@@ -185,9 +185,9 @@ mod tests {
     fn options(receive_ms: u32, max_body_bytes: usize) -> WinHttpGetOptions {
         WinHttpGetOptions {
             timeouts: WinHttpTimeouts {
-                resolve_ms: 1_000,
-                connect_ms: 1_000,
-                send_ms: 1_000,
+                resolve_ms: 5_000,
+                connect_ms: 5_000,
+                send_ms: 5_000,
                 receive_ms,
             },
             max_body_bytes,
@@ -210,6 +210,7 @@ mod tests {
 
     #[test]
     fn fetches_wire_v1_from_local_http() {
+        let _guard = crate::http_test_guard();
         let server = FakeHttpServer::spawn(200, valid_body(), Duration::ZERO);
 
         let bundle = server.provider(options(1_000, 1024)).fetch(42).unwrap();
@@ -219,6 +220,7 @@ mod tests {
 
     #[test]
     fn non_success_status_is_rejected_without_parsing_body() {
+        let _guard = crate::http_test_guard();
         let server = FakeHttpServer::spawn(503, b"not-json".to_vec(), Duration::ZERO);
 
         let error = server.provider(options(1_000, 1024)).fetch(42).unwrap_err();
@@ -234,6 +236,7 @@ mod tests {
 
     #[test]
     fn receive_timeout_has_stable_classification() {
+        let _guard = crate::http_test_guard();
         let server = FakeHttpServer::spawn(200, valid_body(), Duration::from_millis(6_000));
 
         let error = server.provider(options(1_000, 1024)).fetch(42).unwrap_err();
@@ -249,6 +252,7 @@ mod tests {
 
     #[test]
     fn response_limit_is_enforced_while_reading() {
+        let _guard = crate::http_test_guard();
         let server = FakeHttpServer::spawn(200, vec![b'x'; 256], Duration::ZERO);
 
         let error = server.provider(options(1_000, 32)).fetch(42).unwrap_err();
@@ -261,6 +265,7 @@ mod tests {
 
     #[test]
     fn malformed_json_is_not_persistable_catalog() {
+        let _guard = crate::http_test_guard();
         let server = FakeHttpServer::spawn(200, b"not-json".to_vec(), Duration::ZERO);
 
         let error = server.provider(options(1_000, 1024)).fetch(42).unwrap_err();
@@ -270,6 +275,7 @@ mod tests {
 
     #[test]
     fn semantically_invalid_catalog_is_rejected() {
+        let _guard = crate::http_test_guard();
         let body = br#"{"schema_version":1,"apps":[{"app_id":7}]}"#.to_vec();
         let server = FakeHttpServer::spawn(200, body, Duration::ZERO);
 

@@ -109,7 +109,7 @@ impl ConfigSnapshot {
                 crate::CatalogMode::Disabled => "未配置".to_owned(),
                 crate::CatalogMode::CustomHttp => "CustomHttp".to_owned(),
                 crate::CatalogMode::Lua => "Lua (config/lua/catalog.lua)".to_owned(),
-                crate::CatalogMode::Community => "Community (暂不可用)".to_owned(),
+                crate::CatalogMode::Community => "Community (多源聚合)".to_owned(),
                 crate::CatalogMode::Mock => "Mock (开发模式)".to_owned(),
             },
             manifest_url: host.manifest.url,
@@ -214,11 +214,7 @@ mod tests {
         let accel = snap.tools.iter().find(|t| t.id == "store_accel").unwrap();
         assert!(!accel.enabled);
         assert!(accel.placeholder);
-        let download = snap
-            .tools
-            .iter()
-            .find(|t| t.id == "download_kit")
-            .unwrap();
+        let download = snap.tools.iter().find(|t| t.id == "download_kit").unwrap();
         assert!(!download.enabled);
         assert!(!download.placeholder);
     }

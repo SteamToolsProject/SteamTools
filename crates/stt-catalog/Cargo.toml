@@ -12,6 +12,8 @@ stt-platform = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+keyvalues-parser = "0.2.4"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [lints]
 workspace = true

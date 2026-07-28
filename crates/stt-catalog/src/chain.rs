@@ -39,17 +39,14 @@ impl CatalogProvider for CatalogProviderChain {
     fn fetch_with_trace(&self, app_id: AppId) -> CatalogResult<CatalogFetchOutcome> {
         let mut trace = Vec::with_capacity(self.providers.len());
         for provider in &self.providers {
-            match provider.fetch(app_id) {
-                Ok(bundle) => {
-                    trace.push(CatalogTraceEntry {
-                        provider: provider.id().to_owned(),
-                        outcome: CatalogTraceOutcome::Hit,
-                    });
-                    return Ok(CatalogFetchOutcome {
-                        bundle,
-                        source: provider.id().to_owned(),
-                        trace,
-                    });
+            match provider.fetch_with_trace(app_id) {
+                Ok(mut outcome) => {
+                    trace.append(&mut outcome.trace);
+                    outcome.trace = trace;
+                    return Ok(outcome);
+                }
+                Err(CatalogError::ChainExhausted { trace: mut nested }) => {
+                    trace.append(&mut nested);
                 }
                 Err(error) => trace.push(CatalogTraceEntry {
                     provider: provider.id().to_owned(),
@@ -61,7 +58,7 @@ impl CatalogProvider for CatalogProviderChain {
     }
 }
 
-fn classify_error(error: &CatalogError) -> ProviderErrorKind {
+pub(crate) fn classify_error(error: &CatalogError) -> ProviderErrorKind {
     match error {
         CatalogError::Provider { kind, .. } => *kind,
         CatalogError::RequestedAppMissing(_) => ProviderErrorKind::NotFound,

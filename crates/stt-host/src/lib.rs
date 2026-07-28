@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use stt_catalog::{
-    CatalogError, CatalogLimits, CatalogProvider, CatalogProviderChain, CatalogTraceEntry,
-    CatalogTraceOutcome, CommunityCatalogProvider, CustomHttpCatalogProvider, MockCatalogProvider,
-    ProviderErrorKind,
+    ensure_community_snapshots, CaigamerCatalogProvider, CatalogError, CatalogLimits,
+    CatalogProvider, CatalogProviderChain, CatalogTraceEntry, CatalogTraceOutcome,
+    CommunityCatalogProvider, CommunitySnapshotState, CustomHttpCatalogProvider,
+    MockCatalogProvider, ProviderErrorKind,
 };
 use stt_config::{
     add_to_library, apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent,
@@ -268,10 +269,80 @@ fn catalog_http_options(config: &CatalogSection) -> stt_platform::WinHttpRequest
     }
 }
 
-fn with_community_fallback(provider: Box<dyn CatalogProvider>) -> Box<dyn CatalogProvider> {
+fn community_provider(steam_root: &Path, config: &CatalogSection) -> CommunityCatalogProvider {
+    let request_options = catalog_http_options(config);
+    let options = stt_platform::WinHttpGetOptions {
+        timeouts: request_options.timeouts,
+        max_body_bytes: request_options.max_response_body_bytes,
+    };
+    CommunityCatalogProvider::new(stt_platform::data_dir(steam_root).join("cache"), options)
+}
+
+fn caigamer_provider(config: &CatalogSection) -> CaigamerCatalogProvider {
+    let request_options = catalog_http_options(config);
+    CaigamerCatalogProvider::new(stt_platform::WinHttpGetOptions {
+        timeouts: request_options.timeouts,
+        max_body_bytes: request_options.max_response_body_bytes,
+    })
+}
+
+fn spawn_community_snapshot_refresh(steam_root: &Path, state: &ConfigState) {
+    let host = state.host();
+    if !matches!(
+        host.catalog.mode,
+        CatalogMode::CustomHttp | CatalogMode::Lua | CatalogMode::Community
+    ) {
+        return;
+    }
+    let root = steam_root.to_path_buf();
+    let cache = stt_platform::data_dir(steam_root).join("cache");
+    let timeouts = catalog_http_options(&host.catalog).timeouts;
+    let spawn = std::thread::Builder::new()
+        .name("stt-community-cache".to_owned())
+        .spawn(move || {
+            let report = ensure_community_snapshots(&cache, timeouts);
+            append_host_log(
+                &root,
+                &format!(
+                    "community_cache=depotkeys {}",
+                    community_snapshot_text(&report.depot_keys)
+                ),
+            );
+            append_host_log(
+                &root,
+                &format!(
+                    "community_cache=appaccesstokens {}",
+                    community_snapshot_text(&report.access_tokens)
+                ),
+            );
+        });
+    if let Err(error) = spawn {
+        append_host_log(
+            steam_root,
+            &format!("community_cache=worker unavailable {error}"),
+        );
+    }
+}
+
+fn community_snapshot_text(state: &CommunitySnapshotState) -> String {
+    match state {
+        CommunitySnapshotState::Cached { entries } => format!("cached entries={entries}"),
+        CommunitySnapshotState::Downloaded { source, entries } => {
+            format!("downloaded source={source} entries={entries}")
+        }
+        CommunitySnapshotState::Unavailable => "unavailable".to_owned(),
+    }
+}
+
+fn with_community_fallback(
+    provider: Box<dyn CatalogProvider>,
+    steam_root: &Path,
+    config: &CatalogSection,
+) -> Box<dyn CatalogProvider> {
     Box::new(CatalogProviderChain::new(vec![
         provider,
-        Box::new(CommunityCatalogProvider),
+        Box::new(community_provider(steam_root, config)),
+        Box::new(caigamer_provider(config)),
     ]))
 }
 
@@ -298,7 +369,7 @@ fn build_catalog_provider(
                 config.url_template.clone(),
                 options,
             )?);
-            Ok(with_community_fallback(provider))
+            Ok(with_community_fallback(provider, steam_root, config))
         }
         CatalogMode::Lua => {
             let path = ConfigState::default_lua_dir(steam_root).join("catalog.lua");
@@ -311,11 +382,12 @@ fn build_catalog_provider(
                 options: catalog_http_options(config),
             });
             let provider = Box::new(LuaCatalogProvider::new(source, Some(client))?);
-            Ok(with_community_fallback(provider))
+            Ok(with_community_fallback(provider, steam_root, config))
         }
-        CatalogMode::Community => Ok(Box::new(CatalogProviderChain::new(vec![Box::new(
-            CommunityCatalogProvider,
-        )]))),
+        CatalogMode::Community => Ok(Box::new(CatalogProviderChain::new(vec![
+            Box::new(community_provider(steam_root, config)),
+            Box::new(caigamer_provider(config)),
+        ]))),
     }
 }
 
@@ -465,6 +537,7 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         }
     }
 
+    spawn_community_snapshot_refresh(steam_root, &state);
     log_module_hashes(steam_root);
     let patterns = log_pattern_probe(steam_root);
     let library_ux_report = log_library_ux_plan(steam_root, &state, &patterns);
