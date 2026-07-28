@@ -7,6 +7,7 @@
 // 会报 unfulfilled_lint_expectations.
 #![allow(non_snake_case)]
 
+mod host_log;
 #[cfg(feature = "download-request-code")]
 mod manifest_code;
 
@@ -17,6 +18,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use host_log::{HostLogLevel, HostLogger};
 use stt_catalog::{
     ensure_community_snapshots, CaigamerCatalogProvider, CatalogError, CatalogLimits,
     CatalogProvider, CatalogProviderChain, CatalogTraceEntry, CatalogTraceOutcome,
@@ -37,6 +39,8 @@ static LICENSE_QUEUE: OnceLock<Arc<LicenseQueue>> = OnceLock::new();
 static CONFIGURED_APPS: OnceLock<Arc<Mutex<HashSet<AppId>>>> = OnceLock::new();
 /// 库 UX 纯逻辑控制器 (CancelRemoval / QueueRemoval).
 static LIBRARY_UX: OnceLock<stt_steamui::LibraryUx> = OnceLock::new();
+/// 进程内日志写入器, 只在 init 工作线程中创建.
+static HOST_LOGGER: OnceLock<HostLogger> = OnceLock::new();
 
 fn license_queue() -> Option<Arc<LicenseQueue>> {
     LICENSE_QUEUE.get().map(Arc::clone)
@@ -440,50 +444,72 @@ fn channel_label(use_pipe: bool) -> String {
     }
 }
 
-fn append_host_log(steam_root: &Path, line: &str) {
+fn init_host_logger(steam_root: &Path) -> io::Result<()> {
+    if HOST_LOGGER.get().is_some() {
+        return Ok(());
+    }
+    let logger = HostLogger::new(&stt_platform::host_log_path(steam_root), "debug")?;
+    let _ = HOST_LOGGER.set(logger);
+    if HOST_LOGGER.get().is_some() {
+        Ok(())
+    } else {
+        Err(io::Error::other("host logger was not initialized"))
+    }
+}
+
+fn set_host_log_level(level: &str) -> bool {
+    HOST_LOGGER
+        .get()
+        .map(|logger| logger.set_level(level))
+        .unwrap_or(false)
+}
+
+fn append_host_log_at(steam_root: &Path, level: HostLogLevel, line: &str) {
+    if let Some(logger) = HOST_LOGGER.get() {
+        logger.log(steam_root, level, line);
+        return;
+    }
+
+    // init 前只有测试辅助或极早期错误会走这里, 保留同步兜底.
     let path = stt_platform::host_log_path(steam_root);
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{line}")
-        });
+        .and_then(|mut f| writeln!(f, "{line}"));
 }
 
-/// 初始化: 数据目录, 配置, 扫 lua, 写 host.log, 然后阻塞轮询监视.
+fn append_host_log(steam_root: &Path, line: &str) {
+    append_host_log_at(steam_root, HostLogLevel::infer_legacy(line), line);
+}
+
+/// 初始化: 数据目录, 配置, 扫 lua, 启动日志 writer, 然后阻塞轮询监视.
 pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     let data = stt_platform::ensure_data_dir(steam_root)?;
-    let log_path = stt_platform::host_log_path(steam_root);
-
-    let legacy_note = if stt_platform::legacy_data_dir_exists(steam_root) {
-        format!(
-            "legacy_data_dir_present={}\n",
-            stt_platform::legacy_data_dir(steam_root).display()
-        )
-    } else {
-        String::new()
-    };
+    init_host_logger(steam_root)?;
+    append_host_log(steam_root, "host_init=starting");
 
     let state = match bootstrap_config(steam_root) {
         Ok(s) => s,
         Err(e) => {
-            let body = format!(
-                "SteamTools host init\n\
-                 steam_root={}\n\
-                 data_dir={}\n\
-                 host_config=(config error: {e})\n\
-                 {legacy}\
-                 status=init failed\n",
-                steam_root.display(),
-                data.display(),
-                legacy = legacy_note,
+            append_host_log(
+                steam_root,
+                &format!(
+                    "host_init=failed data_dir={} config_error={e}",
+                    data.display()
+                ),
             );
-            std::fs::write(&log_path, body)?;
             return Ok(());
         }
     };
+    let log_level = state.host().log.level;
+    if !set_host_log_level(&log_level) {
+        append_host_log_at(
+            steam_root,
+            HostLogLevel::Error,
+            &format!("host_init=invalid_log_level value={log_level} fallback=debug"),
+        );
+    }
 
     // 抢在 Steam 拉起 steamwebhelper 之前装 CreateProcessW hook (ADR 0010).
     // 必须是配置就绪后的第一件事: 后面 SHA-256 两个大 DLL 要几百毫秒, 等不起.
@@ -503,34 +529,23 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     config_lines.push_str(&catalog_mode_line(&state));
     config_lines.push('\n');
 
-    let body = format!(
-        "SteamTools host init\n\
-         steam_root={steam_root}\n\
-         data_dir={data_dir}\n\
-         host_config={cfg_path}\n\
-         {tools}\
-         lua_dirs={lua_dirs}\n\
-         lua_files_ok={lua_files_ok}\n\
-         lua_files_err={lua_files_err}\n\
-         owned_count={owned_count}\n\
-         rules_epoch={rules_epoch}\n\
-         {legacy}\
-         status=init bootstrapped (hooks/package still loading)\n\
-         watch=pending debounce_ms={debounce_ms} poll_ms={poll_ms}\n",
-        steam_root = steam_root.display(),
-        data_dir = data.display(),
-        cfg_path = cfg_path,
-        tools = config_lines,
-        lua_dirs = lua_report.dirs_scanned,
-        lua_files_ok = lua_report.files_ok,
-        lua_files_err = lua_report.files_err,
-        owned_count = state.owned_count(),
-        rules_epoch = state.rules_epoch(),
-        legacy = legacy_note,
-        debounce_ms = WATCH_DEBOUNCE.as_millis(),
-        poll_ms = WATCH_POLL.as_millis(),
+    append_host_log(
+        steam_root,
+        &format!(
+            "host_init=bootstrapped data_dir={} host_config={} {} lua_dirs={} lua_files_ok={} lua_files_err={} owned_count={} rules_epoch={} legacy_data_dir_present={} watch=pending debounce_ms={} poll_ms={}",
+            data.display(),
+            cfg_path,
+            config_lines.trim(),
+            lua_report.dirs_scanned,
+            lua_report.files_ok,
+            lua_report.files_err,
+            state.owned_count(),
+            state.rules_epoch(),
+            stt_platform::legacy_data_dir_exists(steam_root),
+            WATCH_DEBOUNCE.as_millis(),
+            WATCH_POLL.as_millis(),
+        ),
     );
-    std::fs::write(&log_path, body)?;
 
     if lua_report.files_err > 0 {
         for e in &lua_report.errors {
@@ -2126,6 +2141,16 @@ fn run_watch_loop(
         if host_changed {
             match state.load_host_from_steam_root(steam_root) {
                 Ok(()) => {
+                    let log_level = state.host().log.level;
+                    if !set_host_log_level(&log_level) {
+                        append_host_log_at(
+                            steam_root,
+                            HostLogLevel::Error,
+                            &format!(
+                                "reload=invalid_log_level value={log_level} keeping_previous_level"
+                            ),
+                        );
+                    }
                     append_host_log(
                         steam_root,
                         &format!(
