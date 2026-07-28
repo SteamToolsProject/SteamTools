@@ -779,6 +779,7 @@ struct HostPanel {
     catalog_jobs: SyncSender<CatalogJob>,
     /// 受管 app 的缓存与它对应的 rules epoch —— 算一次要扫目录, 别每轮来.
     managed: Vec<u32>,
+    managed_names: std::collections::BTreeMap<u32, String>,
     managed_epoch: Option<u64>,
 }
 
@@ -802,6 +803,7 @@ impl HostPanel {
         let epoch = self.state.rules_epoch();
         if self.managed_epoch != Some(epoch) {
             self.managed = stt_config::managed_apps(&self.state, &self.steam_root);
+            self.managed_names = stt_config::app_names(&self.steam_root, &self.managed);
             self.managed_epoch = Some(epoch);
         }
         &self.managed
@@ -840,6 +842,7 @@ impl stt_steamui::PanelBridge for HostPanel {
         let facts = stt_config::HostFacts {
             tool_details: self.details.clone(),
             managed: self.managed_cached().to_vec(),
+            managed_names: self.managed_names.clone(),
         };
         let note = shared_note(&self.note);
         Some(ConfigSnapshot::new(
@@ -916,6 +919,7 @@ fn spawn_store_cdp_bridge(
                 details,
                 catalog_jobs: catalog_jobs.clone(),
                 managed: Vec::new(),
+                managed_names: std::collections::BTreeMap::new(),
                 managed_epoch: None,
             };
             // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.

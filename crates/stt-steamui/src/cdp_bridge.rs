@@ -16,7 +16,7 @@ use crate::config_panel::{
     PanelState, ViewRole, LIBRARY_MENU_DRAIN_JS,
 };
 use crate::store_debug::cdp_host_port;
-use crate::store_inject::STORE_INJECT_JS;
+use crate::store_inject::{app_id_from_store_path, STORE_INJECT_JS};
 
 pub(crate) const DRAIN_JS: &str = r#"(function(){var p=window.__SteamToolsPending||[];window.__SteamToolsPending=[];return p;})()"#;
 
@@ -29,7 +29,7 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
 (function(){
   window.__SteamToolsPending = window.__SteamToolsPending || [];
   var href = String(location.href||"");
-  var m = String(location.pathname||"").match(/\/app\/(\d+)/) || href.match(/\/app\/(\d+)/);
+  var m = String(location.pathname||"").match(/^\/app\/(\d+)(?:\/|$)/);
   var appId = m ? m[1] : null;
   if(!appId) return "no-appid";
   // 购买区: 按钮放进本体的 .game_purchase_action_bg, 与「添加至购物车」同一行.
@@ -462,7 +462,16 @@ pub(crate) fn poll_panel_cdp(
             )),
         }
     }
-    poll_library_menu_cdp(&targets, bridge, state, on_log);
+    // 右键后 Steam 才创建独立 popup; 重新取一次 target, 不必等下一轮.
+    let refreshed = if state.pending_menu().is_some() {
+        list_page_targets(host_port)
+            .ok()
+            .filter(|targets| !targets.is_empty())
+    } else {
+        None
+    };
+    let menu_targets = refreshed.as_deref().unwrap_or(&targets);
+    poll_library_menu_cdp(menu_targets, bridge, state, on_log);
 }
 
 fn poll_library_menu_cdp(
@@ -693,12 +702,18 @@ pub(crate) fn hosts_nav_entry(url: &str, title: &str) -> bool {
 }
 
 pub(crate) fn is_store_app_url(url: &str) -> bool {
-    // 商店 CEF 页: 只要 store.steampowered.com 就注入.
-    // 脚本内再解析 /app/<id>; 过严的 /app/ 过滤会漏掉 SPA/重定向中间态.
-    if url.contains("agecheck") {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
         return false;
-    }
-    url.contains("store.steampowered.com")
+    };
+    let Some((host, path)) = rest.split_once('/') else {
+        return false;
+    };
+    host == "store.steampowered.com"
+        && !path.starts_with("agecheck/")
+        && app_id_from_store_path(&format!("/{path}")).is_some()
 }
 
 /// 一次页面注入的结果.
@@ -715,7 +730,7 @@ fn session_inject_and_drain(ws_url: &str, inject_js: &str) -> Result<InjectOutco
     let mut ws = WsClient::connect(ws_url, Duration::from_millis(1500))?;
     // 先看是不是商店 app 页, 不是则秒退 (省时间).
     let probe = ws.eval_value(
-        r#"(function(){var h=String(location.href||"");var p=String(location.pathname||"");return /store\.steampowered\.com/.test(h)&&/\/app\/\d+/.test(p||h);})()"#,
+        r#"(function(){var h=String(location.href||"");var p=String(location.pathname||"");return /store\.steampowered\.com/.test(h)&&/^\/app\/\d+(?:\/|$)/.test(p);})()"#,
     );
     match probe {
         Ok(v) if v.as_bool() == Some(true) => {}
@@ -1290,7 +1305,10 @@ mod tests {
         assert!(is_store_app_url(
             "https://store.steampowered.com/app/3240220/GTA/"
         ));
-        assert!(is_store_app_url("https://store.steampowered.com/"));
+        assert!(!is_store_app_url("https://store.steampowered.com/"));
+        assert!(!is_store_app_url(
+            "https://store.steampowered.com/news/app/593110/"
+        ));
         assert!(!is_store_app_url(
             "https://store.steampowered.com/agecheck/app/3240220/"
         ));

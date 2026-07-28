@@ -1,5 +1,6 @@
 //! 配置页要显示的一份只读快照 (宿主推给页面, 页面不自己算).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
@@ -14,7 +15,7 @@ pub struct ToolView {
     pub id: &'static str,
     pub name: &'static str,
     pub enabled: bool,
-    /// 占位工具: 开关能拨, 但还没有实现.
+    /// 占位工具: 功能尚未实现, 页面应显示为禁用开关.
     pub placeholder: bool,
     /// 这个工具此刻在干什么 / 为什么没干成.
     ///
@@ -33,6 +34,8 @@ pub struct HostFacts {
     pub tool_details: ToolDetails,
     /// 我们自己入库的 app; 由宿主按 rules epoch 缓存, 见 [`managed_apps`].
     pub managed: Vec<u32>,
+    /// 受管 app 的本地显示名称, 找不到时由页面回退到 AppId.
+    pub managed_names: BTreeMap<u32, String>,
 }
 
 /// 配置页一次渲染需要的全部数据.
@@ -61,6 +64,8 @@ pub struct ConfigSnapshot {
     ///
     /// 库里右键要用它判断"这一项是不是我们加的" —— 不是我们加的就别抢 Steam 的菜单.
     pub managed: Vec<u32>,
+    /// `AppId -> Steam 显示名称`, 只来自本机 appinfo 缓存.
+    pub managed_names: BTreeMap<u32, String>,
 }
 
 impl ConfigSnapshot {
@@ -70,6 +75,8 @@ impl ConfigSnapshot {
             managed: managed_apps(state, steam_root),
             ..HostFacts::default()
         };
+        let mut facts = facts;
+        facts.managed_names = crate::app_names(steam_root, &facts.managed);
         Self::new(state, steam_root, channel, note, &facts)
     }
 
@@ -123,6 +130,7 @@ impl ConfigSnapshot {
             channel: channel.to_owned(),
             note: note.to_owned(),
             managed: facts.managed.clone(),
+            managed_names: facts.managed_names.clone(),
         }
     }
 }

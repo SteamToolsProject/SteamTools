@@ -12,27 +12,9 @@ pub const STORE_INJECT_JS: &str = r##"
   window.__SteamToolsPending = window.__SteamToolsPending || [];
 
   function appIdFromLocation() {
-    var href = String(location.href || "");
     var path = String(location.pathname || "");
-    var m =
-      path.match(/\/(?:agecheck\/)?app\/(\d+)/) ||
-      href.match(/\/(?:agecheck\/)?app\/(\d+)/) ||
-      href.match(/[?&]appid=(\d+)/i);
-    if (m) return m[1];
-    var el =
-      document.querySelector("[data-appid]") ||
-      document.querySelector("#review_appid") ||
-      document.querySelector("input[name='appid']") ||
-      document.querySelector("div.game_area_purchase [data-ds-appid]") ||
-      document.querySelector("[data-ds-appid]");
-    if (el) {
-      var v =
-        el.getAttribute("data-appid") ||
-        el.getAttribute("data-ds-appid") ||
-        el.value;
-      if (v && /^\d+$/.test(String(v))) return String(v);
-    }
-    return null;
+    var m = path.match(/^\/(?:agecheck\/)?app\/(\d+)(?:\/|$)/);
+    return m ? m[1] : null;
   }
 
   function isOwnedUi() {
@@ -186,40 +168,18 @@ pub fn app_id_from_store_path(path_or_url: &str) -> Option<u32> {
     } else {
         s
     };
-    // /app/123 /agecheck/app/123
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i + 5 < bytes.len() {
-        if bytes[i] == b'/'
-            && i + 4 < bytes.len()
-            && &path[i + 1..i + 4] == "app"
-            && bytes[i + 4] == b'/'
-        {
-            let start = i + 5;
-            let mut end = start;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > start {
-                if let Ok(id) = path[start..end].parse::<u32>() {
-                    return Some(id);
-                }
-            }
-        }
-        // agecheck/app/
-        if path[i..].starts_with("/agecheck/app/") {
-            let start = i + "/agecheck/app/".len();
-            let mut end = start;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > start {
-                return path[start..end].parse().ok();
-            }
-        }
-        i += 1;
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let path = path.strip_prefix("/agecheck").unwrap_or(path);
+    let rest = path.strip_prefix("/app/")?;
+    let bytes = rest.as_bytes();
+    let end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(bytes.len());
+    if end == 0 || (end < bytes.len() && bytes[end] != b'/') {
+        return None;
     }
-    None
+    rest[..end].parse().ok()
 }
 
 #[cfg(test)]
@@ -239,6 +199,10 @@ mod tests {
             Some(3240220)
         );
         assert_eq!(app_id_from_store_path("/app/570"), Some(570));
+        assert_eq!(
+            app_id_from_store_path("https://store.steampowered.com/news/app/593110/"),
+            None
+        );
         assert_eq!(
             app_id_from_store_path("https://steamloopback.host/index.html"),
             None
