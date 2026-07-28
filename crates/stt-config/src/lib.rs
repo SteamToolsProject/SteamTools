@@ -1,5 +1,6 @@
 //! 宿主配置: TOML, 工具注册表, Catalog 落盘, 可选 Lua DSL.
 
+mod appinfo;
 mod catalog_add;
 mod error;
 mod host_toml;
@@ -9,16 +10,17 @@ mod tools;
 mod watch;
 
 #[cfg(feature = "lua")]
-mod lua_dsl;
+mod lua_catalog;
 #[cfg(feature = "lua")]
-mod lua_load;
+mod lua_dsl;
 #[cfg(feature = "lua")]
 mod lua_http;
 #[cfg(feature = "lua")]
-mod lua_manifest_code;
+mod lua_load;
 #[cfg(feature = "lua")]
-mod lua_catalog;
+mod lua_manifest_code;
 
+pub use appinfo::app_names;
 #[cfg(feature = "lua")]
 pub use catalog_add::remove_from_library;
 pub use catalog_add::{
@@ -47,13 +49,13 @@ pub use lua_http::{
     LuaHttpClient, LuaHttpErrorKind, LuaHttpMethod, LuaHttpRequest, LuaHttpResponse,
 };
 #[cfg(feature = "lua")]
-pub use lua_manifest_code::{
-    LuaManifestCodeErrorKind, LuaManifestCodeExecutor, LuaManifestCodeResult,
-};
-#[cfg(feature = "lua")]
 pub use lua_load::{
     default_lua_dir, list_lua_files, list_lua_files_in_dirs, load_lua_directories, lua_search_dirs,
     LuaLoadReport,
+};
+#[cfg(feature = "lua")]
+pub use lua_manifest_code::{
+    LuaManifestCodeErrorKind, LuaManifestCodeExecutor, LuaManifestCodeResult,
 };
 
 use std::path::{Path, PathBuf};

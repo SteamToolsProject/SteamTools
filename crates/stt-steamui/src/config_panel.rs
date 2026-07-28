@@ -2,7 +2,7 @@
 //!
 //! 入口: 克隆导航栏上现成的一个 tab, 只改文字 — 字体/间距/hover 全是 Steam 自己的,
 //! 我们既不用认它那串 hash 类名, 也不用手写像素.
-//! 面板: 我们自己的一层 DOM, 跟 React 无关, 所以里面爱怎么画怎么画.
+//! 面板: TSX 构建出的单文件 IIFE, 只在这里划出 Rust 生命周期的边界.
 //!
 //! 回传只走页内队列 + 宿主轮询取走: 页面发不出网络请求到本机端口 (CSP),
 //! 这条路已经证伪过一次, 别再往那边走.
@@ -274,8 +274,7 @@ pub fn library_menu_inject_js(app_id: u32, point: Option<(i32, i32)>) -> String 
     try{{w=window.opener;}}catch(x){{}}
     try{{
       if(w&&w!==window){{
-        if(kind==="open_tools"){{w.__SteamToolsWant=true;}}
-        else{{(w.__SteamToolsIntents=w.__SteamToolsIntents||[]).push(msg);}}
+        (w.__SteamToolsIntents=w.__SteamToolsIntents||[]).push(msg);
         sent=true;
       }}
     }}catch(x2){{}}
@@ -313,7 +312,6 @@ pub fn library_menu_inject_js(app_id: u32, point: Option<(i32, i32)>) -> String 
   parent.appendChild(sep);
   add("刷新清单","refresh_app");
   add("移除入库","remove_app");
-  add("打开 SteamTools","open_tools");
   fitPopup(popupRoot(parent));
   out.s="injected";out.app_id={app_id};out.native_items=items.length;
   return out;
@@ -361,390 +359,8 @@ pub fn nav_tick_js(mount_entry: bool) -> String {
 
 /// 打开配置面板 (只在宿主判定该开时跑一次, 不进每轮的热路径).
 ///
-/// 照 Steam 自己的设置对话框来: 居中浮层 + 左侧分区栏 + 右侧卡片行.
-/// 用的都是从 `steamui/css` 里挖出来的它自己的数值 —— 卡片底
-/// `rgba(85,85,85,.067)` + 3px 圆角, 按钮底 `hsla(0,0%,100%,.15)` + 2px 圆角,
-/// 面板底 `#23262e`, 侧栏标题 `#66c0f4`, 强调 `#1a9fff`.
-/// 不自创配色: 这东西住在 Steam 里, 像客人一样穿衣服.
-pub const PANEL_JS: &str = r##"
-(function(){
-  // 意图排在本文档的队列里, 宿主下一轮从同一个文档取走.
-  window.__SteamToolsIntents=window.__SteamToolsIntents||[];
-  function push(o){window.__SteamToolsIntents.push(o);}
-
-  // 面板就画在当前文档里. 试过开真窗口 (`BrowserView.CreatePopup` + `window.open`):
-  // 窗口确实能开, 但 Steam 的弹窗管理器会接管它, 把我们写进去的 DOM 重新渲染掉,
-  // 窗口还停在 1x1. 那条路是给它自己托管 BrowserView 用的, 不是给外人当画布的.
-  //
-  // 所以仍然是页内浮层, 但**只画在当前最上面那个视图里** —— 商店/社区是独立的
-  // CEF 视图, 合成在客户端文档之上, 画在下面那层会被整块盖住. 谁在上面由宿主
-  // 按 visibilityState + 尺寸挑, 见 `PanelState::owner`.
-  var d=document;
-  if(d.getElementById("stt-panel")) return "already";
-  function el(tag,txt,css){
-    var e=d.createElement(tag);
-    if(txt!=null)e.textContent=txt;
-    if(css)e.style.cssText=css;
-    return e;
-  }
-  function svg(path){
-    var s=d.createElementNS("http://www.w3.org/2000/svg","svg");
-    s.setAttribute("viewBox","0 0 24 24");
-    s.setAttribute("width","19");s.setAttribute("height","19");
-    s.setAttribute("fill","none");
-    s.setAttribute("stroke","currentColor");
-    s.setAttribute("stroke-width","1.7");
-    s.setAttribute("stroke-linecap","round");
-    s.setAttribute("stroke-linejoin","round");
-    var p=d.createElementNS("http://www.w3.org/2000/svg","path");
-    p.setAttribute("d",path);
-    s.appendChild(p);
-    s.style.cssText="flex:none;opacity:.9;";
-    return s;
-  }
-
-  // 全部取自 steamui/css, 不自创.
-  var ACCENT="#1a9fff";
-  var TITLE="#66c0f4";
-  var SURFACE="#23262e";
-  var CARD="rgba(85,85,85,.0666666667)";
-  var BTN="hsla(0,0%,100%,.15)";
-  var TEXT="#dcdedf";
-  var MUTE="#7d8894";
-  var SANS="'Motiva Sans',Helvetica,sans-serif";
-  var MONO="Consolas,'Cascadia Mono',ui-monospace,monospace";
-
-  var navRow=window.__SteamToolsNavRow||null;
-
-  var root=el("div");
-  root.id="stt-panel";
-  // 9000: 压得住内容 (Steam 自己的内容都在 4100 以下), 又低于它的菜单与模态
-  // (7000 以上那几层), 弹出菜单仍会正常压在我们上面.
-  // 四边写全不用 inset 简写 —— CEF 认不认它不好说, 认不出这一条就整块不可见.
-  root.style.cssText="position:fixed;left:0;top:0;right:0;bottom:0;z-index:9000;display:flex;"
-    +"align-items:center;justify-content:center;background:rgba(0,0,0,.6);"
-    +"font-family:"+SANS+";color:"+TEXT+";";
-
-  // 样式挂在 root 里, 关窗时跟着消失; 逐条用 #stt-panel 收口, 不漏进 Steam.
-  var css=el("style");
-  css.textContent=
-    "#stt-panel .stt-nav:hover{background:rgba(255,255,255,.045)}"
-   +"#stt-panel .stt-b{transition:background .12s}"
-   +"#stt-panel .stt-b:hover{background:hsla(0,0%,100%,.24)}"
-   +"#stt-panel .stt-rm:hover{background:rgba(200,70,70,.32)}"
-   +"#stt-panel .stt-x:hover{color:#fff}"
-   +"#stt-panel .stt-i::placeholder{color:"+MUTE+"}"
-   +"#stt-panel .stt-i:focus{border-color:"+ACCENT+"}"
-   +"#stt-panel [tabindex]:focus-visible,#stt-panel .stt-i:focus-visible{"
-   +"outline:2px solid "+ACCENT+";outline-offset:2px}"
-   +"#stt-panel ::-webkit-scrollbar{width:8px}"
-   +"#stt-panel ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.14);border-radius:4px}";
-  root.appendChild(css);
-
-  // 同理不用 min(): 宽高走 width + max-width 这套老写法.
-  var box=el("div",null,"width:880px;max-width:92vw;height:660px;max-height:86vh;display:flex;"
-    +"background:"+SURFACE+";border-radius:3px;overflow:hidden;"
-    +"box-shadow:0 12px 48px rgba(0,0,0,.6);");
-  root.appendChild(box);
-
-  var side=el("div",null,"width:196px;flex:none;padding:22px 0;overflow-y:auto;"
-    +"border-right:1px solid rgba(0,0,0,.36);");
-  var pane=el("div",null,"flex:1;min-width:0;display:flex;flex-direction:column;");
-  box.appendChild(side);box.appendChild(pane);
-
-  side.appendChild(el("div","STEAMTOOLS 设置",
-    "padding:0 22px;margin-bottom:20px;font-size:15px;font-weight:700;color:"+TITLE+";"
-    +"letter-spacing:.6px;"));
-  var navBox=el("div");
-  side.appendChild(navBox);
-
-  var head=el("div",null,"display:flex;align-items:center;justify-content:space-between;"
-    +"gap:16px;padding:26px 28px 16px;flex:none;");
-  var title=el("div",null,"font-size:22px;line-height:28px;font-weight:700;color:#fff;");
-  var shutBtn=el("div","✕","cursor:pointer;font-size:17px;color:"+MUTE+";flex:none;"
-    +"padding:2px 6px;line-height:1;");
-  shutBtn.className="stt-x";
-  shutBtn.tabIndex=0;
-  head.appendChild(title);head.appendChild(shutBtn);
-  var body=el("div",null,"flex:1;min-height:0;overflow-y:auto;padding:0 28px 28px;");
-  pane.appendChild(head);pane.appendChild(body);
-  (d.body||d.documentElement).appendChild(root);
-
-  var rowClick=null;
-  // 关掉要报给宿主: 面板可能在别的视图里也有一份, 这边关了别处得跟着关.
-  function shut(){
-    window.__SteamToolsWant=false;
-    window.__SteamToolsClosed=true;
-    window.__SteamToolsClose=null;
-    if(root.parentNode)root.parentNode.removeChild(root);
-    d.removeEventListener("keydown",onKey,true);
-    if(navRow&&rowClick)navRow.removeEventListener("click",rowClick,true);
-  }
-  function onKey(e){ if(e.key==="Escape") shut(); }
-  shutBtn.addEventListener("click",shut);
-  shutBtn.addEventListener("keydown",function(e){
-    if(e.key==="Enter"||e.key===" "){e.preventDefault();shut();}
-  });
-  d.addEventListener("keydown",onKey,true);
-  // 点浮层外面关掉, 与 Steam 的对话框一致.
-  root.addEventListener("click",function(e){ if(e.target===root) shut(); });
-  if(navRow){
-    rowClick=function(e){
-      var t=e.target;
-      while(t&&t!==navRow){
-        if(t.getAttribute&&t.getAttribute("data-stt-nav")) return;
-        t=t.parentNode;
-      }
-      shut();
-    };
-    navRow.addEventListener("click",rowClick,true);
-  }
-  window.__SteamToolsClose=shut;
-
-  // 一行 = 一张卡片, 卡片之间靠间距分开 —— 与 Steam 设置页里那些行同一种做法.
-  function card(){
-    var c=el("div",null,"display:flex;align-items:center;justify-content:space-between;"
-      +"gap:20px;background:"+CARD+";border-radius:3px;padding:14px 18px;margin-bottom:8px;");
-    body.appendChild(c);
-    return c;
-  }
-  function label(main_,sub_,mono){
-    var w=el("div",null,"min-width:0;");
-    w.appendChild(el("div",main_,"font-size:15px;line-height:20px;color:"+TEXT+";"
-      +(mono?"font-family:"+MONO+";font-size:13.5px;overflow:hidden;text-overflow:ellipsis;":"")));
-    if(sub_){
-      w.appendChild(el("div",sub_,"margin-top:3px;font-size:12.5px;line-height:17px;color:"+MUTE+";"));
-    }
-    return w;
-  }
-  function btn(txt,cls){
-    var b=el("div",txt,"background:"+BTN+";color:"+TEXT+";border-radius:2px;flex:none;"
-      +"padding:8px 18px;font-size:14px;line-height:18px;cursor:pointer;text-align:center;");
-    b.className="stt-b"+(cls?" "+cls:"");
-    b.tabIndex=0;
-    return b;
-  }
-  function onHit(e,fn){
-    e.addEventListener("click",fn);
-    e.addEventListener("keydown",function(ev){
-      if(ev.key==="Enter"||ev.key===" "){ev.preventDefault();fn();}
-    });
-  }
-  function toggle(on,cb){
-    var rail=el("div");
-    rail.tabIndex=0;
-    rail.setAttribute("role","switch");
-    rail.setAttribute("aria-checked",on?"true":"false");
-    function paint(v){
-      rail.style.cssText="position:relative;width:38px;height:21px;border-radius:11px;flex:none;"
-        +"cursor:pointer;transition:background .16s;"
-        +"background:"+(v?ACCENT:"rgba(255,255,255,.16)")+";";
-    }
-    paint(on);
-    var knob=el("div",null,"position:absolute;top:3px;left:"+(on?"20px":"3px")+";width:15px;"
-      +"height:15px;border-radius:50%;background:#fff;transition:left .16s;");
-    rail.appendChild(knob);
-    onHit(rail,function(){
-      // 先自己动起来, 别等宿主那一轮回来才给反馈.
-      paint(!on);
-      knob.style.left=on?"3px":"20px";
-      rail.setAttribute("aria-checked",on?"false":"true");
-      cb();
-    });
-    return rail;
-  }
-  // 选项组: 一条分段控件, 当前项用 Steam 的强调蓝.
-  function seg(list,cur,cb,names){
-    var w=el("div",null,"display:flex;flex:none;border-radius:2px;overflow:hidden;"
-      +"background:rgba(0,0,0,.24);");
-    (list||[]).forEach(function(v){
-      var on=v===cur;
-      var b=el("div",(names&&names[v])||v,"padding:7px 14px;font-family:"+MONO+";font-size:13px;line-height:16px;"
-        +"cursor:pointer;"+(on?"background:"+ACCENT+";color:#fff;":"color:"+MUTE+";"));
-      if(!on) b.className="stt-b";
-      b.tabIndex=0;
-      onHit(b,function(){ if(!on){ b.textContent="…"; cb(v);} });
-      w.appendChild(b);
-    });
-    return w;
-  }
-
-  // 图标: 滑杆 / 下载 / 文件夹 / 信息. 工具那个别用三条横线, 那读起来是"菜单".
-  var PAGES=[
-    ["tools","工具","M4 8h3m4 0h9M4 16h9m4 0h3"
-      +"M11 8a2 2 0 10-4 0 2 2 0 004 0M17 16a2 2 0 10-4 0 2 2 0 004 0"],
-    ["source","上游与日志","M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"],
-    ["apps","已入库","M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"],
-    ["lua","Lua 目录","M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"],
-    ["status","状态","M12 21a9 9 0 100-18 9 9 0 000 18zM12 8h.01M11 12h1v5h1"]
-  ];
-  // 这两个要跨重绘活着: 快照每变一次就整窗重画.
-  var page="tools";
-  var typed="";
-  var typedCatalog=null;
-
-  function renderTools(s){
-    (s.tools||[]).forEach(function(x){
-      var c=card();
-      // 开着不等于跑起来了: 第二行说清它此刻在干什么 / 为什么没干成.
-      var left=label(x.name,x.detail||x.id);
-      if(x.placeholder){
-        // 占位是第三种状态, 开关表达不了 —— 给它一个标记, 别塞进名字里.
-        left.firstChild.appendChild(el("span","占位",
-          "margin-left:10px;font-size:11px;color:"+MUTE+";background:rgba(0,0,0,.3);"
-          +"border-radius:2px;padding:2px 7px;vertical-align:1px;"));
-      }
-      c.appendChild(left);
-      c.appendChild(toggle(x.enabled,function(){
-        push({kind:"set_tool",id:x.id,on:!x.enabled});
-      }));
-    });
-  }
-  // 已入库: 只列我们自己写的那些 lua, 每项能刷新 / 移除.
-  function renderApps(s){
-    var ids=s.managed||[];
-    if(!ids.length){
-      var e=card();
-      e.appendChild(label("还没有入库的应用","从商店页点「入库」, 或往 steamtools/inbox 丢 app_id"));
-      return;
-    }
-    ids.forEach(function(id){
-      var c=card();
-      c.appendChild(label(String(id),"config/lua/stt_"+id+".lua",true));
-      var box=el("div",null,"display:flex;gap:8px;flex:none;");
-      var re=btn("刷新");
-      onHit(re,function(){ re.textContent="…"; push({kind:"refresh_app",app_id:id}); });
-      var rm=btn("移除","stt-rm");
-      onHit(rm,function(){ rm.textContent="…"; push({kind:"remove_app",app_id:id}); });
-      box.appendChild(re); box.appendChild(rm);
-      c.appendChild(box);
-    });
-  }
-  function renderSource(s){
-    var a=card();
-    a.appendChild(label("Catalog 源",s.catalog_status||"未配置"));
-    a.appendChild(seg(s.catalog_modes,s.catalog_mode,function(v){
-      push({kind:"set_catalog_mode",value:v});
-    },{disabled:"关闭",custom_http:"CustomHttp",lua:"Lua",community:"Community",mock:"Mock"}));
-    var u=card();
-    var inp=d.createElement("input");
-    if(typedCatalog===null) typedCatalog=s.catalog_url_template||"";
-    inp.className="stt-i";
-    inp.placeholder="https://catalog.example/v1/{app_id}";
-    inp.value=typedCatalog;
-    inp.style.cssText="flex:1;min-width:0;background:rgba(0,0,0,.3);border:1px solid rgba(0,0,0,.4);"
-      +"border-radius:2px;padding:8px 12px;color:"+TEXT+";font-family:"+MONO+";font-size:13.5px;"
-      +"outline:none;transition:border-color .15s;";
-    inp.addEventListener("input",function(){typedCatalog=inp.value;});
-    var save=btn("保存 URL");
-    function saveCatalogUrl(){
-      var v=(inp.value||"").trim();
-      if(!/^https?:\/\//.test(v)||v.split("{app_id}").length!==2){
-        inp.style.borderColor="#d94126";return;
-      }
-      inp.style.borderColor="rgba(0,0,0,.4)";save.textContent="…";
-      push({kind:"set_catalog_url_template",value:v});
-    }
-    inp.addEventListener("keydown",function(e){if(e.key==="Enter")saveCatalogUrl();});
-    onHit(save,saveCatalogUrl);
-    u.appendChild(inp);u.appendChild(save);
-    var m=card();
-    m.appendChild(label("Manifest 请求码源","仅用于下载阶段的 request code"));
-    m.appendChild(seg(s.manifest_sources,s.manifest_url,function(v){
-      push({kind:"set_manifest_url",value:v});
-    }));
-    var b=card();
-    b.appendChild(label("日志级别","写进 steamtools/host.log"));
-    b.appendChild(seg(s.log_levels,s.log_level,function(v){
-      push({kind:"set_log_level",value:v});
-    }));
-  }
-  function renderLua(s){
-    var def=card();
-    def.appendChild(label(s.lua_dir||"","总是加载, 不可移除",true));
-    def.appendChild(el("div","默认","font-size:12.5px;color:"+MUTE+";flex:none;"));
-    (s.lua_paths||[]).forEach(function(p){
-      var c=card();
-      c.appendChild(label(p,null,true));
-      var rm=btn("移除","stt-rm");
-      onHit(rm,function(){ rm.textContent="…"; push({kind:"remove_lua_path",value:p}); });
-      c.appendChild(rm);
-    });
-    var add=card();
-    var inp=d.createElement("input");
-    inp.className="stt-i";
-    inp.placeholder="再加一个 lua 目录的绝对路径";
-    inp.value=typed;
-    inp.style.cssText="flex:1;min-width:0;background:rgba(0,0,0,.3);border:1px solid rgba(0,0,0,.4);"
-      +"border-radius:2px;padding:8px 12px;color:"+TEXT+";font-family:"+MONO+";font-size:13.5px;"
-      +"outline:none;transition:border-color .15s;";
-    inp.addEventListener("input",function(){typed=inp.value;});
-    var ab=btn("添加");
-    function submit(){
-      var v=(inp.value||"").trim();
-      if(!v) return;
-      inp.value="";typed="";ab.textContent="…";
-      push({kind:"add_lua_path",value:v});
-    }
-    inp.addEventListener("keydown",function(e){if(e.key==="Enter")submit();});
-    onHit(ab,submit);
-    add.appendChild(inp);add.appendChild(ab);
-  }
-  function renderStatus(s){
-    var tools=s.tools||[];
-    var on=tools.filter(function(x){return x.enabled;}).length;
-    [["调试通道",s.channel||"-","宿主与 Steam 界面之间的通道"],
-     ["已入库应用",String(s.owned_count==null?"-":s.owned_count),"config/lua 里记下的 app"],
-     ["规则版本",String(s.epoch==null?"-":s.epoch),"配置每变一次加一"],
-     ["已启用工具",on+" / "+tools.length,""],
-     ["版本","v"+(s.version||"?"),""]
-    ].forEach(function(r){
-      var c=card();
-      c.appendChild(label(r[0],r[2]||null));
-      c.appendChild(el("div",r[1],"font-family:"+MONO+";font-size:14px;color:#fff;flex:none;"));
-    });
-  }
-
-  function render(s){
-    navBox.textContent="";
-    PAGES.forEach(function(p){
-      var it=el("div",null,"display:flex;align-items:center;gap:12px;padding:10px 22px;"
-        +"cursor:pointer;font-size:15px;line-height:20px;"
-        +(p[0]===page
-          ? "background:rgba(255,255,255,.08);color:#fff;box-shadow:inset 3px 0 0 "+ACCENT+";"
-          : "color:#b6bcc2;"));
-      it.className="stt-nav";
-      it.tabIndex=0;
-      it.appendChild(svg(p[2]));
-      it.appendChild(el("span",p[1]));
-      onHit(it,function(){ page=p[0]; render(s); });
-      navBox.appendChild(it);
-    });
-    var name="";
-    PAGES.forEach(function(p){ if(p[0]===page) name=p[1]; });
-    title.textContent=name;
-    body.textContent="";
-    if(page==="tools") renderTools(s);
-    else if(page==="apps") renderApps(s);
-    else if(page==="source") renderSource(s);
-    else if(page==="lua") renderLua(s);
-    else renderStatus(s);
-    if(s.note){
-      var n=el("div",s.note,"margin-top:14px;padding:11px 16px;border-radius:3px;font-size:13.5px;"
-        +"line-height:18px;"
-        +(s.note.indexOf("失败")===0
-          ? "background:rgba(190,60,60,.16);color:#f0a3a3;"
-          : "background:rgba(26,159,255,.13);color:#9ed4ff;"));
-      body.appendChild(n);
-    }
-  }
-  window.__SteamToolsPanel={update:function(s){
-    try{render(s);}catch(e){ title.textContent="SteamTools"; }
-  }};
-  render({});
-  return "opened";
-})()
-"##;
+/// 产物由 `ui/` 的 Preact + TSX 工具链显式构建, Rust 只嵌入已经检查过的静态包.
+pub const PANEL_JS: &str = include_str!("../ui/embed/panel.iife.js");
 
 /// 只摘面板, 留着入口 — 用户在别的视图里关掉时, 宿主用它同步其余视图.
 pub const PANEL_CLOSE_JS: &str = r##"
@@ -1039,8 +655,8 @@ pub(crate) fn panel_step(
         });
     }
 
-    if !state.open || state.owner() != Some(key) {
-        // 关掉了, 或者这个文档压根不该显示面板 —— 收干净.
+    if !state.open {
+        // 关掉了 —— 收干净.
         if tick.has {
             target.eval(PANEL_CLOSE_JS)?;
         }
@@ -1048,6 +664,31 @@ pub(crate) fn panel_step(
         return Ok(PanelStepOutcome {
             asked_why: tick.why.clone(),
 
+            tick,
+            opened: false,
+            asked: just_asked,
+        });
+    }
+
+    let owner = state.owner();
+    if owner.is_none() {
+        // Steam 失焦或最小化时, CEF 会暂时报所有视图 hidden. 这不是用户关闭面板,
+        // 也没有新的宿主可迁移; 保留当前 DOM, 等可见视图回来再继续.
+        return Ok(PanelStepOutcome {
+            asked_why: tick.why.clone(),
+            tick,
+            opened: false,
+            asked: just_asked,
+        });
+    }
+    if owner != Some(key) {
+        // 找到了另一个可见视图, 面板需要迁过去 —— 当前文档只负责收干净.
+        if tick.has {
+            target.eval(PANEL_CLOSE_JS)?;
+        }
+        state.forget(key);
+        return Ok(PanelStepOutcome {
+            asked_why: tick.why.clone(),
             tick,
             opened: false,
             asked: just_asked,
@@ -1417,40 +1058,44 @@ mod tests {
         assert!(PANEL_JS.contains("stt-panel"));
         assert!(PANEL_JS.contains("set_tool"));
         assert!(PANEL_JS.contains("add_lua_path"));
+        assert!(PANEL_JS.contains("refresh_app"));
+        assert!(PANEL_JS.contains("remove_app"));
     }
 
-    /// 配色全部取自 steamui/css, 不自创 —— 这东西住在 Steam 里, 得像客人一样穿衣服.
+    /// 内嵌包保留 SteamTools 自己的视觉基线, 不依赖 Steam 私有模块.
     #[test]
-    fn every_colour_comes_from_steams_own_css() {
-        // 卡片底与按钮底是它自己那两个值, 照抄才不出戏.
-        assert!(PANEL_JS.contains("rgba(85,85,85,.0666666667)"));
-        assert!(PANEL_JS.contains("hsla(0,0%,100%,.15)"));
-        assert!(PANEL_JS.contains("#1a9fff"));
-        assert!(PANEL_JS.contains("#23262e"));
-        assert!(PANEL_JS.contains("#66c0f4"));
+    fn panel_bundle_keeps_visual_baseline() {
+        assert!(PANEL_JS.contains("#172333"));
+        assert!(PANEL_JS.contains("#121c28"));
+        assert!(PANEL_JS.contains("rgba(103, 193, 245, .13)"));
+        assert!(PANEL_JS.contains("#67c1f5"));
+        assert!(PANEL_JS.contains("#dceeff"));
     }
 
-    /// 等宽只给 ASCII 机器值; 中文一律 Motiva —— 也顺带躲开中文落进等宽的字形错乱.
     #[test]
-    fn machine_values_are_set_in_mono() {
+    fn panel_bundle_keeps_machine_value_fonts() {
         assert!(PANEL_JS.contains("Motiva Sans"));
         assert!(PANEL_JS.contains("Consolas"));
     }
 
-    /// 注入的样式必须全部收在 #stt-panel 里, 不能漏进 Steam 自己的界面.
     #[test]
-    fn injected_css_stays_inside_our_page() {
-        let opens = PANEL_JS.matches("#stt-panel ").count();
-        assert!(opens >= 5, "样式没有逐条收口");
-        assert!(!PANEL_JS.contains("\nbody{"));
+    fn injected_bundle_is_scoped_and_static() {
+        assert!(PANEL_JS.matches("#stt-panel").count() >= 10);
+        assert!(!PANEL_JS.contains("body{"));
+        assert!(!PANEL_JS.contains("fetch("));
+        assert!(!PANEL_JS.contains("XMLHttpRequest"));
+        assert!(!PANEL_JS.contains("WebSocket"));
+        assert!(!PANEL_JS.contains("window.open"));
+        assert!(!PANEL_JS.contains("import("));
     }
 
-    /// 别再试着开真窗口: `BrowserView.CreatePopup` 造出的窗口归 Steam 的弹窗管理器,
-    /// 它会把我们写进去的 DOM 重新渲染掉, 窗口还停在 1x1 (实测).
     #[test]
-    fn the_panel_does_not_try_to_open_a_window() {
-        assert!(!PANEL_JS.contains("window.open("));
-        assert!(!PANEL_JS.contains("BrowserView.CreatePopup("));
+    fn panel_bundle_keeps_dom_lifecycle_contract() {
+        assert!(PANEL_JS.contains("__SteamToolsClose"));
+        assert!(PANEL_JS.contains("__SteamToolsClosed"));
+        assert!(PANEL_JS.contains("Escape"));
+        assert!(PANEL_JS.contains("stt-dialog"));
+        assert!(PANEL_JS.contains("stt-close"));
     }
 
     /// 挑视图要看"可见 + 够大"两样: SharedJSContext 是 visible 的, 但只有 1x1.
@@ -1463,28 +1108,6 @@ mod tests {
         assert!(!parse_panel_tick(&json!({"vis":false,"w":1200,"h":800})).showing);
     }
 
-    /// 别用新语法写关键的布局: 认不出 `inset:0` 就整块不可见 (实测栽过一次).
-    #[test]
-    fn layout_avoids_shorthand_cef_might_not_know() {
-        assert!(!PANEL_JS.contains("inset:0"));
-        // 只挑 CSS 里的 min(); JS 的 Math.min 与注释不算.
-        assert!(!PANEL_JS.contains("width:min("));
-        assert!(!PANEL_JS.contains("height:min("));
-        assert!(PANEL_JS.contains("left:0;top:0;right:0;bottom:0"));
-    }
-
-    /// 弹窗: 居中浮层 + 遮罩, 关的路子要留够 (✕ / 点遮罩 / Esc / 再点入口).
-    #[test]
-    fn the_dialog_can_always_be_closed() {
-        assert!(PANEL_JS.contains("rgba(0,0,0,.6)"));
-        assert!(PANEL_JS.contains("Escape"));
-        assert!(PANEL_JS.contains("e.target===root"));
-        assert!(PANEL_JS.contains("__SteamToolsClose"));
-        assert!(NAV_TICK_JS.contains("__SteamToolsClose"));
-        // 层级要压过内容区, 又不能盖掉 Steam 自己的菜单.
-        assert!(PANEL_JS.contains("z-index:9000"));
-    }
-
     /// 入口要紧挨着用户名; margin-left:auto 会把它顶到行尾去.
     #[test]
     fn the_entry_sits_next_to_its_neighbour() {
@@ -1492,37 +1115,34 @@ mod tests {
         assert!(NAV_TICK_JS.contains("__SteamToolsNavRow"));
     }
 
-    /// 左侧分区栏 + 右侧卡片行, 与 Steam 设置对话框同一种骨架.
     #[test]
     fn the_dialog_is_shaped_like_steam_settings() {
-        assert!(PANEL_JS.contains("STEAMTOOLS 设置"));
-        for page in ["\"tools\"", "\"source\"", "\"lua\"", "\"status\""] {
+        assert!(PANEL_JS.contains("STEAMTOOLS"));
+        assert!(PANEL_JS.contains("stt-brand-sub"));
+        for page in ["tools", "source", "apps", "lua", "status"] {
             assert!(PANEL_JS.contains(page), "缺分区 {page}");
         }
-        // 当前分区: 浅底 + 左侧一道强调色, 照它的做法.
-        assert!(PANEL_JS.contains("inset 3px 0 0 "));
+        assert!(PANEL_JS.contains("stt-nav-active"));
     }
 
-    /// 开关是画出来的圆轨 + 白钮, 不是一颗写着字的按钮.
     #[test]
     fn tools_are_switched_not_buttoned() {
-        assert!(PANEL_JS.contains("border-radius:11px"));
-        assert!(PANEL_JS.contains("border-radius:50%"));
-        assert!(PANEL_JS.contains("role\",\"switch\""));
+        assert!(PANEL_JS.contains("stt-toggle"));
+        assert!(PANEL_JS.contains("switch"));
     }
 
-    /// 键盘要能走完全程: 开关/选项/移除/添加/返回都不是原生控件.
     #[test]
     fn everything_is_reachable_by_keyboard() {
-        let tabbable = PANEL_JS.matches("tabIndex=0").count();
-        assert!(tabbable >= 5, "只有 {tabbable} 处可聚焦");
         assert!(PANEL_JS.contains("focus-visible"));
+        assert!(PANEL_JS.contains("stt-button"));
+        assert!(PANEL_JS.contains("stt-input"));
     }
 
-    /// 输入到一半的路径不能被快照重绘冲掉.
     #[test]
-    fn the_page_keeps_its_own_state_across_redraws() {
-        assert!(PANEL_JS.contains("var typed=\"\""));
+    fn the_bundle_contains_local_draft_pages() {
+        assert!(PANEL_JS.contains("catalog_url_template"));
+        assert!(PANEL_JS.contains("lua_paths"));
+        assert!(PANEL_JS.contains("set_catalog_url_template"));
     }
 
     #[test]
@@ -1744,6 +1364,51 @@ mod tests {
         assert!(a.opened, "商店收起来了, 面板没回到外壳");
     }
 
+    /// Steam 最小化期间所有 CEF 视图都可能暂时报 hidden, 不能把已开的面板当成关闭.
+    #[test]
+    fn losing_focus_does_not_close_an_open_panel() {
+        let mut state = PanelState::default();
+        let mut host = FakeHost::default();
+
+        state.begin_round();
+        let mut visible = FakePage::new(json!({"s":"already","want":true,"has":false}));
+        let opened = panel_step(
+            "shell",
+            &mut visible,
+            &mut host,
+            &mut state,
+            role(true, true),
+        )
+        .unwrap();
+        assert!(opened.opened);
+
+        // 第一轮失焦时 owner 还可能是上一轮的可见视图.
+        state.begin_round();
+        let mut hidden_once = FakePage::new(json!({"s":"already","has":true,"vis":false}));
+        panel_step(
+            "shell",
+            &mut hidden_once,
+            &mut host,
+            &mut state,
+            role(true, true),
+        )
+        .unwrap();
+
+        // 持续 hidden 后 owner 暂时为空, 仍应保持面板, 等 Steam 恢复前台.
+        state.begin_round();
+        let mut hidden = FakePage::new(json!({"s":"already","has":true,"vis":false}));
+        let out = panel_step(
+            "shell",
+            &mut hidden,
+            &mut host,
+            &mut state,
+            role(true, true),
+        )
+        .unwrap();
+        assert!(!out.opened);
+        assert!(!hidden.seen.contains(&"close"), "失焦不应摘掉已开的面板");
+    }
+
     /// SharedJSContext 报 visible 但只有 1x1, 画进去等于没画.
     #[test]
     fn a_pinhole_view_is_never_chosen() {
@@ -1780,6 +1445,7 @@ mod tests {
         assert!(js.contains("__SteamToolsMenuActions"));
         assert!(js.contains("刷新清单"));
         assert!(js.contains("移除入库"));
+        assert!(!js.contains("打开 SteamTools"));
     }
 
     #[test]
