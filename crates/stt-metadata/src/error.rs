@@ -9,6 +9,8 @@ pub enum MetadataError {
     },
     #[error("toml parse error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("json parse error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("invalid metadata: {0}")]
     Invalid(String),
     #[error("pattern set unavailable for module")]
