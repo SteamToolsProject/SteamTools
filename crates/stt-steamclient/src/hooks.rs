@@ -85,10 +85,7 @@ fn package_hooks_enabled_by_env() -> bool {
 }
 
 /// 进程内共享运行时 (host init 时注册一次).
-pub fn register_runtime(
-    queue: Arc<LicenseQueue>,
-    configured: Arc<Mutex<HashSet<AppId>>>,
-) {
+pub fn register_runtime(queue: Arc<LicenseQueue>, configured: Arc<Mutex<HashSet<AppId>>>) {
     let _ = RUNTIME.set(PackageRuntime {
         queue,
         configured,
@@ -281,34 +278,29 @@ pub fn try_install_package_hooks(
 
     // # Safety
     // 地址来自 pattern RVA; InlineHook 只改入口 12 字节绝对 jmp.
-    let mut get_package = match unsafe {
-        InlineHook::new(gpi_addr, hk_get_package_info as *const c_void)
-    } {
-        Ok(h) => h,
-        Err(e) => return report.with_detail(format!("GetPackageInfo hook new: {e}")),
-    };
+    let mut get_package =
+        match unsafe { InlineHook::new(gpi_addr, hk_get_package_info as *const c_void) } {
+            Ok(h) => h,
+            Err(e) => return report.with_detail(format!("GetPackageInfo hook new: {e}")),
+        };
     if let Err(e) = unsafe { get_package.attach() } {
         return report.with_detail(format!("GetPackageInfo attach failed: {e}"));
     }
 
-    let mut check = match unsafe {
-        InlineHook::new(check_addr, hk_check_app_ownership as *const c_void)
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = unsafe { get_package.detach() };
-            return report.with_detail(format!("CheckAppOwnership hook new: {e}"));
-        }
-    };
+    let mut check =
+        match unsafe { InlineHook::new(check_addr, hk_check_app_ownership as *const c_void) } {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = unsafe { get_package.detach() };
+                return report.with_detail(format!("CheckAppOwnership hook new: {e}"));
+            }
+        };
     if let Err(e) = unsafe { check.attach() } {
         let _ = unsafe { get_package.detach() };
         return report.with_detail(format!("CheckAppOwnership attach failed: {e}"));
     }
 
-    *slot = Some(PackageHooks {
-        check,
-        get_package,
-    });
+    *slot = Some(PackageHooks { check, get_package });
     ATTACHED.store(true, Ordering::SeqCst);
     report.status = PackageInstallStatus::HooksAttached;
     report.with_detail(
@@ -373,11 +365,7 @@ unsafe extern "C" fn hk_get_package_info(
 
 /// # Safety
 /// 作为 CheckAppOwnership detour; `p_own` 指向至少 APP_OWNERSHIP_SIZE 的可写缓冲.
-unsafe extern "C" fn hk_check_app_ownership(
-    this: *mut c_void,
-    app_id: u32,
-    p_own: *mut u8,
-) -> u8 {
+unsafe extern "C" fn hk_check_app_ownership(this: *mut c_void, app_id: u32, p_own: *mut u8) -> u8 {
     CHECK_HITS.fetch_add(1, Ordering::Relaxed);
     if !this.is_null() {
         C_USER.store(this, Ordering::SeqCst);
@@ -410,7 +398,11 @@ unsafe extern "C" fn hk_check_app_ownership(
         OwnershipRewrite::LeaveOriginal => result,
         OwnershipRewrite::MarkSteamOwned => {
             unsafe {
-                write_u32(p_own, app_ownership::RELEASE_STATE, APP_RELEASE_STATE_RELEASED);
+                write_u32(
+                    p_own,
+                    app_ownership::RELEASE_STATE,
+                    APP_RELEASE_STATE_RELEASED,
+                );
             }
             result
         }

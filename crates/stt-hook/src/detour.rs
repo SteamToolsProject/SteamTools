@@ -293,11 +293,7 @@ fn fixup_stolen_for_call_frame(code: &mut [u8]) {
             continue;
         }
         // mov [rax+disp8], r32: 89 50 dd / 89 48 dd 等 (mod=01, r/m=000=rax)
-        if rax_is_rsp
-            && i + 2 < code.len()
-            && code[i] == 0x89
-            && (code[i + 1] & 0xC7) == 0x40
-        {
+        if rax_is_rsp && i + 2 < code.len() && code[i] == 0x89 && (code[i + 1] & 0xC7) == 0x40 {
             code[i + 2] = code[i + 2].wrapping_add(8);
             i += 3;
             continue;
@@ -325,11 +321,7 @@ fn fixup_stolen_for_call_frame(code: &mut [u8]) {
             continue;
         }
         // sub rsp, imm8: 48 83 EC xx
-        if i + 3 < code.len()
-            && code[i] == 0x48
-            && code[i + 1] == 0x83
-            && code[i + 2] == 0xEC
-        {
+        if i + 3 < code.len() && code[i] == 0x48 && code[i + 1] == 0x83 && code[i + 2] == 0xEC {
             rax_is_rsp = false;
             i += 4;
             continue;
