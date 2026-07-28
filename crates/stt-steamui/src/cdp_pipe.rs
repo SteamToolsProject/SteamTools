@@ -18,10 +18,13 @@ use serde_json::{json, Value};
 use stt_platform::DevToolsPipe;
 
 use crate::cdp_bridge::{
-    hosts_nav_entry, is_mount_news, is_store_app_url, log_panel_step, parse_pending_app_ids,
-    wants_panel_tick, StoreCdpPoll, DRAIN_JS,
+    hosts_nav_entry, is_mount_news, is_popup_menu_target, is_store_app_url, log_panel_step,
+    parse_pending_app_ids, wants_panel_tick, StoreCdpPoll, DRAIN_JS,
 };
-use crate::config_panel::{panel_step, EvalTarget, PanelBridge, PanelState, ViewRole};
+use crate::config_panel::{
+    apply_library_menu_drain, library_menu_inject_js, panel_step, EvalTarget, PanelBridge,
+    PanelState, ViewRole, LIBRARY_MENU_DRAIN_JS,
+};
 
 /// 单次 CDP 调用的等待上限.
 ///
@@ -360,7 +363,7 @@ pub(crate) fn poll_panel_pipe(
         return;
     };
     state.begin_round();
-    for t in targets {
+    for t in &targets {
         if t.kind != "page" && t.kind != "iframe" {
             continue;
         }
@@ -382,6 +385,94 @@ pub(crate) fn poll_panel_pipe(
         match stepped {
             Ok(out) => log_panel_step(&out, &t.title, on_log),
             Err(e) => on_log(format!("config_ui=page_err {e}")),
+        }
+    }
+    poll_library_menu_pipe(session, &targets, bridge, state, on_log);
+}
+
+fn poll_library_menu_pipe(
+    session: &mut CdpPipeSession,
+    targets: &[PipeTarget],
+    bridge: &mut dyn PanelBridge,
+    state: &mut PanelState,
+    on_log: &mut dyn FnMut(String),
+) {
+    if let Some((key, app_id)) = state
+        .active_menu()
+        .map(|(key, app_id)| (key.to_owned(), app_id))
+    {
+        let Some(target) = targets.iter().find(|target| target.target_id == key) else {
+            state.clear_active_menu();
+            return;
+        };
+        let result = session.attach(&target.target_id).and_then(|sid| {
+            let value = session.eval_value(&sid, LIBRARY_MENU_DRAIN_JS);
+            session.detach(&sid);
+            value
+        });
+        match result {
+            Ok(value) => {
+                let (alive, dropped) = apply_library_menu_drain(&value, app_id, bridge, state);
+                if dropped > 0 {
+                    on_log(format!("config_ui=library_menu dropped_actions={dropped}"));
+                }
+                if !alive {
+                    state.clear_active_menu();
+                }
+            }
+            Err(_) => state.clear_active_menu(),
+        }
+    }
+
+    let Some((source_key, app_id, point)) = state
+        .pending_menu()
+        .map(|(key, app_id, point)| (key.to_owned(), app_id, point))
+    else {
+        return;
+    };
+    if let Some(target) = targets.iter().find(|target| target.target_id == source_key) {
+        let result = session.attach(&target.target_id).and_then(|sid| {
+            let value = session.eval_value(&sid, &library_menu_inject_js(app_id, point));
+            session.detach(&sid);
+            value
+        });
+        if let Ok(value) = result {
+            let status = value.get("s").and_then(Value::as_str).unwrap_or("invalid");
+            if matches!(status, "injected" | "already") {
+                state.activate_menu(&target.target_id, app_id);
+                on_log(format!(
+                    "config_ui=library_menu {status} app_id={app_id} target=source"
+                ));
+                return;
+            }
+        }
+    }
+    for target in targets
+        .iter()
+        .filter(|target| is_popup_menu_target(&target.url, &target.title))
+    {
+        let result = session.attach(&target.target_id).and_then(|sid| {
+            let value = session.eval_value(&sid, &library_menu_inject_js(app_id, None));
+            session.detach(&sid);
+            value
+        });
+        let Ok(value) = result else {
+            continue;
+        };
+        let status = value.get("s").and_then(Value::as_str).unwrap_or("invalid");
+        if matches!(status, "injected" | "already") {
+            state.activate_menu(&target.target_id, app_id);
+            on_log(format!(
+                "config_ui=library_menu {status} app_id={app_id} title={}",
+                target.title.chars().take(32).collect::<String>()
+            ));
+            return;
+        }
+        if status != "hidden" {
+            on_log(format!(
+                "config_ui=library_menu waiting state={status} title={}",
+                target.title.chars().take(32).collect::<String>()
+            ));
         }
     }
 }
