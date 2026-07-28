@@ -1393,7 +1393,7 @@ fn tool_details(
         CatalogMode::Disabled => "Catalog 未配置",
         CatalogMode::CustomHttp => "Catalog: CustomHttp",
         CatalogMode::Lua => "Catalog: Lua (config/lua/catalog.lua)",
-        CatalogMode::Community => "Catalog: Community 暂不可用",
+        CatalogMode::Community => "Catalog: Community 多源聚合",
         CatalogMode::Mock => "Catalog: Mock 开发模式",
     };
     let mut d = stt_config::ToolDetails::new();
@@ -1698,6 +1698,17 @@ fn run_watch_loop(
                         report.attach_detail().unwrap_or("not attached")
                     ),
                 );
+            }
+        }
+        if package_rearm_ticks.is_multiple_of(8) && stt_steamclient::is_attached() {
+            if let Some(queue) = license_queue().filter(|queue| !queue.is_fake_license_ready()) {
+                let plan = stt_steamclient::notify_license_changed(&queue);
+                if queue.is_fake_license_ready() {
+                    append_host_log(
+                        steam_root,
+                        &format!("package=startup_sync {}", plan.summary_line()),
+                    );
+                }
             }
         }
 
