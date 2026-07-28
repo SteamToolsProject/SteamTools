@@ -67,7 +67,9 @@ mod tests {
         assert_eq!(app_ownership::EXIST_IN_PACKAGE_NUMS, 0x14);
         assert_eq!(app_ownership::B_OWNS_LICENSE, 0x24);
         assert_eq!(app_ownership::B_FREE_LICENSE, 0x28);
-        assert!(app_ownership::B_FREE_LICENSE < APP_OWNERSHIP_SIZE);
+        const {
+            assert!(app_ownership::B_FREE_LICENSE < APP_OWNERSHIP_SIZE);
+        }
     }
 
     #[test]
