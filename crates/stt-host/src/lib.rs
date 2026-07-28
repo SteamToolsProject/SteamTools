@@ -784,7 +784,9 @@ struct HostPanel {
 
 fn set_shared_note(note: &Arc<Mutex<String>>, text: impl Into<String>) {
     // poison 也恢复: note 只是 UI 文案, 丢一次旧值比卡死回调划算.
-    let mut g = note.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut g = note
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *g = text.into();
 }
 
@@ -1148,7 +1150,10 @@ fn setup_package_layer(
             ),
         );
     } else {
-        append_host_log(steam_root, "package=hooks not attached (logic-only or failed)");
+        append_host_log(
+            steam_root,
+            "package=hooks not attached (logic-only or failed)",
+        );
     }
     report
 }
@@ -1437,10 +1442,7 @@ fn tool_details(
         ToolId::ConfigUi.as_str(),
         format!("就是这个界面, 经 {}", channel_label(use_pipe)),
     );
-    d.insert(
-        ToolId::DownloadKit.as_str(),
-        download.detail_for_ui(),
-    );
+    d.insert(ToolId::DownloadKit.as_str(), download.detail_for_ui());
     d.insert(
         ToolId::StoreAccel.as_str(),
         format!("尚未实现; 原生注入路径: {:?}", native.status),
@@ -1674,8 +1676,7 @@ fn run_watch_loop(
             && package_rearm_ticks.is_multiple_of(8)
             && state.tools().is_enabled(ToolId::CatalogAdd)
         {
-            let report =
-                stt_steamclient::try_install_package_hooks(&state.tools(), &patterns);
+            let report = stt_steamclient::try_install_package_hooks(&state.tools(), &patterns);
             if stt_steamclient::is_attached() {
                 package_attached_logged = true;
                 append_host_log(steam_root, &report.summary_line());
@@ -1851,15 +1852,13 @@ fn run_watch_loop(
         {
             let mut report = build_download_report(state, &patterns);
             stt_steamclient::try_install_manifest_code_hooks(&mut report, &patterns);
-            let request_code = report.capabilities.iter().find(|item| {
-                item.capability == stt_steamclient::DownloadCapability::RequestCode
-            });
+            let request_code = report
+                .capabilities
+                .iter()
+                .find(|item| item.capability == stt_steamclient::DownloadCapability::RequestCode);
             if stt_steamclient::is_manifest_code_hook_attached() {
                 request_code_attached_logged = true;
-                append_host_log(
-                    steam_root,
-                    "download_request_code=hooks attached on rearm",
-                );
+                append_host_log(steam_root, "download_request_code=hooks attached on rearm");
             } else if package_rearm_ticks == 8
                 || package_rearm_ticks == 40
                 || package_rearm_ticks.is_multiple_of(80)
@@ -1872,9 +1871,7 @@ fn run_watch_loop(
                     .unwrap_or("not attached");
                 append_host_log(
                     steam_root,
-                    &format!(
-                        "download_request_code=rearm waiting status={status} detail={detail}"
-                    ),
+                    &format!("download_request_code=rearm waiting status={status} detail={detail}"),
                 );
             }
         }
