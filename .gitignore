@@ -57,6 +57,7 @@ Desktop.ini
 .chat/
 .copilot/
 **/__pycache__/
+**/node_modules/
 *.agent.md.bak
 *.prompt.md.bak
 .repomix*
