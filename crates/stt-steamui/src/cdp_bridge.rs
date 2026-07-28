@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::config_panel::{panel_step, EvalTarget, PanelBridge, PanelState, ViewRole};
+use crate::config_panel::{
+    apply_library_menu_drain, library_menu_inject_js, panel_step, EvalTarget, PanelBridge,
+    PanelState, ViewRole, LIBRARY_MENU_DRAIN_JS,
+};
 use crate::store_debug::cdp_host_port;
 use crate::store_inject::STORE_INJECT_JS;
 
@@ -439,7 +442,7 @@ pub(crate) fn poll_panel_cdp(
         return;
     };
     state.begin_round();
-    for t in targets {
+    for t in &targets {
         if !wants_panel_tick(&t.url, &t.title) {
             continue;
         }
@@ -457,6 +460,84 @@ pub(crate) fn poll_panel_cdp(
                 "config_ui=page_err title={} {e}",
                 clip(&t.title, 32)
             )),
+        }
+    }
+    poll_library_menu_cdp(&targets, bridge, state, on_log);
+}
+
+fn poll_library_menu_cdp(
+    targets: &[PageTarget],
+    bridge: &mut dyn PanelBridge,
+    state: &mut PanelState,
+    on_log: &mut dyn FnMut(String),
+) {
+    if let Some((key, app_id)) = state
+        .active_menu()
+        .map(|(key, app_id)| (key.to_owned(), app_id))
+    {
+        let Some(target) = targets.iter().find(|target| target.key == key) else {
+            state.clear_active_menu();
+            return;
+        };
+        match WsClient::connect(&target.ws, Duration::from_millis(1500))
+            .and_then(|mut page| page.eval(LIBRARY_MENU_DRAIN_JS))
+        {
+            Ok(value) => {
+                let (alive, dropped) = apply_library_menu_drain(&value, app_id, bridge, state);
+                if dropped > 0 {
+                    on_log(format!("config_ui=library_menu dropped_actions={dropped}"));
+                }
+                if !alive {
+                    state.clear_active_menu();
+                }
+            }
+            Err(_) => state.clear_active_menu(),
+        }
+    }
+
+    let Some((source_key, app_id, point)) = state
+        .pending_menu()
+        .map(|(key, app_id, point)| (key.to_owned(), app_id, point))
+    else {
+        return;
+    };
+    if let Some(target) = targets.iter().find(|target| target.key == source_key) {
+        let result = WsClient::connect(&target.ws, Duration::from_millis(1500))
+            .and_then(|mut page| page.eval(&library_menu_inject_js(app_id, point)));
+        if let Ok(value) = result {
+            let status = value.get("s").and_then(Value::as_str).unwrap_or("invalid");
+            if matches!(status, "injected" | "already") {
+                state.activate_menu(&target.key, app_id);
+                on_log(format!(
+                    "config_ui=library_menu {status} app_id={app_id} target=source"
+                ));
+                return;
+            }
+        }
+    }
+    for target in targets
+        .iter()
+        .filter(|target| is_popup_menu_target(&target.url, &target.title))
+    {
+        let result = WsClient::connect(&target.ws, Duration::from_millis(1500))
+            .and_then(|mut page| page.eval(&library_menu_inject_js(app_id, None)));
+        let Ok(value) = result else {
+            continue;
+        };
+        let status = value.get("s").and_then(Value::as_str).unwrap_or("invalid");
+        if matches!(status, "injected" | "already") {
+            state.activate_menu(&target.key, app_id);
+            on_log(format!(
+                "config_ui=library_menu {status} app_id={app_id} title={}",
+                clip(&target.title, 32)
+            ));
+            return;
+        }
+        if status != "hidden" {
+            on_log(format!(
+                "config_ui=library_menu waiting state={status} title={}",
+                clip(&target.title, 32)
+            ));
         }
     }
 }
@@ -483,6 +564,9 @@ pub(crate) fn log_panel_step(
     }
     if out.opened {
         on_log("config_ui=panel opened".into());
+    }
+    if let Some(app_id) = out.tick.menu_app_id {
+        on_log(format!("config_ui=library_menu captured app_id={app_id}"));
     }
     if out.tick.dropped > 0 {
         on_log(format!("config_ui=dropped_intents n={}", out.tick.dropped));
@@ -582,6 +666,13 @@ pub(crate) fn classify_target(url: &str, title: &str) -> TargetKind {
     TargetKind::Skip
 }
 
+/// Steam 的弹出菜单是独立 target. Supernav 菜单不是库右键菜单候选.
+pub(crate) fn is_popup_menu_target(url: &str, title: &str) -> bool {
+    title.contains("Menu")
+        && !title.contains("Supernav")
+        && (url.starts_with("about:blank") || url.starts_with("data:text/html"))
+}
+
 /// 配置页这一轮要问哪些文档.
 ///
 /// 客户端外壳之外还要带上商店/社区那些网页视图: 它们是独立的 CEF 视图, 被合成在
@@ -658,11 +749,7 @@ fn session_eval_js(ws_url: &str, js: &str) -> Result<(), String> {
 /// 把反馈脚本推到本轮摸到的商店页; 失败只记 note, 不拖垮轮询.
 ///
 /// `targets` 在端口模式下是完整 `ws://` URL (见 `poll_store_cdp`).
-pub fn push_store_feedback_cdp(
-    targets: &[String],
-    js: &str,
-    on_log: &mut dyn FnMut(String),
-) {
+pub fn push_store_feedback_cdp(targets: &[String], js: &str, on_log: &mut dyn FnMut(String)) {
     if js.is_empty() || targets.is_empty() {
         return;
     }
@@ -1160,6 +1247,16 @@ mod tests {
             classify_target("https://steamcommunity.com/app/570", "Community"),
             TargetKind::Skip
         );
+    }
+
+    #[test]
+    fn library_popup_target_is_narrower_than_the_general_menu_skip() {
+        assert!(is_popup_menu_target("about:blank", "Library Context Menu"));
+        assert!(!is_popup_menu_target("about:blank", "Supernav Menu"));
+        assert!(!is_popup_menu_target(
+            "https://store.steampowered.com/app/570",
+            "Library Context Menu"
+        ));
     }
 
     /// 没有 userGesture, CEF 会把 `window.open` 当成广告弹窗拦掉 —— 配置页就退回
