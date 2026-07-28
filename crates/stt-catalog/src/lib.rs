@@ -3,14 +3,17 @@
 //! 该 crate 不执行 HTTP, 也不负责 Lua/TOML 落盘. provider 返回的数据必须先通过
 //! [`validate_bundle`], 才能交给配置层持久化.
 
+mod caigamer;
 mod chain;
 mod community;
 mod error;
 mod http;
 mod mock;
+mod snapshot;
 mod validate;
 mod wire;
 
+pub use caigamer::CaigamerCatalogProvider;
 pub use chain::CatalogProviderChain;
 pub use community::CommunityCatalogProvider;
 pub use error::{
@@ -18,12 +21,20 @@ pub use error::{
 };
 pub use http::{validate_url_template, CustomHttpCatalogProvider};
 pub use mock::MockCatalogProvider;
+pub use snapshot::{ensure_community_snapshots, CommunitySnapshotReport, CommunitySnapshotState};
 pub use validate::{validate_bundle, CatalogLimits};
 pub use wire::{
     parse_catalog_wire_v1, CatalogAppV1, CatalogDepotV1, CatalogManifestV1, CatalogWireV1,
 };
 
 use stt_core::{AppId, CatalogBundle};
+
+#[cfg(test)]
+pub(crate) fn http_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Catalog 获取结果及 provider chain 诊断.
 #[derive(Debug, Clone)]
