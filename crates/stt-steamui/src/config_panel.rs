@@ -32,7 +32,7 @@ fn surface_side(v: &Value, key: &str) -> f64 {
 pub const NAV_TICK_JS: &str = r##"
 (function(){
   var d=document,b=d.body;
-  var out={s:"empty",want:false,has:false,q:[]};
+  var out={s:"empty",want:false,has:false,q:[],menu_app:0};
   // 状态先报完再谈别的: 空文档也要报出尺寸与可见性, 否则宿主挑不出该画在哪个视图.
   var q=window.__SteamToolsIntents||[];
   window.__SteamToolsIntents=[];
@@ -51,7 +51,14 @@ pub const NAV_TICK_JS: &str = r##"
   // 其余菜单/隐藏视图一律 hidden, SharedJSContext 虽然 visible 但只有 1x1.
   out.vis=(d.visibilityState!=="hidden");
   out.w=window.innerWidth; out.h=window.innerHeight;
-  out.menu=!!window.__SteamToolsMenuArmed;
+  out.menu=!!window.__SteamToolsMenuHandler;
+  var mc=window.__SteamToolsMenuContext;
+  if(mc&&mc.seq!==window.__SteamToolsMenuReported){
+    out.menu_app=Number(mc.app_id)||0;
+    out.menu_x=Number(mc.x);
+    out.menu_y=Number(mc.y);
+    window.__SteamToolsMenuReported=mc.seq;
+  }
   if(!b||!b.children.length) return out;
 
   function open(e){
@@ -179,16 +186,12 @@ pub const NAV_TICK_JS: &str = r##"
 })()
 "##;
 
-/// 库里的右键菜单 (只对我们自己加的 app 生效).
+/// 记录库里受管 App 的右键上下文, 但始终放行 Steam 原菜单.
 ///
-/// 装一次监听就够, 之后每轮只是确认还在. 判 app_id 靠胶囊图的 URL:
-/// 本地是 `steamloopback.host/assets/<id>/`, 远程是 `.../apps/<id>/` ——
-/// 库行的类名是混淆的, 认不得, 但图片路径稳定.
-///
-/// **不是我们加的一律不拦**: 用户自己的游戏照常弹 Steam 的菜单.
+/// 判 app_id 靠胶囊图 URL. 库行的类名是混淆的, 不能拿来当契约.
 pub const LIBRARY_MENU_JS: &str = r##"
 (function(){
-  if(window.__SteamToolsMenuArmed) return "already";
+  if(window.__SteamToolsMenuHandler) return "already";
   var d=document;
   function appIdOf(node){
     var e=node;
@@ -200,64 +203,133 @@ pub const LIBRARY_MENU_JS: &str = r##"
     }
     return 0;
   }
-  function close(){
-    var old=d.getElementById("stt-ctx");
-    if(old&&old.remove) old.remove();
-  }
-  function item(txt,cb){
-    var e=d.createElement("div");
-    e.textContent=txt;
-    e.style.cssText="padding:8px 16px;cursor:pointer;white-space:nowrap;color:#dcdedf;";
-    e.className="stt-ctx-i";
-    e.addEventListener("click",function(ev){
-      ev.stopPropagation(); close(); cb();
-    });
-    return e;
-  }
-  d.addEventListener("contextmenu",function(ev){
-    close();
+  function onContextMenu(ev){
     var managed=window.__SteamToolsManaged||[];
     if(!managed.length) return;
     var id=appIdOf(ev.target);
-    if(!id || managed.indexOf(id)<0) return;   // 不是我们加的 -> 让 Steam 自己弹
-    ev.preventDefault(); ev.stopPropagation();
-
-    var box=d.createElement("div");
-    box.id="stt-ctx";
-    box.style.cssText="position:fixed;z-index:9100;min-width:168px;padding:6px 0;"
-      +"background:#23262e;border:1px solid rgba(0,0,0,.5);border-radius:3px;"
-      +"box-shadow:0 6px 24px rgba(0,0,0,.6);font:14px/18px 'Motiva Sans',Helvetica,sans-serif;";
-    var head=d.createElement("div");
-    head.textContent="SteamTools · "+id;
-    head.style.cssText="padding:6px 16px 8px;color:#7d8894;font-size:12px;"
-      +"border-bottom:1px solid rgba(255,255,255,.07);margin-bottom:4px;";
-    box.appendChild(head);
-    box.appendChild(item("刷新清单",function(){
-      (window.__SteamToolsIntents=window.__SteamToolsIntents||[])
-        .push({kind:"refresh_app",app_id:id});
-    }));
-    box.appendChild(item("移除入库",function(){
-      (window.__SteamToolsIntents=window.__SteamToolsIntents||[])
-        .push({kind:"remove_app",app_id:id});
-    }));
-    box.appendChild(item("打开 SteamTools",function(){ window.__SteamToolsWant=true; }));
-    // 先挂上再量, 否则量不到尺寸; 贴着光标, 越界就翻到另一侧.
-    box.style.left="0px"; box.style.top="0px";
-    (d.body||d.documentElement).appendChild(box);
-    var r=box.getBoundingClientRect();
-    var x=ev.clientX, y=ev.clientY;
-    if(x+r.width>window.innerWidth) x=Math.max(0,x-r.width);
-    if(y+r.height>window.innerHeight) y=Math.max(0,y-r.height);
-    box.style.left=x+"px"; box.style.top=y+"px";
-  },true);
-  d.addEventListener("click",close,true);
-  d.addEventListener("keydown",function(e){ if(e.key==="Escape") close(); },true);
-
-  var css=d.createElement("style");
-  css.textContent="#stt-ctx .stt-ctx-i:hover{background:#1a9fff;color:#fff}";
-  (d.head||d.documentElement).appendChild(css);
-  window.__SteamToolsMenuArmed=true;
+    if(!id || managed.indexOf(id)<0) return;
+    var seq=(window.__SteamToolsMenuSeq||0)+1;
+    window.__SteamToolsMenuSeq=seq;
+    window.__SteamToolsMenuContext={app_id:id,seq:seq,x:ev.clientX,y:ev.clientY};
+  }
+  d.addEventListener("contextmenu",onContextMenu,true);
+  window.__SteamToolsMenuHandler=onContextMenu;
   return "armed";
+})()
+"##;
+
+/// 在 Steam 已生成的菜单底部追加操作. 找不到原生菜单项时不改 DOM.
+pub fn library_menu_inject_js(app_id: u32, point: Option<(i32, i32)>) -> String {
+    let point = point.map_or_else(|| "null".to_owned(), |(x, y)| format!("{{x:{x},y:{y}}}"));
+    format!(
+        r##"(function(){{
+  var d=document,b=d.body,out={{s:"skip",w:window.innerWidth,h:window.innerHeight}},point={point};
+  if(!b||d.visibilityState==="hidden"){{out.s="hidden";return out;}}
+  var old=d.querySelector("[data-stt-menu-group]");
+  if(old){{out.s="already";return out;}}
+  var items=Array.prototype.slice.call(d.querySelectorAll('[role="menuitem"]'));
+  items=items.filter(function(e){{
+    var r=e.getBoundingClientRect();
+    return r.width>=80&&r.height>=16&&r.height<=80;
+  }});
+  if(point){{
+    var parents=[];
+    items.forEach(function(item){{
+      var parent=item.parentElement;
+      if(parent&&parents.indexOf(parent)<0)parents.push(parent);
+    }});
+    var parent=parents.find(function(candidate){{
+      var r=candidate.getBoundingClientRect();
+      return r.width>=80&&r.height>=16&&r.height<=1000
+        &&point.x>=r.left-48&&point.x<=r.right+48
+        &&point.y>=r.top-48&&point.y<=r.bottom+48;
+    }});
+    if(!parent){{out.s="not-near-pointer";return out;}}
+    items=items.filter(function(item){{return item.parentElement===parent;}});
+  }}
+  if(!items.length){{
+    out.s="no-items";
+    out.body=String(b.className||"").slice(0,160);
+    return out;
+  }}
+  var sample=items[items.length-1],parent=sample.parentElement;
+  if(!parent){{out.s="no-parent";return out;}}
+  function popupRoot(node){{
+    var root=node;
+    for(var current=node.parentElement;current&&current!==b;current=current.parentElement){{
+      var style=getComputedStyle(current);
+      if(style.position==="absolute"||style.position==="fixed")root=current;
+    }}
+    return root;
+  }}
+  function fitPopup(root){{
+    var r=root.getBoundingClientRect(),limit=window.innerHeight-8;
+    if(r.bottom<=limit||r.height>=window.innerHeight-16)return;
+    var top=parseFloat(getComputedStyle(root).top);
+    if(isFinite(top))root.style.top=Math.max(8,top-(r.bottom-limit))+"px";
+    else{{root.style.top="auto";root.style.bottom="8px";}}
+  }}
+  function sink(kind){{
+    var msg={{kind:kind}},sent=false,w=null;
+    try{{w=window.opener;}}catch(x){{}}
+    try{{
+      if(w&&w!==window){{
+        if(kind==="open_tools"){{w.__SteamToolsWant=true;}}
+        else{{(w.__SteamToolsIntents=w.__SteamToolsIntents||[]).push(msg);}}
+        sent=true;
+      }}
+    }}catch(x2){{}}
+    if(!sent){{
+      (window.__SteamToolsMenuActions=window.__SteamToolsMenuActions||[]).push(msg);
+      setTimeout(function(){{
+        try{{d.dispatchEvent(new KeyboardEvent("keydown",{{key:"Escape",bubbles:true}}));}}catch(x3){{}}
+      }},0);
+    }}
+    if(sent){{setTimeout(function(){{try{{window.close();}}catch(x3){{}}}},0);}}
+  }}
+  function add(label,kind){{
+    var row=sample.cloneNode(false);
+    if(row.removeAttribute){{row.removeAttribute("id");row.removeAttribute("aria-checked");}}
+    row.setAttribute("data-stt-menu-group","1");
+    row.setAttribute("role","menuitem");
+    row.textContent=label;
+    row.addEventListener("click",function(ev){{
+      ev.preventDefault();ev.stopPropagation();sink(kind);
+    }},true);
+    row.addEventListener("keydown",function(ev){{
+      if(ev.key==="Enter"||ev.key===" "){{ev.preventDefault();sink(kind);}}
+    }},true);
+    parent.appendChild(row);
+  }}
+  var nativeSep=parent.querySelector('[role="separator"]'),sep;
+  if(nativeSep){{sep=nativeSep.cloneNode(false);}}
+  else{{
+    sep=d.createElement("div");
+    sep.setAttribute("role","separator");
+    sep.style.cssText="height:1px;margin:4px 8px;background:rgba(255,255,255,.12);";
+  }}
+  if(sep.removeAttribute)sep.removeAttribute("id");
+  sep.setAttribute("data-stt-menu-group","1");
+  parent.appendChild(sep);
+  add("刷新清单","refresh_app");
+  add("移除入库","remove_app");
+  add("打开 SteamTools","open_tools");
+  fitPopup(popupRoot(parent));
+  out.s="injected";out.app_id={app_id};out.native_items=items.length;
+  return out;
+}})()"##
+    )
+}
+
+/// 菜单 popup 没有 opener 时, 宿主从这里取回动作并关掉 popup.
+pub const LIBRARY_MENU_DRAIN_JS: &str = r##"
+(function(){
+  var q=window.__SteamToolsMenuActions||[];
+  window.__SteamToolsMenuActions=[];
+  var alive=!!document.querySelector("[data-stt-menu-group]")
+    &&document.visibilityState!=="hidden";
+  if(q.length){setTimeout(function(){try{window.close();}catch(x){}},0);}
+  return {q:q,alive:alive};
 })()
 "##;
 
@@ -270,8 +342,10 @@ pub fn managed_apps_js(ids: &[u32]) -> String {
 /// 工具关掉时把右键菜单也撤掉.
 pub const LIBRARY_MENU_TEARDOWN_JS: &str = r##"
 (function(){
-  var p=document.getElementById("stt-ctx");
-  if(p&&p.remove) p.remove();
+  var h=window.__SteamToolsMenuHandler;
+  if(h)document.removeEventListener("contextmenu",h,true);
+  window.__SteamToolsMenuHandler=null;
+  window.__SteamToolsMenuContext=null;
   window.__SteamToolsManaged=[];
   return "off";
 })()
@@ -751,7 +825,21 @@ pub struct PanelState {
     pending: Vec<ViewInfo>,
     /// 上次推给各文档的"我们管着哪些 app", 没变就不重推.
     last_managed: std::collections::HashMap<String, String>,
+    /// 最近一次受管 App 右键. 只在少数轮次内匹配新出现的菜单 target.
+    pending_menu: Option<PendingLibraryMenu>,
+    /// 已追加过操作的菜单 target, 继续从里面取回兜底动作.
+    active_menu: Option<(String, u32)>,
 }
+
+#[derive(Debug, Clone)]
+struct PendingLibraryMenu {
+    app_id: u32,
+    rounds_left: u8,
+    source_key: String,
+    point: Option<(i32, i32)>,
+}
+
+type PendingMenuContext<'a> = (&'a str, u32, Option<(i32, i32)>);
 
 /// 这一轮怎么对待某个视图.
 ///
@@ -780,6 +868,12 @@ impl PanelState {
             self.views = std::mem::take(&mut self.pending);
         }
         self.pending.clear();
+        if let Some(menu) = self.pending_menu.as_mut() {
+            menu.rounds_left = menu.rounds_left.saturating_sub(1);
+            if menu.rounds_left == 0 {
+                self.pending_menu = None;
+            }
+        }
     }
 
     fn note_view(&mut self, key: &str, shell: bool, showing: bool) {
@@ -807,6 +901,41 @@ impl PanelState {
             .or_else(|| seen.iter().find(|v| v.shell && v.showing))
             .map(|v| v.key.as_str())
     }
+
+    fn note_menu_context(&mut self, key: &str, app_id: u32, point: Option<(i32, i32)>) {
+        self.pending_menu = Some(PendingLibraryMenu {
+            app_id,
+            rounds_left: 4,
+            source_key: key.to_owned(),
+            point,
+        });
+        self.active_menu = None;
+    }
+
+    pub(crate) fn pending_menu(&self) -> Option<PendingMenuContext<'_>> {
+        self.pending_menu
+            .as_ref()
+            .map(|menu| (menu.source_key.as_str(), menu.app_id, menu.point))
+    }
+
+    pub(crate) fn activate_menu(&mut self, key: &str, app_id: u32) {
+        self.pending_menu = None;
+        self.active_menu = Some((key.to_owned(), app_id));
+    }
+
+    pub(crate) fn active_menu(&self) -> Option<(&str, u32)> {
+        self.active_menu
+            .as_ref()
+            .map(|(key, app_id)| (key.as_str(), *app_id))
+    }
+
+    pub(crate) fn clear_active_menu(&mut self) {
+        self.active_menu = None;
+    }
+
+    pub(crate) fn request_open(&mut self) {
+        self.open = true;
+    }
 }
 
 impl PanelState {
@@ -818,6 +947,10 @@ impl PanelState {
     pub fn should_run(&mut self, enabled: bool) -> bool {
         let run = enabled || self.armed;
         self.armed = enabled;
+        if !enabled {
+            self.pending_menu = None;
+            self.active_menu = None;
+        }
         run
     }
 }
@@ -863,6 +996,9 @@ pub(crate) fn panel_step(
         });
     }
     let tick = parse_panel_tick(&target.eval(&nav_tick_js(role.hosts_entry))?);
+    if let Some(app_id) = tick.menu_app_id {
+        state.note_menu_context(key, app_id, tick.menu_point);
+    }
     if !tick.intents.is_empty() {
         bridge.on_intents(&tick.intents);
     }
@@ -952,6 +1088,10 @@ pub struct PanelTick {
     pub showing: bool,
     /// 库右键菜单已经装过监听了.
     pub menu_armed: bool,
+    /// 这一轮新捕获的受管 App 右键上下文.
+    pub menu_app_id: Option<u32>,
+    /// 右键在来源文档中的位置. 同文档菜单回退用它避免误改其它菜单.
+    pub menu_point: Option<(i32, i32)>,
     /// 面板已经在页面上.
     pub has: bool,
     pub intents: Vec<ConfigIntent>,
@@ -991,6 +1131,18 @@ pub fn parse_panel_tick(v: &Value) -> PanelTick {
         // 只有可见且够大才算摆在面前: SharedJSContext 是 visible 的, 但只有 1x1.
         // 尺寸按 f64 读 —— 缩放下 innerWidth 会是小数, 按整数读会解析失败当成 0.
         menu_armed: v.get("menu").and_then(Value::as_bool).unwrap_or(false),
+        menu_app_id: v
+            .get("menu_app")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|id| *id > 0),
+        menu_point: match (
+            v.get("menu_x").and_then(Value::as_i64),
+            v.get("menu_y").and_then(Value::as_i64),
+        ) {
+            (Some(x), Some(y)) => i32::try_from(x).ok().zip(i32::try_from(y).ok()),
+            _ => None,
+        },
         showing: v.get("vis").and_then(Value::as_bool).unwrap_or(false)
             && surface_side(v, "w") >= MIN_SURFACE
             && surface_side(v, "h") >= MIN_SURFACE,
@@ -1049,6 +1201,67 @@ fn parse_one(item: &Value) -> Option<ConfigIntent> {
     }
 }
 
+/// 从菜单 popup 的本地兜底队列取回白名单动作.
+pub(crate) struct LibraryMenuDrain {
+    pub intents: Vec<ConfigIntent>,
+    pub open_tools: bool,
+    pub alive: bool,
+    pub dropped: usize,
+}
+
+pub(crate) fn parse_library_menu_drain(value: &Value, app_id: u32) -> LibraryMenuDrain {
+    let alive = value.get("alive").and_then(Value::as_bool).unwrap_or(false);
+    let Some(actions) = value.get("q").and_then(Value::as_array) else {
+        return LibraryMenuDrain {
+            intents: Vec::new(),
+            open_tools: false,
+            alive,
+            dropped: 0,
+        };
+    };
+    let mut intents = Vec::new();
+    let mut open_tools = false;
+    let mut dropped = actions.len().saturating_sub(MAX_INTENTS);
+    for action in actions.iter().take(MAX_INTENTS) {
+        match action.get("kind").and_then(Value::as_str) {
+            Some("refresh_app") => {
+                if let Some(intent) = ConfigIntent::refresh_app(app_id) {
+                    intents.push(intent);
+                }
+            }
+            Some("remove_app") => {
+                if let Some(intent) = ConfigIntent::remove_app(app_id) {
+                    intents.push(intent);
+                }
+            }
+            Some("open_tools") => open_tools = true,
+            _ => dropped += 1,
+        }
+    }
+    LibraryMenuDrain {
+        intents,
+        open_tools,
+        alive,
+        dropped,
+    }
+}
+
+pub(crate) fn apply_library_menu_drain(
+    value: &Value,
+    app_id: u32,
+    bridge: &mut dyn PanelBridge,
+    state: &mut PanelState,
+) -> (bool, usize) {
+    let drain = parse_library_menu_drain(value, app_id);
+    if !drain.intents.is_empty() {
+        bridge.on_intents(&drain.intents);
+    }
+    if drain.open_tools {
+        state.request_open();
+    }
+    (drain.alive, drain.dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,6 +1293,15 @@ mod tests {
         assert!(!tick.has);
         assert!(tick.just_mounted());
         assert!(tick.mounted());
+    }
+
+    #[test]
+    fn tick_reports_new_library_menu_context_once() {
+        let tick = parse_panel_tick(&json!({"menu_app":447040,"menu_x":100,"menu_y":200}));
+
+        assert_eq!(tick.menu_app_id, Some(447040));
+        assert_eq!(tick.menu_point, Some((100, 200)));
+        assert_eq!(parse_panel_tick(&json!({"menu_app":0})).menu_app_id, None);
     }
 
     /// already 是常态, 不能当成"刚挂上"再打一行日志.
@@ -1536,13 +1758,63 @@ mod tests {
         assert!(!out.opened, "面板画进了 1x1 的视图");
     }
 
-    /// 库右键只对我们加的 app 生效 —— 用户自己的游戏要照常弹 Steam 的菜单.
+    /// 受管库项也不该吃掉 Steam 原菜单, 只记录给 popup target 的上下文.
     #[test]
-    fn the_library_menu_defers_to_steam_for_other_games() {
+    fn the_library_menu_preserves_steams_default_action() {
         assert!(LIBRARY_MENU_JS.contains("managed.indexOf(id)<0) return"));
-        assert!(LIBRARY_MENU_JS.contains("preventDefault"));
+        assert!(!LIBRARY_MENU_JS.contains("preventDefault"));
+        assert!(LIBRARY_MENU_JS.contains("__SteamToolsMenuContext"));
         // 认 app 靠图片路径, 不靠混淆的类名.
         assert!(LIBRARY_MENU_JS.contains("(?:assets|apps)"));
+    }
+
+    #[test]
+    fn native_menu_injection_clones_existing_items_and_keeps_a_fallback_queue() {
+        let js = library_menu_inject_js(42, None);
+
+        assert!(js.contains("[role=\"menuitem\"]"));
+        assert!(js.contains("sample.cloneNode(false)"));
+        assert!(js.contains("parent.querySelector"));
+        assert!(js.contains("fitPopup(popupRoot(parent))"));
+        assert!(js.contains("window.opener"));
+        assert!(js.contains("__SteamToolsMenuActions"));
+        assert!(js.contains("刷新清单"));
+        assert!(js.contains("移除入库"));
+    }
+
+    #[test]
+    fn popup_actions_are_bound_to_the_captured_app() {
+        let value = json!({
+            "alive": true,
+            "q": [
+                {"kind": "refresh_app", "app_id": 999},
+                {"kind": "remove_app"},
+                {"kind": "open_tools"},
+                {"kind": "unknown"}
+            ]
+        });
+
+        let drain = parse_library_menu_drain(&value, 42);
+
+        assert_eq!(
+            drain.intents,
+            vec![ConfigIntent::RefreshApp(42), ConfigIntent::RemoveApp(42)]
+        );
+        assert!(drain.open_tools);
+        assert!(drain.alive);
+        assert_eq!(drain.dropped, 1);
+    }
+
+    #[test]
+    fn menu_context_expires_before_an_unrelated_later_popup() {
+        let mut state = PanelState::default();
+        state.note_menu_context("library", 42, Some((10, 20)));
+
+        for _ in 0..4 {
+            state.begin_round();
+        }
+
+        assert_eq!(state.pending_menu(), None);
     }
 
     /// 菜单挂一次就够, tick 要能报出来, 否则每轮重装一遍监听.
