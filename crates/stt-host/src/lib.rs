@@ -11,6 +11,7 @@
 mod manifest_code;
 
 use std::collections::HashSet;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1020,8 +1021,135 @@ fn log_module_hashes(steam_root: &Path) {
     }
 }
 
+const PATTERN_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/SteamToolsProject/SteamTools-Patterns/main/manifests/stable.json";
+const PATTERN_RAW_BASE_URL: &str =
+    "https://raw.githubusercontent.com/SteamToolsProject/SteamTools-Patterns/main";
+
+#[derive(Debug, thiserror::Error)]
+enum PatternFetchError {
+    #[error("pattern HTTP request failed: {0}")]
+    Http(#[from] stt_platform::HttpError),
+    #[error("pattern metadata is invalid: {0}")]
+    Metadata(#[from] stt_metadata::MetadataError),
+    #[error("pattern response is not UTF-8: {0}")]
+    Utf8(#[from] std::str::Utf8Error),
+    #[error("{resource} HTTP status {status}")]
+    UnexpectedStatus { resource: &'static str, status: u16 },
+    #[error("manifest channel is {actual}, expected stable")]
+    UnexpectedChannel { actual: String },
+    #[error("pattern response has no entries")]
+    EmptyPattern,
+    #[error("pattern cache write failed: {0}")]
+    Cache(#[from] io::Error),
+}
+
+fn pattern_http_options() -> stt_platform::WinHttpGetOptions {
+    stt_platform::WinHttpGetOptions {
+        timeouts: stt_platform::WinHttpTimeouts {
+            resolve_ms: 2_000,
+            connect_ms: 2_000,
+            send_ms: 2_000,
+            receive_ms: 3_000,
+        },
+        max_body_bytes: 512 * 1024,
+    }
+}
+
+fn fetch_pattern_manifest() -> Result<stt_metadata::PatternManifest, PatternFetchError> {
+    let response = stt_platform::winhttp_get(PATTERN_MANIFEST_URL, pattern_http_options())?;
+    if !(200..300).contains(&response.status) {
+        return Err(PatternFetchError::UnexpectedStatus {
+            resource: "manifest",
+            status: response.status,
+        });
+    }
+    let manifest = stt_metadata::PatternManifest::parse(&response.body)?;
+    if manifest.channel() != "stable" {
+        return Err(PatternFetchError::UnexpectedChannel {
+            actual: manifest.channel().to_owned(),
+        });
+    }
+    Ok(manifest)
+}
+
+fn fetch_remote_pattern(
+    steam_root: &Path,
+    component: &str,
+    dll: &str,
+    sha: &str,
+    manifest: &stt_metadata::PatternManifest,
+) -> Result<bool, PatternFetchError> {
+    let Some(relative_path) = manifest.matching_pattern(component, dll, sha)? else {
+        return Ok(false);
+    };
+    let url = format!("{PATTERN_RAW_BASE_URL}/{relative_path}");
+    let response = stt_platform::winhttp_get(&url, pattern_http_options())?;
+    if !(200..300).contains(&response.status) {
+        return Err(PatternFetchError::UnexpectedStatus {
+            resource: "pattern",
+            status: response.status,
+        });
+    }
+    let text = std::str::from_utf8(&response.body)?;
+    let map = stt_metadata::PatternMap::parse_str(component, text)?;
+    if map.is_empty() {
+        return Err(PatternFetchError::EmptyPattern);
+    }
+
+    let path = stt_platform::pattern_cache_file(steam_root, component, sha);
+    write_pattern_cache(&path, response.body.as_slice())?;
+    Ok(true)
+}
+
+fn write_pattern_cache(path: &Path, body: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pattern path has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pattern path has no UTF-8 filename",
+            )
+        })?;
+    std::fs::create_dir_all(parent)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = parent.join(format!(".{name}.{}-{nonce}.tmp", std::process::id()));
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(body)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_file() => {
+            let _ = std::fs::remove_file(&temporary);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
 fn log_pattern_probe(steam_root: &Path) -> stt_metadata::PatternStore {
     let mut store = stt_metadata::PatternStore::new();
+    let mut remote_manifest: Option<Result<stt_metadata::PatternManifest, PatternFetchError>> =
+        None;
     for component in ["steamui", "steamclient"] {
         let dll = if component == "steamui" {
             "steamui.dll"
@@ -1039,16 +1167,50 @@ fn log_pattern_probe(steam_root: &Path) -> stt_metadata::PatternStore {
                 continue;
             }
         };
-        // steamui: 已知 sha 自动落盘内置 pattern, 用户不用手拷.
-        if component == "steamui" {
+
+        let primary = stt_platform::pattern_cache_file(steam_root, component, &sha);
+        if !primary.is_file() {
+            match remote_manifest.get_or_insert_with(fetch_pattern_manifest) {
+                Ok(manifest) => {
+                    match fetch_remote_pattern(steam_root, component, dll, &sha, manifest) {
+                        Ok(true) => append_host_log(
+                            steam_root,
+                            &format!(
+                                "pattern_{component}=remote path={} build={} sha={sha}",
+                                primary.display(),
+                                manifest.steam_build()
+                            ),
+                        ),
+                        Ok(false) => append_host_log(
+                            steam_root,
+                            &format!("pattern_{component}=remote miss sha={sha}"),
+                        ),
+                        Err(error) => append_host_log(
+                            steam_root,
+                            &format!("pattern_{component}=remote unavailable ({error}) sha={sha}"),
+                        ),
+                    }
+                }
+                Err(error) => append_host_log(
+                    steam_root,
+                    &format!("pattern_{component}=remote unavailable ({error}) sha={sha}"),
+                ),
+            }
+        }
+
+        // 内置样本只保留作兼容回退, 不覆盖主仓库缓存.
+        if !primary.is_file() && component == "steamui" {
             if let Some(p) = stt_steamui::ensure_builtin_steamui_pattern(steam_root, &sha) {
                 append_host_log(
                     steam_root,
-                    &format!("pattern_steamui=auto path={} sha={sha}", p.display()),
+                    &format!(
+                        "pattern_steamui=builtin_fallback path={} sha={sha}",
+                        p.display()
+                    ),
                 );
             }
         }
-        let primary = stt_platform::pattern_cache_file(steam_root, component, &sha);
+
         let legacy = stt_platform::legacy_pattern_cache_file(steam_root, component, &sha);
         match store.load_with_fallback(component, &primary, Some(&legacy)) {
             Ok(loaded) => append_host_log(
@@ -2172,6 +2334,31 @@ mod tests {
     fn placeholder_init_empty() {
         let rules = init_placeholder();
         assert_eq!(rules.epoch(), 0);
+    }
+
+    #[test]
+    fn pattern_cache_write_leaves_only_the_final_file() {
+        let root = std::env::temp_dir().join(format!(
+            "steamtools-pattern-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let path = root.join("steamtools/pattern/steamui/test.toml");
+
+        write_pattern_cache(&path, b"[0x1]\nname = \"Demo\"\n")
+            .expect("pattern cache write should succeed");
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[0x1]\nname = \"Demo\"\n"
+        );
+        let files: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, vec![std::ffi::OsString::from("test.toml")]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
