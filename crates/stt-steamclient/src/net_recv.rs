@@ -173,7 +173,7 @@ mod tests {
         };
         let mut rewritten = vec![4, 5, 6, 7];
         let rewritten_ptr = rewritten.as_mut_ptr();
-        let marker = 1usize as *mut c_void;
+        let marker = std::ptr::dangling_mut::<c_void>();
 
         let result = unsafe {
             call_with_rewritten_packet(&mut packet, &mut rewritten, 4, |current| {
