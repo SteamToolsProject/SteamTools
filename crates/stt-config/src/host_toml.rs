@@ -37,7 +37,7 @@ pub enum CatalogMode {
     CustomHttp,
     /// 从固定的 `config/lua/catalog.lua` 调用 SteamTools wire v1 扩展.
     Lua,
-    /// 社区 adapter 占位, 当前明确不可用.
+    /// 内置社区多源聚合.
     Community,
     /// 仅用于显式开发模式的确定性假数据.
     Mock,
@@ -330,10 +330,7 @@ paths = ["D:/extra/lua"]
     #[test]
     fn manifest_source_and_timeouts_are_bounded() {
         assert!(HostConfig::parse_str("[manifest]\nurl = \"custom\"").is_err());
-        assert!(HostConfig::parse_str(
-            "[manifest]\nurl = \"wudrm\"\ntimeout_recv_ms = 0"
-        )
-        .is_err());
+        assert!(HostConfig::parse_str("[manifest]\nurl = \"wudrm\"\ntimeout_recv_ms = 0").is_err());
         assert!(HostConfig::parse_str(
             "[manifest]\nurl = \"steamrun\"\ntimeout_connect_ms = 60001"
         )
