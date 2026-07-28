@@ -33,12 +33,7 @@ pub fn format_catalog_lua(app_id: AppId, bundle: &CatalogBundle) -> String {
         out.push_str(&format!("addappid({id}, {purchase_time})\n"));
     }
 
-    let mut depots: Vec<_> = bundle
-        .app_depots
-        .values()
-        .flatten()
-        .copied()
-        .collect();
+    let mut depots: Vec<_> = bundle.app_depots.values().flatten().copied().collect();
     depots.sort_unstable();
     depots.dedup();
     for depot_id in depots {
@@ -284,7 +279,10 @@ mod tests {
     fn lua_round_trip_preserves_app_depot_relationship() {
         let (_root, state, _out) = add_app_42();
 
-        assert_eq!(state.with_rules(|rules| rules.app_depots(42).to_vec()), vec![43]);
+        assert_eq!(
+            state.with_rules(|rules| rules.app_depots(42).to_vec()),
+            vec![43]
+        );
     }
 
     #[test]
