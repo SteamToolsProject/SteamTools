@@ -193,7 +193,7 @@ impl CdpPipeSession {
 }
 
 /// 页面自检: 是不是商店的 app 页. 与 ws 版同一段脚本, 行为保持一致.
-const PROBE_JS: &str = r#"(function(){var h=String(location.href||"");var p=String(location.pathname||"");return /store\.steampowered\.com/.test(h)&&/\/app\/\d+/.test(p||h);})()"#;
+const PROBE_JS: &str = r#"(function(){var h=String(location.href||"");var p=String(location.pathname||"");return /store\.steampowered\.com/.test(h)&&/^\/app\/\d+(?:\/|$)/.test(p);})()"#;
 
 /// 一次轮询: 找商店页 → 注入 → 取回 pending.
 pub fn poll_store_pipe(session: &mut CdpPipeSession, inject_js: &str) -> StoreCdpPoll {
@@ -387,7 +387,14 @@ pub(crate) fn poll_panel_pipe(
             Err(e) => on_log(format!("config_ui=page_err {e}")),
         }
     }
-    poll_library_menu_pipe(session, &targets, bridge, state, on_log);
+    // 右键后 Steam 才创建独立 popup; 重新取一次 target, 不必等下一轮.
+    let refreshed = if state.pending_menu().is_some() {
+        session.targets().ok().filter(|targets| !targets.is_empty())
+    } else {
+        None
+    };
+    let menu_targets = refreshed.as_deref().unwrap_or(&targets);
+    poll_library_menu_pipe(session, menu_targets, bridge, state, on_log);
 }
 
 fn poll_library_menu_pipe(
