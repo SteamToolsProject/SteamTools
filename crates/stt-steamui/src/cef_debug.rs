@@ -1,7 +1,11 @@
-//! hook steam.exe 的 `CreateProcessW`, 只改 steamwebhelper 的调试参数.
+//! hook steam.exe / steamclient64.dll 的进程创建 API, 只改 steamwebhelper 的调试参数.
 //!
 //! 走 IAT 而非 prologue: steam.exe 从导入表调 `CreateProcessW` (已实证), 改指针
 //! 不用猜指令边界. 详见 ADR 0010.
+//!
+//! 2026-08-01 起同时接管 `CreateProcessAsUserW`: steamclient64.dll 经它拉起
+//! webhelper, 只挂 W 时整个会话一次都截不到 (host.log `missed_webhelper
+//! calls=1 webhelper=0`), 8080 无人监听, 入口/面板全部消失.
 //!
 //! # 风险
 //!
@@ -40,6 +44,21 @@ type CreateProcessWFn = unsafe extern "system" fn(
     *mut c_void,
 ) -> i32;
 
+/// `CreateProcessAsUserW` 原型: 比 W 多一个 `hToken` 在最前面.
+type CreateProcessAsUserWFn = unsafe extern "system" fn(
+    *const c_void, // hToken
+    *const u16,
+    *mut u16,
+    *const c_void,
+    *const c_void,
+    i32,
+    u32,
+    *const c_void,
+    *const u16,
+    *const c_void,
+    *mut c_void,
+) -> i32;
+
 /// hook 状态; 模块陆续加载, 所以要能反复补挂.
 struct HookState {
     /// 已挂上的 (模块名, hook).
@@ -57,6 +76,8 @@ static STATE: Mutex<HookState> = Mutex::new(HookState {
     examined: BTreeSet::new(),
 });
 static ORIGINAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// `CreateProcessAsUserW` 的原函数指针 (steamclient64 拉起 webhelper 走这条路).
+static ORIGINAL_AS_USER_W: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// 关掉时只剥参数不注入, webhelper 就完全不开调试端点.
 static INJECT_ENABLED: AtomicBool = AtomicBool::new(false);
 /// detour 被调用的总次数 (任何子进程) — 用来分辨"没挂上"与"挂上了但没等到 webhelper".
@@ -161,32 +182,49 @@ pub fn install_cef_debug_hook(enable: bool, use_pipe: bool) -> CefDebugReport {
             detail: "CreateProcessW not resolvable".into(),
         };
     };
+    let Some(target_as_user) = resolve_create_process_as_user_w() else {
+        return CefDebugReport {
+            status: CefDebugStatus::ImportMissing,
+            port,
+            modules: Vec::new(),
+            detail: "CreateProcessAsUserW not resolvable".into(),
+        };
+    };
     // 先存原函数指针: detour 一旦生效就会立刻用到它.
     ORIGINAL.store(target.cast_mut(), Ordering::SeqCst);
+    ORIGINAL_AS_USER_W.store(target_as_user.cast_mut(), Ordering::SeqCst);
 
     for (name, base) in hookable_modules() {
         // 同一模块只查一次导入表: 补挂每 2s 跑一轮, 重扫上百个模块太浪费.
         if !guard.examined.insert((base as usize, name.clone())) {
             continue;
         }
-        // 模块不导入 CreateProcessW 是正常的, 跳过即可.
-        let Ok(mut hook) =
-            (unsafe { IatHook::new(base, target, hk_create_process_w as *const c_void) })
-        else {
-            continue;
-        };
-        if unsafe { hook.attach() }.is_ok() {
-            guard.hooks.push((name, hook));
+        // 模块不导入这两个函数是正常的, 跳过即可.
+        if let Ok(mut hook) = unsafe {
+            IatHook::new(base, target, hk_create_process_w as *const c_void)
+        } {
+            if unsafe { hook.attach() }.is_ok() {
+                guard.hooks.push((name.clone(), hook));
+            }
+        }
+        // steamclient64 走 AsUserW 拉起 webhelper, 两者都要接管 (见模块注释).
+        if let Ok(mut hook) = unsafe {
+            IatHook::new(base, target_as_user, hk_create_process_as_user_w as *const c_void)
+        } {
+            if unsafe { hook.attach() }.is_ok() {
+                guard.hooks.push((name, hook));
+            }
         }
     }
 
     if guard.hooks.is_empty() {
         ORIGINAL.store(std::ptr::null_mut(), Ordering::SeqCst);
+        ORIGINAL_AS_USER_W.store(std::ptr::null_mut(), Ordering::SeqCst);
         return CefDebugReport {
             status: CefDebugStatus::ImportMissing,
             port,
             modules: Vec::new(),
-            detail: "no loaded module imports CreateProcessW yet".into(),
+            detail: "no loaded module imports CreateProcessW/AsUserW yet".into(),
         };
     }
 
@@ -309,7 +347,8 @@ unsafe fn snapshot_launch(si: *const c_void, inherit: i32, flags: u32) {
 /// 诊断计数: (detour 总调用, 认出的 webhelper 启动, 实际改写).
 ///
 /// `calls=0` 说明 hook 没挂到发起调用的模块; `calls>0 && webhelper=0` 说明
-/// webhelper 走的是别的 API (steamclient 还导入了 `CreateProcessAsUserW`).
+/// webhelper 走的是别的 API (steamclient64 经 `CreateProcessAsUserW` 拉起,
+/// 2026-08-01 起两路都挂, 若再现则优先怀疑模块 IAT 重定位).
 pub fn cef_debug_stats() -> (u64, u64, u64) {
     (
         CALLS.load(Ordering::SeqCst),
@@ -325,6 +364,10 @@ pub fn cef_debug_rewrites() -> u64 {
 
 fn resolve_create_process_w() -> Option<*const c_void> {
     stt_platform::proc_address("kernel32.dll", c"CreateProcessW")
+}
+
+fn resolve_create_process_as_user_w() -> Option<*const c_void> {
+    stt_platform::proc_address("kernel32.dll", c"CreateProcessAsUserW")
 }
 
 /// 直接调原函数; 拿不到就返回失败 (不可能发生, 但绝不 panic).
@@ -350,8 +393,10 @@ unsafe fn call_original(
     f(app, cmd, pa, ta, inherit, flags, env, dir, si, pi)
 }
 
-// 参数个数由 Win32 CreateProcessW 决定, 不能精简.
-unsafe extern "system" fn hk_create_process_w(
+/// 直接调原 `CreateProcessAsUserW`; 拿不到就返回失败 (绝不 panic).
+#[expect(clippy::too_many_arguments, reason = "Win32 CreateProcessAsUserW 原型")]
+unsafe fn call_original_as_user_w(
+    h_token: *const c_void,
     app: *const u16,
     cmd: *mut u16,
     pa: *const c_void,
@@ -363,7 +408,35 @@ unsafe extern "system" fn hk_create_process_w(
     si: *const c_void,
     pi: *mut c_void,
 ) -> i32 {
-    CALLS.fetch_add(1, Ordering::SeqCst);
+    let raw = ORIGINAL_AS_USER_W.load(Ordering::SeqCst);
+    if raw.is_null() {
+        return 0;
+    }
+    // SAFETY: raw 来自 kernel32 导出表, 原型与 Win32 CreateProcessAsUserW 一致.
+    let f: CreateProcessAsUserWFn = std::mem::transmute(raw);
+    f(h_token, app, cmd, pa, ta, inherit, flags, env, dir, si, pi)
+}
+
+/// 两个 detour 共用的准备阶段: 识别 webhelper、改写命令行、备管道.
+///
+/// 改写缓冲由 `_buffer` 持有, 必须活到原函数调用返回; 调用方负责调原函数
+/// 并走 `finish_launch` 收尾.
+struct PreparedLaunch {
+    _buffer: Option<Vec<u16>>,
+    cmd: *mut u16,
+    si: *const c_void,
+    flags: u32,
+    inherit: i32,
+    launch: Option<ChildPipeLaunch>,
+}
+
+unsafe fn prepare_launch(
+    app: *const u16,
+    cmd: *mut u16,
+    inherit: i32,
+    flags: u32,
+    si: *const c_void,
+) -> PreparedLaunch {
     // 改写用的缓冲要活到调用结束; None 表示照原样透传.
     let seen_before = WEBHELPER_SEEN.load(Ordering::SeqCst);
     let mut patched = rewritten_cmdline(app, cmd);
@@ -381,7 +454,7 @@ unsafe extern "system" fn hk_create_process_w(
     }
 
     // pipe 模式: 把 CDP 管道作为 fd 3/4 交下去, 并换掉 STARTUPINFO.
-    // launch 里的缓冲被 STARTUPINFOEX 按指针引用, 必须活到 CreateProcessW 返回.
+    // launch 里的缓冲被 STARTUPINFOEX 按指针引用, 必须活到原函数返回.
     let mut launch: Option<ChildPipeLaunch> = None;
     let (si_arg, flags_arg, inherit_arg) = if is_webhelper && patched.is_some() && use_pipe() {
         match arm_devtools_pipe(si) {
@@ -396,20 +469,18 @@ unsafe extern "system" fn hk_create_process_w(
     } else {
         (si, flags, inherit)
     };
+    PreparedLaunch {
+        _buffer: patched,
+        cmd: cmd_ptr,
+        si: si_arg,
+        flags: flags_arg,
+        inherit: inherit_arg,
+        launch,
+    }
+}
 
-    let rc = call_original(
-        app,
-        cmd_ptr,
-        pa,
-        ta,
-        inherit_arg,
-        flags_arg,
-        env,
-        dir,
-        si_arg,
-        pi,
-    );
-
+/// 原函数返回后的收尾: 进程没起来就扔掉管道, 否则标记管道已交付.
+unsafe fn finish_launch(rc: i32, launch: Option<ChildPipeLaunch>) {
     if launch.is_some() {
         if rc == 0 {
             // 进程没起来: 扔掉管道, 免得 CDP 桥去等一个永远不来的对端.
@@ -418,6 +489,69 @@ unsafe extern "system" fn hk_create_process_w(
             PIPE_ARMED.store(true, Ordering::SeqCst);
         }
     }
+}
+
+// 参数个数由 Win32 CreateProcessW 决定, 不能精简.
+unsafe extern "system" fn hk_create_process_w(
+    app: *const u16,
+    cmd: *mut u16,
+    pa: *const c_void,
+    ta: *const c_void,
+    inherit: i32,
+    flags: u32,
+    env: *const c_void,
+    dir: *const u16,
+    si: *const c_void,
+    pi: *mut c_void,
+) -> i32 {
+    CALLS.fetch_add(1, Ordering::SeqCst);
+    let prepared = prepare_launch(app, cmd, inherit, flags, si);
+    let rc = call_original(
+        app,
+        prepared.cmd,
+        pa,
+        ta,
+        prepared.inherit,
+        prepared.flags,
+        env,
+        dir,
+        prepared.si,
+        pi,
+    );
+    finish_launch(rc, prepared.launch);
+    rc
+}
+
+// steamclient64 经 CreateProcessAsUserW 拉起 webhelper (2026-08-01 实机证据).
+unsafe extern "system" fn hk_create_process_as_user_w(
+    h_token: *const c_void,
+    app: *const u16,
+    cmd: *mut u16,
+    pa: *const c_void,
+    ta: *const c_void,
+    inherit: i32,
+    flags: u32,
+    env: *const c_void,
+    dir: *const u16,
+    si: *const c_void,
+    pi: *mut c_void,
+) -> i32 {
+    CALLS.fetch_add(1, Ordering::SeqCst);
+    let prepared = prepare_launch(app, cmd, inherit, flags, si);
+    let rc = call_original_as_user_w(
+        h_token,
+        app,
+        prepared.cmd,
+        pa,
+        ta,
+        prepared.inherit,
+        prepared.flags,
+        env,
+        dir,
+        prepared.si,
+        pi,
+    );
+    finish_launch(rc, prepared.launch);
     rc
 }
 
@@ -536,6 +670,12 @@ mod tests {
     #[test]
     fn null_wide_string_is_none() {
         assert!(unsafe { wide_to_string(std::ptr::null()) }.is_none());
+    }
+
+    /// steamclient64 靠 AsUserW 拉起 webhelper; 拿不到导出就谈不上接管.
+    #[test]
+    fn as_user_w_resolves_on_kernel32() {
+        assert!(resolve_create_process_as_user_w().is_some());
     }
 
     #[test]
