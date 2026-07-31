@@ -12,7 +12,12 @@ crate-type = ["cdylib", "rlib"]
 name = "SteamTools"
 
 [features]
-default = []
+default = [
+    "download-manifest",
+    "download-key",
+    "download-token",
+    "download-request-code",
+]
 download-manifest = ["stt-steamclient/download-manifest"]
 download-key = ["stt-steamclient/download-key"]
 download-token = ["stt-steamclient/download-token"]

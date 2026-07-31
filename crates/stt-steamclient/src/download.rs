@@ -325,8 +325,10 @@ mod tests {
 
     #[test]
     fn tool_off_precedes_every_capability_gate() {
+        let mut tools = ToolRegistry::with_defaults();
+        tools.set_enabled(ToolId::DownloadKit, false);
         let report = plan_download_kit(
-            &ToolRegistry::with_defaults(),
+            &tools,
             &complete_patterns(),
             "steamclient",
             all_features(),

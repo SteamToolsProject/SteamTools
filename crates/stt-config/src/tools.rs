@@ -41,15 +41,16 @@ impl ToolId {
         }
     }
 
-    /// 默认开: 入库 + 库 UX + 配置页.
+    /// 默认开: 入库 + 库 UX + 配置页 + 下载套件.
     ///
     /// 产品表常写「默认仅 catalog_add + library_ux」; 狗粮期把 `config_ui` 也默认开,
     /// 否则通道 gating (`catalog_add || config_ui`) 下关掉入库会把自己关没,
-    /// 也没法在面板里拨开关. 用户仍可在 toml 里关掉.
+    /// 也没法在面板里拨开关. 2026-07-31 起 `download_kit` 默认开.
+    /// 用户仍可在 toml 里关掉.
     pub fn default_enabled(self) -> bool {
         matches!(
             self,
-            ToolId::CatalogAdd | ToolId::LibraryUx | ToolId::ConfigUi
+            ToolId::CatalogAdd | ToolId::LibraryUx | ToolId::ConfigUi | ToolId::DownloadKit
         )
     }
 
@@ -155,7 +156,7 @@ mod tests {
         assert!(reg.is_enabled(ToolId::CatalogAdd));
         assert!(reg.is_enabled(ToolId::LibraryUx));
         assert!(reg.is_enabled(ToolId::ConfigUi));
-        assert!(!reg.is_enabled(ToolId::DownloadKit));
+        assert!(reg.is_enabled(ToolId::DownloadKit));
         assert!(!reg.is_enabled(ToolId::StoreAccel));
     }
 
