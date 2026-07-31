@@ -2778,7 +2778,7 @@ end
     }
 
     #[test]
-    fn download_kit_is_runtime_disabled_by_default() {
+    fn download_kit_runs_by_default() {
         let tools = stt_config::ToolRegistry::with_defaults();
         let report = stt_steamclient::plan_download_kit(
             &tools,
@@ -2789,10 +2789,10 @@ end
             stt_steamclient::DownloadDataAvailability::default(),
         );
 
-        assert!(report
+        assert!(!report
             .capabilities
             .iter()
-            .all(|item| item.status == stt_steamclient::DownloadCapabilityStatus::ToolDisabled));
+            .any(|item| item.status == stt_steamclient::DownloadCapabilityStatus::ToolDisabled));
     }
 
     #[test]
