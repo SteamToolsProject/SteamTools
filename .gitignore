@@ -14,8 +14,7 @@
 *.a
 
 # ----- Rust -----
-Cargo.lock
-!**/*/Cargo.lock
+# 本项目产出二进制/DLL 应用, Cargo.lock 入库保证可复现构建.
 .cargo/config.toml.local
 
 # ----- IDE / OS -----
@@ -35,8 +34,9 @@ Desktop.ini
 # ----- 参考树（只读对照，不入库）-----
 .example/
 
-# ----- 文档 / 计划 / ADR（本机开发用，不入库）-----
-/docs/
+# ----- 本机规划 / ADR（不入库）；docs/ 其余内容（用户文档）可提交 -----
+/docs/plan/
+/docs/decisions/
 
 # ----- Agent / 副驾驶 / 本机 AI（全部不入库）-----
 /AGENTS.md
