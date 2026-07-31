@@ -29,8 +29,8 @@ pub use catalog_add::{
 };
 pub use error::{ConfigError, Result};
 pub use host_toml::{
-    CatalogMode, CatalogSection, HostConfig, LogSection, LuaSection, ManifestSection, ToolsSection,
-    HOST_TOML_NAME, LEGACY_TOML_NAME,
+    CatalogMode, CatalogSection, HostConfig, LogSection, LuaSection, ManifestSection,
+    StoreAccelEgress, StoreAccelSection, ToolsSection, HOST_TOML_NAME, LEGACY_TOML_NAME,
 };
 pub use intent::{
     apply_intent, host_toml_write_path, save_host_change, ConfigIntent, CATALOG_MODES, LOG_LEVELS,
