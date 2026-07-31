@@ -510,6 +510,15 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     init_host_logger(steam_root)?;
     append_host_log(steam_root, "host_init=starting");
 
+    // 抢在 Steam 拉起 steamwebhelper 之前装 CreateProcessW/AsUserW IAT hook.
+    // webhelper 在 Steam 启动 ~3s 就被拉起 (登录窗口 00:40:35 vs steam 00:40:32),
+    // 而 bootstrap_config (pattern 联网) + reconcile_store_accel 要 4-6s,
+    // 排后面每次首拉都错过 (实测 host.log missed_webhelper calls=1 webhelper=0).
+    // 先用默认 enable=true 装好; config 就绪后由下方 wait 校正开关 (install 幂等).
+    let use_pipe = !stt_platform::cef_pipe_fallback_marker(steam_root).is_file();
+    let early = stt_steamui::install_cef_debug_hook(true, use_pipe);
+    append_host_log(steam_root, &early.summary_line());
+
     let state = match bootstrap_config(steam_root) {
         Ok(s) => s,
         Err(e) => {
@@ -534,13 +543,8 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
 
     reconcile_store_accel(steam_root, false, None, &state);
 
-    // 抢在 Steam 拉起 steamwebhelper 之前装 CreateProcessW hook (ADR 0010).
-    // 必须是配置就绪后的第一件事: 后面 SHA-256 两个大 DLL 要几百毫秒, 等不起.
-    // 发起调用的模块可能比 host 晚加载, 而 webhelper 约 300ms 就被拉起,
-    // 所以这里忙等着补挂; watch 里的 CefRearm 负责后续新模块与 webhelper 重启.
-    // 首选 pipe (不开任何端口); 上次证明走不通才回退到端口.
+    // 上面已幂等装好; 这里校正开关并等 webhelper (或超时).
     let channel_on = needs_cef_channel(&state);
-    let use_pipe = !stt_platform::cef_pipe_fallback_marker(steam_root).is_file();
     let cef = stt_steamui::wait_cef_debug_hook(channel_on, use_pipe, Duration::from_millis(2000));
 
     let lua_report = state.reload_lua_dirs(steam_root);
