@@ -9,6 +9,7 @@ members = [
     "crates/stt-hook",
     "crates/stt-steamui",
     "crates/stt-steamclient",
+    "crates/stt-store-accel",
     "crates/stt-host",
     "crates/stt-loader-dwmapi",
     "crates/stt-loader-xinput",
@@ -23,6 +24,7 @@ default-members = [
     "crates/stt-steamui",
     "crates/stt-steamclient",
     "crates/stt-host",
+    "crates/stt-store-accel",
 ]
 
 [workspace.package]
@@ -41,6 +43,7 @@ stt-metadata = { path = "crates/stt-metadata" }
 stt-hook = { path = "crates/stt-hook" }
 stt-steamui = { path = "crates/stt-steamui" }
 stt-steamclient = { path = "crates/stt-steamclient", default-features = false }
+stt-store-accel = { path = "crates/stt-store-accel" }
 
 [workspace.lints.rust]
 nonstandard_style = { level = "deny", priority = -2 }

@@ -21,9 +21,174 @@ pub struct HostConfig {
     pub manifest: ManifestSection,
     #[serde(default)]
     pub lua: LuaSection,
+    #[serde(default)]
+    pub store_accel: StoreAccelSection,
     /// 工具 id -> 是否启用; 缺省键走工具默认值.
     #[serde(default)]
     pub tools: ToolsSection,
+}
+
+/// 商店网页访问 helper 的受限网络配置.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreAccelSection {
+    #[serde(default = "default_store_accel_listen_port")]
+    pub listen_port: u16,
+    /// 只能是字面 IP, 不能是主机名, 避免 helper 自身落回系统 DNS.
+    #[serde(default = "default_store_accel_resolver")]
+    pub resolver: String,
+    #[serde(default = "default_store_accel_dns_timeout_ms")]
+    pub dns_timeout_ms: u32,
+    #[serde(default = "default_store_accel_connect_timeout_ms")]
+    pub connect_timeout_ms: u32,
+    #[serde(default = "default_store_accel_max_connections")]
+    pub max_connections: usize,
+    #[serde(default)]
+    pub egress: StoreAccelEgress,
+    /// `http_connect` 出口的固定 IPv4 地址和端口, 由用户自有中继提供.
+    #[serde(default)]
+    pub upstream: String,
+    /// 可选的用户本机 Clash HTTP 代理, 只允许 loopback 地址; 本地候选失败后最多回退一次.
+    #[serde(default)]
+    pub clash_fallback: String,
+}
+
+/// helper 如何从本机到达 Steam 网页域名.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreAccelEgress {
+    /// 未配置出口时不启动 helper, 不能改系统 PAC.
+    #[default]
+    Disabled,
+    /// 本机用受信 DNS 得到目标 IP 后直接连 Steam.
+    DirectDns,
+    /// 本地候选 IP 优选, 动态请求可回退到用户本机代理.
+    LocalCdn,
+    /// 连接用户提供的 HTTP CONNECT 中继, 由中继解析并出站.
+    HttpConnect,
+}
+
+fn default_store_accel_listen_port() -> u16 {
+    18_942
+}
+
+fn default_store_accel_resolver() -> String {
+    "1.1.1.1:53".into()
+}
+
+fn default_store_accel_dns_timeout_ms() -> u32 {
+    2_000
+}
+
+fn default_store_accel_connect_timeout_ms() -> u32 {
+    5_000
+}
+
+fn default_store_accel_max_connections() -> usize {
+    32
+}
+
+impl Default for StoreAccelSection {
+    fn default() -> Self {
+        Self {
+            listen_port: default_store_accel_listen_port(),
+            resolver: default_store_accel_resolver(),
+            dns_timeout_ms: default_store_accel_dns_timeout_ms(),
+            connect_timeout_ms: default_store_accel_connect_timeout_ms(),
+            max_connections: default_store_accel_max_connections(),
+            egress: StoreAccelEgress::Disabled,
+            upstream: String::new(),
+            clash_fallback: String::new(),
+        }
+    }
+}
+
+impl StoreAccelSection {
+    /// 配置只接受固定 IPv4 DNS 地址, 防止 helper 再走系统解析.
+    pub fn validate(&self) -> Result<()> {
+        const MAX_TIMEOUT_MS: u32 = 60_000;
+        const MAX_CONNECTIONS: usize = 256;
+        if self.listen_port == 0 {
+            return Err(ConfigError::Invalid(
+                "store_accel.listen_port must not be 0".into(),
+            ));
+        }
+        let resolver = self
+            .resolver
+            .parse::<std::net::SocketAddrV4>()
+            .map_err(|_| {
+                ConfigError::Invalid(
+                    "store_accel.resolver must be an IPv4 address with port".into(),
+                )
+            })?;
+        if resolver.port() == 0 {
+            return Err(ConfigError::Invalid(
+                "store_accel.resolver port must not be 0".into(),
+            ));
+        }
+        if [self.dns_timeout_ms, self.connect_timeout_ms]
+            .into_iter()
+            .any(|timeout| timeout == 0 || timeout > MAX_TIMEOUT_MS)
+        {
+            return Err(ConfigError::Invalid(
+                "store_accel timeout must be within 1..=60000 ms".into(),
+            ));
+        }
+        if self.max_connections == 0 || self.max_connections > MAX_CONNECTIONS {
+            return Err(ConfigError::Invalid(format!(
+                "store_accel.max_connections must be within 1..={MAX_CONNECTIONS}"
+            )));
+        }
+        match self.egress {
+            StoreAccelEgress::Disabled
+            | StoreAccelEgress::DirectDns
+            | StoreAccelEgress::LocalCdn
+                if !self.upstream.is_empty() =>
+            {
+                return Err(ConfigError::Invalid(
+                    "store_accel.upstream requires egress = http_connect".into(),
+                ));
+            }
+            StoreAccelEgress::Disabled | StoreAccelEgress::DirectDns => {}
+            StoreAccelEgress::LocalCdn => {}
+            StoreAccelEgress::HttpConnect => {
+                let upstream = self
+                    .upstream
+                    .parse::<std::net::SocketAddrV4>()
+                    .map_err(|_| {
+                        ConfigError::Invalid(
+                            "store_accel.upstream must be an IPv4 address with port".into(),
+                        )
+                    })?;
+                if upstream.port() == 0 {
+                    return Err(ConfigError::Invalid(
+                        "store_accel.upstream port must not be 0".into(),
+                    ));
+                }
+            }
+        }
+        if !self.clash_fallback.is_empty() {
+            let fallback = self
+                .clash_fallback
+                .parse::<std::net::SocketAddrV4>()
+                .map_err(|_| {
+                    ConfigError::Invalid(
+                        "store_accel.clash_fallback must be a loopback IPv4 address and port"
+                            .into(),
+                    )
+                })?;
+            if !fallback.ip().is_loopback() || fallback.port() == 0 {
+                return Err(ConfigError::Invalid(
+                    "store_accel.clash_fallback must be a loopback IPv4 address and port".into(),
+                ));
+            }
+            if self.egress != StoreAccelEgress::LocalCdn {
+                return Err(ConfigError::Invalid(
+                    "store_accel.clash_fallback requires egress = local_cdn".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 完整 Catalog 的来源模式.
@@ -233,6 +398,7 @@ impl HostConfig {
         let config: Self = toml::from_str(s)?;
         config.catalog.validate()?;
         config.manifest.validate()?;
+        config.store_accel.validate()?;
         Ok(config)
     }
 
@@ -292,6 +458,7 @@ mod tests {
         assert_eq!(c.log.level, "debug");
         assert_eq!(c.catalog.mode, CatalogMode::Disabled);
         assert_eq!(c.manifest.url, "opensteamtool");
+        assert_eq!(c.store_accel.egress, StoreAccelEgress::Disabled);
         assert!(c.is_tool_enabled(ToolId::CatalogAdd));
         assert!(c.is_tool_enabled(ToolId::LibraryUx));
         assert!(!c.is_tool_enabled(ToolId::StoreAccel));
@@ -365,5 +532,62 @@ timeout_recv_ms = 2000
         let error = HostConfig::parse_str("[catalog]\ntimeout_recv_ms = 0\n").unwrap_err();
 
         assert!(error.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn store_accel_requires_bounded_ip_resolver() {
+        assert!(HostConfig::parse_str("[store_accel]\nresolver = \"dns.example:53\"").is_err());
+        assert!(HostConfig::parse_str("[store_accel]\nresolver = \"1.1.1.1:0\"").is_err());
+        assert!(HostConfig::parse_str("[store_accel]\nmax_connections = 0").is_err());
+        assert!(HostConfig::parse_str("[store_accel]\ndns_timeout_ms = 60001").is_err());
+
+        let parsed = HostConfig::parse_str("[store_accel]\nresolver = \"9.9.9.9:53\"").unwrap();
+        assert_eq!(parsed.store_accel.resolver, "9.9.9.9:53");
+    }
+
+    #[test]
+    fn store_accel_http_connect_requires_fixed_upstream() {
+        assert!(HostConfig::parse_str("[store_accel]\negress = \"http_connect\"").is_err());
+        assert!(HostConfig::parse_str(
+            "[store_accel]\negress = \"http_connect\"\nupstream = \"proxy.example:3128\""
+        )
+        .is_err());
+        assert!(HostConfig::parse_str("[store_accel]\nupstream = \"1.1.1.1:3128\"").is_err());
+
+        let parsed = HostConfig::parse_str(
+            "[store_accel]\negress = \"http_connect\"\nupstream = \"203.0.113.9:3128\"",
+        )
+        .unwrap();
+        assert_eq!(parsed.store_accel.egress, StoreAccelEgress::HttpConnect);
+    }
+
+    #[test]
+    fn store_accel_direct_dns_requires_explicit_egress() {
+        assert!(HostConfig::parse_str("[store_accel]\nupstream = \"203.0.113.9:3128\"").is_err());
+
+        let parsed = HostConfig::parse_str("[store_accel]\negress = \"direct_dns\"").unwrap();
+        assert_eq!(parsed.store_accel.egress, StoreAccelEgress::DirectDns);
+    }
+
+    #[test]
+    fn store_accel_local_cdn_accepts_loopback_clash_fallback() {
+        let parsed = HostConfig::parse_str(
+            "[store_accel]\negress = \"local_cdn\"\nclash_fallback = \"127.0.0.1:7890\"",
+        )
+        .unwrap();
+        assert_eq!(parsed.store_accel.egress, StoreAccelEgress::LocalCdn);
+        assert_eq!(parsed.store_accel.clash_fallback, "127.0.0.1:7890");
+    }
+
+    #[test]
+    fn store_accel_clash_fallback_is_loopback_only() {
+        assert!(HostConfig::parse_str(
+            "[store_accel]\negress = \"local_cdn\"\nclash_fallback = \"8.8.8.8:7890\"",
+        )
+        .is_err());
+        assert!(HostConfig::parse_str(
+            "[store_accel]\negress = \"direct_dns\"\nclash_fallback = \"127.0.0.1:7890\"",
+        )
+        .is_err());
     }
 }

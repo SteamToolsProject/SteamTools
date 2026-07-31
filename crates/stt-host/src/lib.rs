@@ -13,7 +13,9 @@ mod manifest_code;
 
 use std::collections::HashSet;
 use std::io::{self, Write};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -28,7 +30,7 @@ use stt_catalog::{
 use stt_config::{
     add_to_library, apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent,
     ConfigSnapshot, ConfigState, HostConfig, LuaCatalogProvider, LuaHttpClient, LuaHttpErrorKind,
-    LuaHttpMethod, LuaHttpRequest, LuaHttpResponse, ToolId,
+    LuaHttpMethod, LuaHttpRequest, LuaHttpResponse, StoreAccelEgress, StoreAccelSection, ToolId,
 };
 use stt_core::{AppId, AppRules};
 use stt_steamclient::{LicenseQueue, UiLicenseAction};
@@ -41,6 +43,25 @@ static CONFIGURED_APPS: OnceLock<Arc<Mutex<HashSet<AppId>>>> = OnceLock::new();
 static LIBRARY_UX: OnceLock<stt_steamui::LibraryUx> = OnceLock::new();
 /// 进程内日志写入器, 只在 init 工作线程中创建.
 static HOST_LOGGER: OnceLock<HostLogger> = OnceLock::new();
+/// DLL 内商店代理的唯一运行实例.
+static STORE_ACCEL_RUNTIME: OnceLock<Mutex<StoreAccelRuntime>> = OnceLock::new();
+
+#[derive(Default)]
+struct StoreAccelRuntime {
+    generation: u64,
+    active: Option<StoreAccelInstance>,
+}
+
+struct StoreAccelInstance {
+    generation: u64,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn store_accel_runtime() -> &'static Mutex<StoreAccelRuntime> {
+    STORE_ACCEL_RUNTIME.get_or_init(|| Mutex::new(StoreAccelRuntime::default()))
+}
 
 fn license_queue() -> Option<Arc<LicenseQueue>> {
     LICENSE_QUEUE.get().map(Arc::clone)
@@ -511,6 +532,8 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         );
     }
 
+    reconcile_store_accel(steam_root, false, None, &state);
+
     // 抢在 Steam 拉起 steamwebhelper 之前装 CreateProcessW hook (ADR 0010).
     // 必须是配置就绪后的第一件事: 后面 SHA-256 两个大 DLL 要几百毫秒, 等不起.
     // 发起调用的模块可能比 host 晚加载, 而 webhelper 约 300ms 就被拉起,
@@ -603,15 +626,16 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
              it keeps 8080 open for every Steam session)",
         );
     }
-    let details = tool_details(
-        &state,
-        &library_ux_report,
-        &package,
-        &download,
-        &native,
+    let details = tool_details(ToolDetailsContext {
+        steam_root,
+        state: &state,
+        library_ux: &library_ux_report,
+        package: &package,
+        download: &download,
+        _native: &native,
         use_pipe,
-        cef.caught_webhelper(),
-    );
+        caught: cef.caught_webhelper(),
+    });
     spawn_store_cdp_bridge(steam_root, &state, use_pipe, details);
     append_host_log(
         steam_root,
@@ -876,6 +900,8 @@ impl stt_steamui::PanelBridge for HostPanel {
 
     fn on_intents(&mut self, intents: &[ConfigIntent]) {
         for intent in intents {
+            let was_store_accel = self.state.tools().is_enabled(ToolId::StoreAccel);
+            let previous_store_accel = self.state.host().store_accel;
             // 针对某个 app 的意图不写 toml, 要 provider, 只有宿主这儿有.
             let done = match intent.app_target() {
                 Some(app_id) => self.apply_app_intent(intent, app_id),
@@ -883,6 +909,12 @@ impl stt_steamui::PanelBridge for HostPanel {
             };
             match done {
                 Ok(done) => {
+                    reconcile_store_accel(
+                        &self.steam_root,
+                        was_store_accel,
+                        Some(&previous_store_accel),
+                        &self.state,
+                    );
                     append_host_log(&self.steam_root, &format!("config_ui=saved {done}"));
                     if !matches!(intent, ConfigIntent::RefreshApp(_)) {
                         set_shared_note(&self.note, format!("已保存 {done}"));
@@ -1564,16 +1596,29 @@ fn download_hook_rearm_pending() -> bool {
     false
 }
 
-/// 各工具此刻的运行状态 —— 开着不等于跑起来了, 这些原来只进 host.log.
-fn tool_details(
-    state: &ConfigState,
-    library_ux: &stt_steamui::LibraryUxInstallReport,
-    package: &stt_steamclient::PackageInstallReport,
-    download: &stt_steamclient::DownloadKitReport,
-    native: &stt_steamui::StoreNativeReport,
+struct ToolDetailsContext<'a> {
+    steam_root: &'a Path,
+    state: &'a ConfigState,
+    library_ux: &'a stt_steamui::LibraryUxInstallReport,
+    package: &'a stt_steamclient::PackageInstallReport,
+    download: &'a stt_steamclient::DownloadKitReport,
+    _native: &'a stt_steamui::StoreNativeReport,
     use_pipe: bool,
     caught: bool,
-) -> stt_config::ToolDetails {
+}
+
+/// 各工具此刻的运行状态 —— 开着不等于跑起来了, 这些原来只进 host.log.
+fn tool_details(context: ToolDetailsContext<'_>) -> stt_config::ToolDetails {
+    let ToolDetailsContext {
+        steam_root,
+        state,
+        library_ux,
+        package,
+        download,
+        _native: _,
+        use_pipe,
+        caught,
+    } = context;
     let tools = state.tools();
     let catalog = match state.host().catalog.mode {
         CatalogMode::Disabled => "Catalog 未配置",
@@ -1626,9 +1671,247 @@ fn tool_details(
     d.insert(ToolId::DownloadKit.as_str(), download.detail_for_ui());
     d.insert(
         ToolId::StoreAccel.as_str(),
-        format!("尚未实现; 原生注入路径: {:?}", native.status),
+        store_accel_detail(steam_root, state),
     );
     d
+}
+
+fn store_accel_runtime_active(port: u16) -> bool {
+    store_accel_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active
+        .as_ref()
+        .is_some_and(|instance| instance.port == port)
+}
+
+fn store_accel_detail(_steam_root: &Path, state: &ConfigState) -> String {
+    if !state.tools().is_enabled(ToolId::StoreAccel) {
+        return "已关闭".to_owned();
+    }
+    let config = state.host().store_accel;
+    match config.egress {
+        StoreAccelEgress::Disabled => {
+            "degraded: 未配置出口, 不会修改系统 PAC".to_owned()
+        }
+        StoreAccelEgress::DirectDns if !store_accel_runtime_active(config.listen_port) => format!(
+            "degraded: DLL 内代理线程未运行; local_direct: 直连 DNS 兼容模式, 监听 127.0.0.1:{}",
+            config.listen_port
+        ),
+        StoreAccelEgress::DirectDns => {
+            "local_direct: 直连 DNS 兼容模式, 当前网络可能不稳定".to_owned()
+        }
+        StoreAccelEgress::LocalCdn
+            if !store_accel_runtime_active(config.listen_port)
+                && !config.clash_fallback.is_empty() =>
+        {
+            format!(
+                "degraded: DLL 内代理线程未运行; local_direct: 本地 CDN/DNS 优选; clash_fallback: 已配置; 监听 127.0.0.1:{}",
+                config.listen_port
+            )
+        }
+        StoreAccelEgress::LocalCdn if !store_accel_runtime_active(config.listen_port) => format!(
+            "degraded: DLL 内代理线程未运行; local_direct: 本地 CDN/DNS 优选, 监听 127.0.0.1:{}",
+            config.listen_port
+        ),
+        StoreAccelEgress::LocalCdn if config.clash_fallback.is_empty() => {
+            format!(
+                "local_direct: 本地 CDN/DNS 优选已配置, 动态请求失败后无 Clash 回退; 监听 127.0.0.1:{}",
+                config.listen_port
+            )
+        }
+        StoreAccelEgress::LocalCdn => format!(
+            "local_direct: 本地 CDN/DNS 优先; clash_fallback: 动态和必要静态请求失败最多回退一次; 监听 127.0.0.1:{}",
+            config.listen_port
+        ),
+        StoreAccelEgress::HttpConnect if !store_accel_runtime_active(config.listen_port) => {
+            format!(
+                "degraded: DLL 内代理线程未运行; user_connect: 自有中继已配置, 监听 127.0.0.1:{}",
+                config.listen_port
+            )
+        }
+        StoreAccelEgress::HttpConnect => format!(
+            "user_connect: 自有中继已配置, DLL 内 PAC + CONNECT 正在监听 127.0.0.1:{}",
+            config.listen_port
+        ),
+    }
+}
+
+/// 在 DLL 内按工具开关启停商店访问线程.
+fn reconcile_store_accel(
+    steam_root: &Path,
+    was_enabled: bool,
+    previous: Option<&StoreAccelSection>,
+    state: &ConfigState,
+) {
+    let host = state.host();
+    let enabled = state.tools().is_enabled(ToolId::StoreAccel);
+    let config_changed = previous.is_some_and(|old| old != &host.store_accel);
+    if !enabled && !was_enabled {
+        return;
+    }
+    if !enabled {
+        stop_store_accel(
+            steam_root,
+            previous.map_or(host.store_accel.listen_port, |old| old.listen_port),
+        );
+        return;
+    }
+    if was_enabled && !config_changed {
+        return;
+    }
+    if was_enabled {
+        stop_store_accel(
+            steam_root,
+            previous.map_or(host.store_accel.listen_port, |old| old.listen_port),
+        );
+    }
+    if host.store_accel.egress == StoreAccelEgress::Disabled {
+        append_host_log(steam_root, "store_accel=not_configured egress=disabled");
+        return;
+    }
+    start_store_accel(steam_root, &host.store_accel);
+}
+
+fn start_store_accel(steam_root: &Path, config: &StoreAccelSection) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let port = config.listen_port;
+    let egress = store_accel_egress_name(config.egress);
+    if stt_store_accel::request_stop(port).is_ok() {
+        append_host_log(
+            steam_root,
+            &format!("store_accel=legacy_helper_stop port={port}"),
+        );
+        wait_for_store_accel_port_release(port);
+    }
+    let generation = {
+        let mut runtime = store_accel_runtime()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.generation = runtime.generation.wrapping_add(1);
+        let generation = runtime.generation;
+        runtime.active = Some(StoreAccelInstance {
+            generation,
+            port,
+            stop: Arc::clone(&stop),
+            thread: None,
+        });
+        generation
+    };
+    let root = steam_root.to_path_buf();
+    let thread_stop = Arc::clone(&stop);
+    let worker = std::thread::Builder::new()
+        .name("stt-store-accel".into())
+        .spawn(move || {
+            let result = stt_store_accel::run(&root, thread_stop);
+            clear_store_accel_runtime(generation);
+            match result {
+                Ok(()) => append_host_log(
+                    &root,
+                    &format!("store_accel=stopped generation={generation}"),
+                ),
+                Err(error) => append_host_log(
+                    &root,
+                    &format!("store_accel=runtime_error generation={generation} error={error}"),
+                ),
+            }
+        });
+    match worker {
+        Ok(thread) => {
+            let mut thread = Some(thread);
+            let retained = {
+                let mut runtime = store_accel_runtime()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(instance) = runtime
+                    .active
+                    .as_mut()
+                    .filter(|instance| instance.generation == generation)
+                {
+                    instance.thread = thread.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if retained {
+                append_host_log(
+                    steam_root,
+                    &format!(
+                        "store_accel=start_requested generation={generation} port={port} egress={egress} mode=in_process"
+                    ),
+                );
+            }
+        }
+        Err(error) => {
+            clear_store_accel_runtime(generation);
+            append_host_log(
+                steam_root,
+                &format!("store_accel=start_error generation={generation} error={error}"),
+            );
+        }
+    }
+}
+
+fn clear_store_accel_runtime(generation: u64) {
+    let mut runtime = store_accel_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if runtime
+        .active
+        .as_ref()
+        .is_some_and(|instance| instance.generation == generation)
+    {
+        runtime.active = None;
+    }
+}
+
+fn stop_store_accel(steam_root: &Path, fallback_port: u16) {
+    let active = {
+        let mut runtime = store_accel_runtime()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.active.take()
+    };
+    let port = active
+        .as_ref()
+        .map_or(fallback_port, |instance| instance.port);
+    match stt_store_accel::request_stop(port) {
+        Ok(()) => append_host_log(
+            steam_root,
+            &format!("store_accel=stop_requested port={port} mode=in_process"),
+        ),
+        Err(error) => append_host_log(
+            steam_root,
+            &format!("store_accel=stop_signal port={port} error={error}"),
+        ),
+    }
+    if let Some(mut instance) = active {
+        instance.stop.store(true, Ordering::Release);
+        if let Some(thread) = instance.thread.take() {
+            let _ = thread.join();
+        }
+    }
+    wait_for_store_accel_port_release(port);
+}
+
+fn wait_for_store_accel_port_release(port: u16) {
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    for _ in 0..10 {
+        if TcpListener::bind(address).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+const fn store_accel_egress_name(egress: StoreAccelEgress) -> &'static str {
+    match egress {
+        StoreAccelEgress::Disabled => "disabled",
+        StoreAccelEgress::DirectDns => "direct_dns",
+        StoreAccelEgress::LocalCdn => "local_cdn",
+        StoreAccelEgress::HttpConnect => "http_connect",
+    }
 }
 
 /// 处理 steamtools/inbox/*.txt: 每行一个 app_id, 按当前 Catalog 配置入库.
@@ -2139,8 +2422,16 @@ fn run_watch_loop(
         }
 
         if host_changed {
+            let was_store_accel = state.tools().is_enabled(ToolId::StoreAccel);
+            let previous_store_accel = state.host().store_accel;
             match state.load_host_from_steam_root(steam_root) {
                 Ok(()) => {
+                    reconcile_store_accel(
+                        steam_root,
+                        was_store_accel,
+                        Some(&previous_store_accel),
+                        state,
+                    );
                     let log_level = state.host().log.level;
                     if !set_host_log_level(&log_level) {
                         append_host_log_at(
@@ -2502,6 +2793,37 @@ end
             .capabilities
             .iter()
             .all(|item| item.status == stt_steamclient::DownloadCapabilityStatus::ToolDisabled));
+    }
+
+    #[test]
+    fn store_accel_detail_does_not_claim_pac_without_an_egress() {
+        let state = ConfigState::new();
+        let mut host = HostConfig::default();
+        host.tools.enabled.insert("store_accel".into(), true);
+        state.apply_host(host);
+        assert!(store_accel_detail(Path::new("C:/steam"), &state).contains("不会修改系统 PAC"));
+
+        let mut host = state.host();
+        host.store_accel.egress = StoreAccelEgress::DirectDns;
+        state.apply_host(host);
+        assert!(store_accel_detail(Path::new("C:/steam"), &state).contains("兼容模式"));
+
+        let mut host = state.host();
+        host.store_accel.egress = StoreAccelEgress::LocalCdn;
+        host.store_accel.clash_fallback = "127.0.0.1:7890".into();
+        state.apply_host(host);
+        let detail = store_accel_detail(Path::new("C:/steam"), &state);
+        assert!(detail.contains("degraded"));
+        assert!(detail.contains("local_direct"));
+        assert!(detail.contains("clash_fallback"));
+
+        let mut host = state.host();
+        host.store_accel.egress = StoreAccelEgress::HttpConnect;
+        host.store_accel.upstream = "203.0.113.9:443".into();
+        state.apply_host(host);
+        let detail = store_accel_detail(Path::new("C:/steam"), &state);
+        assert!(detail.contains("degraded"));
+        assert!(detail.contains("user_connect"));
     }
 
     #[test]

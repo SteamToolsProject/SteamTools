@@ -1,4 +1,4 @@
-//! 工具注册表骨架 (id, 默认开关; 尚无真实 hook).
+//! 工具注册表骨架 (id, 默认开关).
 
 use std::collections::HashMap;
 
@@ -63,9 +63,9 @@ impl ToolId {
         }
     }
 
-    /// 只占位, 还没有实现 — UI 上要标出来, 别让人以为开了就有效果.
+    /// 仍未实现的工具在 UI 上标出来, 别让人以为开了就有效果.
     pub fn is_placeholder(self) -> bool {
-        matches!(self, ToolId::StoreAccel)
+        false
     }
 }
 
@@ -86,7 +86,7 @@ pub fn builtin_manifests() -> Vec<ToolManifest> {
             id,
             name: id.display_name(),
             default_enabled: id.default_enabled(),
-            needs_client: matches!(id, ToolId::DownloadKit | ToolId::StoreAccel),
+            needs_client: matches!(id, ToolId::DownloadKit),
         })
         .collect()
 }
