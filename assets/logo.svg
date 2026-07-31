@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- 入库 mark: 基于 Feather "download" 图标 (MIT, https://feathericons.com) 适配 -->
+  <rect width="256" height="256" rx="56" fill="#171a21"/>
+  <g transform="translate(64,64) scale(5.3333)" fill="none" stroke="#66c0f4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+    <polyline points="7 10 12 15 17 10"/>
+    <line x1="12" y1="15" x2="12" y2="3"/>
+  </g>
+</svg>
