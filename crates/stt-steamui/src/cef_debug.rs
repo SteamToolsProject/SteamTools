@@ -200,16 +200,20 @@ pub fn install_cef_debug_hook(enable: bool, use_pipe: bool) -> CefDebugReport {
             continue;
         }
         // 模块不导入这两个函数是正常的, 跳过即可.
-        if let Ok(mut hook) = unsafe {
-            IatHook::new(base, target, hk_create_process_w as *const c_void)
-        } {
+        if let Ok(mut hook) =
+            unsafe { IatHook::new(base, target, hk_create_process_w as *const c_void) }
+        {
             if unsafe { hook.attach() }.is_ok() {
                 guard.hooks.push((name.clone(), hook));
             }
         }
         // steamclient64 走 AsUserW 拉起 webhelper, 两者都要接管 (见模块注释).
         if let Ok(mut hook) = unsafe {
-            IatHook::new(base, target_as_user, hk_create_process_as_user_w as *const c_void)
+            IatHook::new(
+                base,
+                target_as_user,
+                hk_create_process_as_user_w as *const c_void,
+            )
         } {
             if unsafe { hook.attach() }.is_ok() {
                 guard.hooks.push((name, hook));
