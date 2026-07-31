@@ -1,0 +1,25 @@
+[package]
+name = "stt-store-accel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Steam store access helper with PAC and DNS-safe CONNECT routing"
+autobins = false
+
+[dependencies]
+stt-config = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# 仅用于候选 IP 的 SNI/证书/HEAD 健康探测, 真实 Steam TLS 仍透明透传.
+rustls = "0.23"
+webpki-roots = "1"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinInet",
+    "Win32_System_Registry",
+] }
+
+[lints]
+workspace = true
