@@ -27,7 +27,7 @@ pub use appinfo::app_names;
 pub use catalog_add::remove_from_library;
 pub use catalog_add::{
     add_to_library, catalog_lua_path, format_catalog_lua, write_catalog_lua, AddToLibraryOutcome,
-    RemoveFromLibraryOutcome,
+    MissingDownloadData,
 };
 pub use error::{ConfigError, Result};
 pub use host_toml::{

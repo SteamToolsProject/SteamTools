@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use stt_catalog::{validate_bundle, CatalogProvider, CatalogTraceEntry};
-use stt_core::{AppId, CatalogBundle};
+use stt_core::{AppId, CatalogBundle, DepotId};
 
 use crate::error::{ConfigError, Result};
 use crate::lua_load::default_lua_dir;
@@ -20,6 +20,65 @@ pub struct AddToLibraryOutcome {
     pub lua_path: PathBuf,
     pub epoch: u64,
     pub owned_count: usize,
+    /// 入库成功后仍缺的下载数据 (有清单但缺 key/token), 空 = 齐全.
+    pub missing: MissingDownloadData,
+}
+
+/// 下载数据缺失情况 (Steam 拿不到就下不了, 应该提示用户).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissingDownloadData {
+    /// 只有清单 (manifest) 没拿到下载密钥 (depot key) 的 depot, 升序.
+    pub depot_keys: Vec<DepotId>,
+    /// 有清单但缺 access token (下载 0B 的常见原因).
+    pub access_token: bool,
+}
+
+impl MissingDownloadData {
+    /// 全部数据齐了, 不需要提示.
+    pub fn is_empty(&self) -> bool {
+        self.depot_keys.is_empty() && !self.access_token
+    }
+
+    /// 人类可读的缺失描述, 空串 = 齐全.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.depot_keys.is_empty() {
+            let ids: Vec<String> = self.depot_keys.iter().map(u32::to_string).collect();
+            parts.push(format!("下载密钥 (Depot {})", ids.join(", ")));
+        }
+        if self.access_token {
+            parts.push("访问令牌".to_owned());
+        }
+        parts.join("、")
+    }
+}
+
+/// 算 bundle 里缺的下载数据 (只算请求 app 的).
+///
+/// 判定:
+/// - depot key: 该 depot 声明了 manifest (能告诉 Steam 下哪个清单), 但没有 depot key
+///   (解密需要). 只有 manifest 没有 key 时 Steam 拿不到解密钥匙, 下载会失败.
+/// - access token: 有清单但没给 token, Steam 下载授权过不去 (常见表现为下载 0B).
+pub fn missing_download_data(app_id: AppId, bundle: &CatalogBundle) -> MissingDownloadData {
+    let app_depots = bundle.app_depots.get(&app_id);
+    let mut depot_keys: Vec<DepotId> = app_depots
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|depot_id| {
+            bundle.manifests.contains_key(depot_id) && !bundle.depot_keys.contains_key(depot_id)
+        })
+        .collect();
+    depot_keys.sort_unstable();
+    let has_manifest = app_depots
+        .into_iter()
+        .flatten()
+        .any(|depot_id| bundle.manifests.contains_key(depot_id));
+    MissingDownloadData {
+        depot_keys,
+        // token 为 0 等于没有 (上游用 0 表示未收录).
+        access_token: has_manifest && bundle.access_tokens.get(&app_id).copied().unwrap_or(0) == 0,
+    }
 }
 
 /// 将 bundle 写成兼容上游的 lua 片段.
@@ -140,6 +199,7 @@ pub fn add_to_library(
         lua_path,
         epoch: state.rules_epoch(),
         owned_count: state.owned_count(),
+        missing: missing_download_data(app_id, &bundle),
     })
 }
 
@@ -302,6 +362,122 @@ mod tests {
     fn bumps_rules_epoch() {
         let (_root, _state, out) = add_app_42();
         assert!(out.epoch > 0);
+    }
+
+    #[test]
+    fn missing_download_data_flags_manifest_without_key() {
+        let mut b = CatalogBundle::default();
+        b.apps.push(42);
+        b.app_depots.insert(42, vec![11, 12]);
+        // depot 11: 有清单无密钥 → 应被标出.
+        b.manifests.insert(
+            11,
+            stt_core::ManifestOverride {
+                manifest_gid: 99,
+                size: 0,
+            },
+        );
+        // depot 12: 清单 + 密钥都齐 → 不标.
+        b.depot_keys.insert(12, "a".repeat(64));
+        b.manifests.insert(
+            12,
+            stt_core::ManifestOverride {
+                manifest_gid: 88,
+                size: 0,
+            },
+        );
+        // 有清单但没给 token → 标出.
+        let missing = missing_download_data(42, &b);
+        assert_eq!(missing.depot_keys, vec![11]);
+        assert!(missing.access_token);
+        assert!(missing.describe().contains("Depot 11"));
+        assert!(missing.describe().contains("访问令牌"));
+        assert!(!missing.is_empty());
+    }
+
+    #[test]
+    fn missing_download_data_empty_when_all_keys_and_token_present() {
+        let mut b = CatalogBundle::default();
+        b.apps.push(42);
+        b.app_depots.insert(42, vec![11]);
+        b.depot_keys.insert(11, "a".repeat(64));
+        b.manifests.insert(
+            11,
+            stt_core::ManifestOverride {
+                manifest_gid: 99,
+                size: 0,
+            },
+        );
+        b.access_tokens.insert(42, 123);
+        assert!(missing_download_data(42, &b).is_empty());
+    }
+
+    #[test]
+    fn missing_download_data_empty_without_manifests() {
+        let mut b = CatalogBundle::default();
+        b.apps.push(42);
+        b.app_depots.insert(42, vec![11]);
+        b.depot_keys.insert(11, "a".repeat(64));
+        // 没有 manifest 就没有"该下但下不了"一说, 不提示.
+        assert!(missing_download_data(42, &b).is_empty());
+    }
+
+    #[test]
+    fn missing_download_data_ignores_other_apps_depots() {
+        let mut b = CatalogBundle {
+            apps: vec![42, 7],
+            ..CatalogBundle::default()
+        };
+        b.app_depots.insert(42, vec![11]);
+        b.app_depots.insert(7, vec![12]);
+        // 缺 key 的 depot 12 属于 app 7, 不归这次入库 (app 42) 管.
+        b.manifests.insert(
+            12,
+            stt_core::ManifestOverride {
+                manifest_gid: 99,
+                size: 0,
+            },
+        );
+        // app 42 没有 manifest, token 缺失也不提示.
+        assert!(missing_download_data(42, &b).is_empty());
+    }
+
+    #[test]
+    fn missing_download_data_flags_only_token_when_keys_present() {
+        let mut b = CatalogBundle::default();
+        b.apps.push(42);
+        b.app_depots.insert(42, vec![11]);
+        b.depot_keys.insert(11, "a".repeat(64));
+        b.manifests.insert(
+            11,
+            stt_core::ManifestOverride {
+                manifest_gid: 99,
+                size: 0,
+            },
+        );
+        // key 齐但没 token → 只报 token (1129580 的真实场景).
+        let missing = missing_download_data(42, &b);
+        assert!(missing.depot_keys.is_empty());
+        assert!(missing.access_token);
+        assert_eq!(missing.describe(), "访问令牌");
+    }
+
+    #[test]
+    fn zero_token_counts_as_missing() {
+        let mut b = CatalogBundle::default();
+        b.apps.push(42);
+        b.app_depots.insert(42, vec![11]);
+        b.depot_keys.insert(11, "a".repeat(64));
+        b.manifests.insert(
+            11,
+            stt_core::ManifestOverride {
+                manifest_gid: 99,
+                size: 0,
+            },
+        );
+        // 上游用 0 表示未收录 (CaiGames app_token: 0), 不能当"有 token".
+        b.access_tokens.insert(42, 0);
+        assert!(missing_download_data(42, &b).access_token);
     }
 
     #[cfg(feature = "lua")]
