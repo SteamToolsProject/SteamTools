@@ -50,7 +50,7 @@ Type: filesandordirs; Name: "{app}\steamtools"
 Type: files; Name: "{app}\stbase.dll.old"
 
 [Code]
-function FindWindowW(lpClassName, lpWindowName: string): LongPtr;
+function FindWindowW(lpClassName, lpWindowName: string): HWND;
   external 'FindWindowW@user32.dll stdcall';
 
 var
@@ -90,9 +90,13 @@ begin
 end;
 
 function InitializeSetup(): Boolean;
+var
+  DiagPath: string;
 begin
   Result := True;
   SteamFound := ReadSteamPath();
+  DiagPath := GetTempDir() + 'steamtools-iss-diag.txt';
+  SaveStringToFile(DiagPath, 'SteamFound=[' + SteamFound + '] GetSteamDir=[' + GetSteamDir('') + ']', False);
 end;
 
 procedure InitializeWizard();
@@ -101,7 +105,8 @@ begin
     wpWelcome, '选择 Steam 安装目录', 'SteamTools 需要把文件放进 Steam 根目录 (steam.exe 所在目录)',
     '如果列表里没有你的 Steam 目录, 请手动选择。点击下一步继续。', False, '');
   SteamDirPage.Add('Steam 根目录:');
-  SteamDirPage.Values[0] := GetSteamDir('');
+  // 注意: 页面创建后 GetSteamDir 会读 Values[0] (此时还是空的), 所以直接给 SteamFound.
+  SteamDirPage.Values[0] := SteamFound;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
