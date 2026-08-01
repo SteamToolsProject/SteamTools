@@ -42,7 +42,10 @@ for (const forbidden of ["fetch(", "XMLHttpRequest", "WebSocket", "window.open",
 }
 
 const normalized = source.replace(/\s+$/u, "") + "\n";
-if (verify && previous !== null && previous !== normalized) {
+// 归一化旧产物行尾: Windows checkout 可能把 LF 转成 CRLF, 直接比较会误报 stale.
+const previousNorm =
+  previous === null ? null : previous.replace(/\r\n?/gu, "\n").replace(/\s+$/u, "") + "\n";
+if (verify && previousNorm !== null && previousNorm !== normalized) {
   throw new Error("embed/panel.iife.js is stale; run npm run build");
 }
 await writeFile(output, normalized, "utf8");
