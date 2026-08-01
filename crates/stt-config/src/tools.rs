@@ -41,7 +41,7 @@ impl ToolId {
         }
     }
 
-    /// 默认开: 入库 + 库 UX + 配置页 + 下载套件.
+    /// 默认开: 入库 + 库 UX + 配置页 + 下载清单.
     ///
     /// 产品表常写「默认仅 catalog_add + library_ux」; 狗粮期把 `config_ui` 也默认开,
     /// 否则通道 gating (`catalog_add || config_ui`) 下关掉入库会把自己关没,
@@ -59,7 +59,7 @@ impl ToolId {
             ToolId::CatalogAdd => "入库 / 清单",
             ToolId::LibraryUx => "库 UX",
             ToolId::ConfigUi => "配置页",
-            ToolId::DownloadKit => "下载套件",
+            ToolId::DownloadKit => "下载清单",
             ToolId::StoreAccel => "商店加速",
         }
     }

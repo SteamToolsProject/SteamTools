@@ -19,7 +19,7 @@
 
 ## 关于
 
-**SteamTools** 是 Windows 下 Steam 进程内的 Rust 工具箱：商店一键入库、库右键增强、内嵌配置面板、下载套件与商店加速。
+**SteamTools** 是 Windows 下 Steam 进程内的 Rust 工具箱：商店一键入库、库右键增强、内嵌配置面板、下载清单与商店加速。
 
 主路径：商店详情页点「入库」→ 上游 Catalog 链拉元数据 → 原子落盘 `config/lua/stt_{id}.lua` → 库内可刷新 / 移除。
 参考 [OpenSteamTool](https://github.com/OpenSteam001/OpenSteamTool) 的能力与 Lua 生态，产品形态与实现均为独立设计。
@@ -43,9 +43,9 @@
 - 受管 App 右键追加「刷新清单 / 移除入库」，**Steam 原菜单完整保留**，操作只追加在底部
 - 非受管 App 一律不拦，Steam 行为不变
 
-### 下载套件 `download_kit`（默认开）
+### 下载清单 `download_kit`（默认开）
 
-- 四项独立能力：manifest 固定（GID/size）、depot key、access token、manifest request code
+- 为 Steam 下载提供所需数据：manifest 固定（GID/size）、depot key、access token、manifest request code——**不加速下载，也不代你下载**
 - 全部**精确 SHA + 入口签名匹配**才挂载，缺符号 / 缺 pattern 时对应能力单独降级，其余不受影响
 - 每项有独立运行时开关与工具中心状态（Ready / DataMissing / PatternMissing / EnvDisabled）
 
@@ -86,7 +86,7 @@
 catalog_add = true        # 入库 / 清单
 library_ux = true         # 库 UX
 config_ui = true          # 配置页
-download_kit = true       # 下载套件（默认开）
+download_kit = true       # 下载清单（默认开）
 store_accel = false       # 商店加速（默认关）
 
 [catalog]
@@ -141,14 +141,14 @@ dwmapi.dll / xinput1_4.dll        # 纯 Rust 加载器 → LoadLibrary(SteamTool
 
 ## 边界与声明
 
-- **「入库」= 元数据落盘**，不宣称下载完成；下载相关能力是独立的 `download_kit`，默认开启、可在配置页关闭
+- **「入库」= 元数据落盘**，不宣称下载完成；下载数据相关能力是独立的 `download_kit`，默认开启、可在配置页关闭
 - `store_accel` 只处理商店 / 社区 / 创意工坊网页流量，不代理下载、游戏、P2P 与票据
 - 能力随 Steam 版本漂移：pattern 失效时对应能力单独降级，其余工具不受影响
 
 ## 免责声明
 
 1. **研究用途** — 本项目仅用于工程 / 研究 / 学习，请勿用于商业、违规或任何未经授权的用途
-2. **封号风险** — 入库、下载套件等能力可能违反 Steam 服务条款，存在账号风险；**强烈建议使用小号测试**，由此造成的封号、财产损失由使用者自行承担
+2. **封号风险** — 入库、下载清单等能力可能违反 Steam 服务条款，存在账号风险；**强烈建议使用小号测试**，由此造成的封号、财产损失由使用者自行承担
 3. **非官方产品** — 本项目与 Valve / Steam 无任何关联，非官方出品，不提供任何形式的官方支持
 4. **数据与隐私** — 本项目不上传账号、密钥、ticket 等敏感数据；日志仅写本机 `steamtools/host.log` 且已脱敏
 5. **后果自负** — 使用本项目产生的任何后果由使用者自行承担

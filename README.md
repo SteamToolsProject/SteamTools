@@ -19,7 +19,7 @@
 
 ## About
 
-**SteamTools** is an in-process Rust toolbox for the Steam client on Windows: one-click library import, library context-menu enhancements, an embedded configuration panel, a download kit, and store access acceleration.
+**SteamTools** is an in-process Rust toolbox for the Steam client on Windows: one-click library import, library context-menu enhancements, an embedded configuration panel, download data, and store access acceleration.
 
 Main flow: click "Add to Library" on a store page → fetch metadata through the catalog provider chain → atomically persist to `config/lua/stt_{id}.lua` → refresh / remove from the library. It references the capabilities and Lua ecosystem of [OpenSteamTool](https://github.com/OpenSteam001/OpenSteamTool), but the product design and implementation are independent.
 
@@ -42,9 +42,9 @@ Main flow: click "Add to Library" on a store page → fetch metadata through the
 - Right-click on managed apps appends "Refresh manifest / Remove from library"; **the original Steam menu is fully preserved**, SteamTools items are only appended at the bottom
 - Unmanaged apps are never intercepted
 
-### Download Kit `download_kit` (default on)
+### Download Data `download_kit` (default on)
 
-- Four independent capabilities: manifest pinning (GID/size), depot key, access token, manifest request code
+- Provides the download data Steam needs: manifest pinning (GID/size), depot key, access token, manifest request code — **it does not accelerate downloads nor download for you**
 - Hooks attach only on **exact SHA + entry signature match**; a missing symbol / pattern degrades that capability alone
 - Each capability has an independent runtime switch and tool-center status (Ready / DataMissing / PatternMissing / EnvDisabled)
 
@@ -85,7 +85,7 @@ Place `steamtools.toml` in the Steam root (next to `steam.exe`). If absent, buil
 catalog_add = true        # catalog import
 library_ux = true         # library UX
 config_ui = true          # config panel
-download_kit = true       # download kit (default on)
+download_kit = true       # download data (default on)
 store_accel = false       # store accel (default off)
 
 [catalog]
@@ -140,7 +140,7 @@ Companion crates: `stt-metadata` (pattern parsing) · `stt-hook` (detachable det
 
 ## Boundaries
 
-- **"Import" means metadata persistence**, not download completion; download capabilities live in the separate `download_kit`, on by default and disableable from the config panel
+- **"Import" means metadata persistence**, not download completion; download-data capabilities live in the separate `download_kit`, on by default and disableable from the config panel
 - `store_accel` only handles store / community / workshop web traffic; it never proxies downloads, game traffic, P2P, or tickets
 - Capabilities drift with Steam versions: a stale pattern degrades that capability alone
 

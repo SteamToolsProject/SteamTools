@@ -27,9 +27,9 @@
 - **库 UX (library_ux)**: 受管 App 右键追加「刷新清单 / 移除入库」(保留 Steam 原菜单);
   M4a 真实 steamui detour (RunFrame / FillInAppOverview / BuildCompleteAppOverviewChange),
   移除队列 drain 清 ownership + MarkAppChange, removed_appid 重注入
-- **下载套件 (download_kit)**: 四项独立能力 — manifest 绑定 (GID/size)、
-  depot key、access token、manifest request code; 均按 exact SHA + 入口签名
-  门禁可降级 attach, 独立 feature + 运行时开关
+- **下载清单 (download_kit)**: 为 Steam 下载提供所需数据 — manifest 绑定 (GID/size)、
+  depot key、access token、manifest request code (不加速下载, 也不代下载); 均按
+  exact SHA + 入口签名门禁可降级 attach, 独立 feature + 运行时开关
 - **商店加速 (store_accel)**: DLL 内代理线程, PAC + HTTP CONNECT, 本地 DNS/CDN
   优选 (A/AAAA 缓存 + 候选测速 + 健康冷却), 可选 Clash loopback 回退;
   不装根证书 / 不做 MITM / 不写 Hosts / 不加载 WinDivert, 启停回滚 PAC
