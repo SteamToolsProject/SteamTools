@@ -46,7 +46,16 @@ const normalized = source.replace(/\s+$/u, "") + "\n";
 const previousNorm =
   previous === null ? null : previous.replace(/\r\n?/gu, "\n").replace(/\s+$/u, "") + "\n";
 if (verify && previousNorm !== null && previousNorm !== normalized) {
-  throw new Error("embed/panel.iife.js is stale; run npm run build");
+  // 定位首个差异, 便于区分环境性差异 (行尾/空白) 与真实产物漂移.
+  let i = 0;
+  const max = Math.min(previousNorm.length, normalized.length);
+  while (i < max && previousNorm.charCodeAt(i) === normalized.charCodeAt(i)) i += 1;
+  const prevChunk = previousNorm.slice(Math.max(0, i - 40), i + 40);
+  const newChunk = normalized.slice(Math.max(0, i - 40), i + 40);
+  throw new Error(
+    `embed/panel.iife.js is stale; run npm run build ` +
+      `(first diff at ${i}, prev=${previousNorm.length} new=${normalized.length})`
+  );
 }
 await writeFile(output, normalized, "utf8");
 console.log(`panel.iife.js: ${size} bytes`);
