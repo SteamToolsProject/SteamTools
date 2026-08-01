@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release artifacts
+        run: cargo build -p stt-host -p stt-store-accel -p stt-loader-dwmapi -p stt-loader-xinput --release
+
+      - name: Extract changelog section for this tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $lines = Get-Content CHANGELOG.md
+          $inSection = $false
+          $out = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in $lines) {
+            if ($line -match "^## \[$([regex]::Escape($tag))\]") {
+              $inSection = $true
+              continue
+            }
+            if ($inSection -and $line -match "^## \[") { break }
+            if ($inSection) { $out.Add($line) }
+          }
+          if ($out.Count -eq 0) {
+            Write-Error "CHANGELOG.md 中找不到段落 ## [$tag]"
+          }
+          $out | Set-Content -Path release-notes.txt -Encoding utf8
+          Write-Host "release notes:"
+          Get-Content release-notes.txt
+
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/SteamTools.dll, target/release/dwmapi.dll, target/release/xinput1_4.dll dist/
+          Copy-Item LICENSE, README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath "SteamTools-$tag-win64.zip"
+          Get-ChildItem dist, SteamTools-$tag-win64.zip | Select-Object Name, Length
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release create $tag `
+            --title "SteamTools $tag" `
+            --notes-file release-notes.txt `
+            SteamTools-$tag-win64.zip `
+            target/release/SteamTools.dll `
+            target/release/dwmapi.dll `
+            target/release/xinput1_4.dll
