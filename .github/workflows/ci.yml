@@ -36,9 +36,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: mozilla/sccache-action@v0.0.6
+      - uses: mozilla/sccache-action@v0.0.11
         with:
-          sccache-version: 0.9.0
+          sccache-version: 0.17.0
       - name: Clippy (all targets, all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -47,9 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla/sccache-action@v0.0.6
+      - uses: mozilla/sccache-action@v0.0.11
         with:
-          sccache-version: 0.9.0
+          sccache-version: 0.17.0
       - name: Test (workspace, all features, serial)
         run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=1
 
@@ -58,9 +58,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla/sccache-action@v0.0.6
+      - uses: mozilla/sccache-action@v0.0.11
         with:
-          sccache-version: 0.9.0
+          sccache-version: 0.17.0
       - name: Release build (product artifacts)
         run: cargo build -p stt-host -p stt-store-accel -p stt-loader-dwmapi -p stt-loader-xinput --release
 
@@ -78,3 +78,4 @@ jobs:
         run: |
           npm ci
           npm run check
+
