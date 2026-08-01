@@ -1,4 +1,4 @@
-![SteamTools](https://socialify.git.ci/SteamToolsProject/SteamTools/image?description=1&descriptionEditable=An%20in-process%20toolbox%20for%20the%20Steam%20client%20on%20Windows%2C%20written%20in%20Rust.&font=Inter&forks=1&issues=1&logo=https%3A%2F%2Fraw.githubusercontent.com%2FSteamToolsProject%2FSteamTools%2Fmaster%2Fassets%2Flogo.svg&name=1&owner=1&pattern=Diagonal%20Stripes&stargazers=1&theme=Dark)
+![SteamTools](https://socialify.git.ci/SteamToolsProject/SteamTools/image?description=1&descriptionEditable=An%20in-process%20toolbox%20for%20the%20Steam%20client%20on%20Windows%2C%20written%20in%20Rust.&font=Inter&forks=1&issues=1&logo=https%3A%2F%2Fraw.githubusercontent.com%2FSteamToolsProject%2FSteamTools%2Fmaster%2Fassets%2Fbanner-logo.png&language=1&name=1&owner=1&pattern=Diagonal%20Stripes&stargazers=1&theme=Dark)
 
 <div align="center">
 
@@ -165,4 +165,7 @@ dwmapi.dll / xinput1_4.dll        # 纯 Rust 加载器 → LoadLibrary(SteamTool
 ## 许可证
 
 本项目采用 [GPLv3](./LICENSE) 协议开源；漏洞报告见 [SECURITY.md](SECURITY.md)。
+
+
+
 
