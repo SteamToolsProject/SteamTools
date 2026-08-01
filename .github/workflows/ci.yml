@@ -1,10 +1,8 @@
 name: CI
 
 on:
-  # master 受分支保护只能 PR 合入, 合入前 PR 检查已覆盖, 故不监听 master push
-  # (避免合入时 PR + push 重复跑两遍).
-  push:
-    branches: [dev]
+  # 只有 PR 才跑 CI: master 与 dev 均仅合入, push 到 dev 的是有权限的
+  # 协作者, 不再重复检查; 合入 master 前 PR 检查已覆盖.
   pull_request:
     branches: [master, dev]
 
