@@ -1,8 +1,10 @@
 name: CI
 
 on:
-  # 只有 PR 才跑 CI: master 与 dev 均仅合入, push 到 dev 的是有权限的
-  # 协作者, 不再重复检查; 合入 master 前 PR 检查已覆盖.
+  # dev push 也跑 CI 给开发反馈 (核心三件套, 不跑 release);
+  # master 受保护仅 PR 合入, 合入前 PR 检查已覆盖, 不监听 master push.
+  push:
+    branches: [dev]
   pull_request:
     branches: [master, dev]
 
