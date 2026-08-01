@@ -68,7 +68,7 @@
 
    | 产物 | 说明 |
    |------|------|
-   | `SteamTools.dll` | 宿主：配置 / 状态 / 全部能力（含内嵌商店加速线程，无需独立 helper） |
+   | `stbase.dll` | 宿主：配置 / 状态 / 全部能力（含内嵌商店加速线程，无需独立 helper） |
    | `dwmapi.dll` | 加载器（纯 Rust 转发 + 加载宿主） |
    | `xinput1_4.dll` | 加载器备选通道（同上） |
 
@@ -113,7 +113,7 @@ clash_fallback = "127.0.0.1:7890"   # 可选：仅允许 loopback，本地候选
 
 | 产物 | 输出路径 |
 |------|----------|
-| `SteamTools.dll` | `target\release\steamtools.dll`（`stt-host` cdylib 输出名） |
+| `stbase.dll` | `target\release\stbase.dll`（`stt-host` cdylib 输出名） |
 | `dwmapi.dll` | `target\release\dwmapi.dll`（`stt-loader-dwmapi`） |
 | `xinput1_4.dll` | `target\release\xinput1_4.dll`（`stt-loader-xinput`） |
 
@@ -127,8 +127,8 @@ npm ci && npm run check
 ## 架构
 
 ```text
-dwmapi.dll / xinput1_4.dll        # 纯 Rust 加载器 → LoadLibrary(SteamTools.dll)
-        └→ SteamTools.dll (stt-host)
+dwmapi.dll / xinput1_4.dll        # 纯 Rust 加载器 → LoadLibrary(stbase.dll)
+        └→ stbase.dll (stt-host)
              ├─ stt-config         TOML + Lua 配置、热重载、原子落盘
              ├─ stt-core           入库状态 / AppRules 唯一状态源
              ├─ stt-catalog        CatalogProvider 链（多源聚合、集中校验）

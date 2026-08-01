@@ -67,7 +67,7 @@ Main flow: click "Add to Library" on a store page → fetch metadata through the
 
    | Artifact | Description |
    |---|---|
-   | `SteamTools.dll` | Host: config / state / all capabilities (includes the embedded store-accel thread; no separate helper) |
+   | `stbase.dll` | Host: config / state / all capabilities (includes the embedded store-accel thread; no separate helper) |
    | `dwmapi.dll` | Loader (pure-Rust forwarding + host loading) |
    | `xinput1_4.dll` | Alternate loader channel (same) |
 
@@ -112,7 +112,7 @@ MSVC release artifacts:
 
 | Artifact | Output path |
 |---|---|
-| `SteamTools.dll` | `target\release\steamtools.dll` (`stt-host` cdylib output name) |
+| `stbase.dll` | `target\release\stbase.dll` (`stt-host` cdylib output name) |
 | `dwmapi.dll` | `target\release\dwmapi.dll` (`stt-loader-dwmapi`) |
 | `xinput1_4.dll` | `target\release\xinput1_4.dll` (`stt-loader-xinput`) |
 
@@ -126,8 +126,8 @@ npm ci && npm run check
 ## Architecture
 
 ```text
-dwmapi.dll / xinput1_4.dll        # pure-Rust loaders → LoadLibrary(SteamTools.dll)
-        └→ SteamTools.dll (stt-host)
+dwmapi.dll / xinput1_4.dll        # pure-Rust loaders → LoadLibrary(stbase.dll)
+        └→ stbase.dll (stt-host)
              ├─ stt-config         TOML + Lua config, hot reload, atomic persistence
              ├─ stt-core           import state / single source of truth for AppRules
              ├─ stt-catalog        catalog provider chain (multi-source, centralized validation)

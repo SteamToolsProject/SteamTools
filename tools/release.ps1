@@ -81,7 +81,7 @@ try {
     }
     $dist = Join-Path $RepoRoot 'dist'
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
-    Copy-Item target/release/SteamTools.dll  $dist -Force
+    Copy-Item target/release/stbase.dll     $dist -Force
     Copy-Item target/release/dwmapi.dll      $dist -Force
     Copy-Item target/release/xinput1_4.dll   $dist -Force
     Copy-Item LICENSE $dist -Force

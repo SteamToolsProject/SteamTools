@@ -16,7 +16,7 @@
 ### Added
 
 - **进程进入**: 纯 Rust 双加载器 (`dwmapi.dll` / `xinput1_4.dll`) 劫持加载
-  `SteamTools.dll` (host), 会话追加日志 `steamtools/host.log` (4 MiB 轮转 + 脱敏)
+  `stbase.dll` (host), 会话追加日志 `steamtools/host.log` (4 MiB 轮转 + 脱敏)
 - **配置**: `steamtools.toml` 宿主配置 + `config/lua` 生态兼容 (mlua), 热重载,
   原子落盘
 - **商店入库 (catalog_add)**: 商店详情页「入库」按钮 (CDP 注入),
@@ -41,7 +41,7 @@
 ### Changed
 
 - 许可证改为 GPL-3.0-or-later; `Cargo.lock` 入库保证可复现构建
-- `store_accel` 从独立 exe 内嵌为 `SteamTools.dll` 内线程 (无独立 helper)
+- `store_accel` 从独立 exe 内嵌为 `stbase.dll` 内线程 (无独立 helper)
 - 配置面板从 Rust 手写 DOM 迁移为 Preact + TSX 组件化 (M6.10)
 - 移除实验代码: native CEF ExecuteJavaScript 注入路径 (CDP 为主路径)
 
