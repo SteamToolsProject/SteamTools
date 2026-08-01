@@ -41,7 +41,8 @@ Desktop.ini
 # ----- Agent / 副驾驶 / 本机 AI（全部不入库）-----
 /AGENTS.md
 /.ai/
-/.github/
+/.github/*
+!/.github/workflows/
 .claude/
 .claudecode/
 .cursor/
@@ -56,6 +57,7 @@ Desktop.ini
 .history/
 .chat/
 .copilot/
+.omo/
 **/__pycache__/
 **/node_modules/
 *.agent.md.bak

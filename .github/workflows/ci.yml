@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all targets, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test (workspace, all features, serial)
+        run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=1
+
+      - name: Release build (product artifacts)
+        run: cargo build -p stt-host -p stt-store-accel -p stt-loader-dwmapi -p stt-loader-xinput --release
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/stt-steamui/ui/package-lock.json
+
+      - name: Config panel UI check
+        working-directory: crates/stt-steamui/ui
+        run: |
+          npm ci
+          npm run check
