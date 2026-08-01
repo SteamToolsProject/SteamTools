@@ -189,7 +189,7 @@ fn run_writer(
     if write_line(
         writer.as_mut().unwrap(),
         &format!(
-            "ts_unix_ms={started_ms} level=info target=stt_host event=session_start session={session_id} thread=stt-log-writer uptime_ms=0 dropped_before=0 message=\"log session started\""
+            "ts_unix_ms={started_ms} level=info target=stt_host event=session_start session={session_id} thread=log-writer uptime_ms=0 dropped_before=0 message=\"log session started\""
         ),
     )
     .is_err()
