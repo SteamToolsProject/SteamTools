@@ -19,6 +19,9 @@ AppPublisher={#APP_PUBLISHER}
 AppPublisherURL={#APP_URL}
 AppSupportURL={#APP_URL}
 DefaultDirName={code:GetSteamDir}
+; 卸载器收敛进数据目录, 别污染 Steam 根目录.
+; 不放 {app}\steamtools\update: 那是自更新工作区, 版本追平后会被整体清理.
+UninstallFilesDir={app}\steamtools
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
