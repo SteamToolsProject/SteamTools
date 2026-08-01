@@ -94,10 +94,29 @@ try {
 
     # ---------- 3.5 安装器 (可选) ----------
     $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+    if (-not $iscc) {
+        # winget 装在 LOCALAPPDATA, choco 装在 Program Files (x86).
+        foreach ($candidate in @(
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+        )) {
+            if (Test-Path $candidate) {
+                $iscc = Get-Item $candidate
+                break
+            }
+        }
+    }
     if ($iscc) {
         Invoke-Step "iscc installer" {
+            # 官方 Inno 不带简体中文语言包, 从官方仓库补一份, 否则编译报缺文件.
+            $langDir = Join-Path (Split-Path (Split-Path $iscc.FullName)) 'Languages'
+            $isl = Join-Path $langDir 'ChineseSimplified.isl'
+            if (-not (Test-Path $isl)) {
+                Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl' `
+                    -OutFile $isl -UseBasicParsing
+            }
             $ver = $Version.TrimStart('v')
-            & $iscc.Source "/DVERSION=$ver" (Join-Path $RepoRoot 'installer\steamtools.iss')
+            & $iscc.FullName "/DVERSION=$ver" (Join-Path $RepoRoot 'installer\steamtools.iss')
         }
         Log "安装器已生成: dist/SteamTools-Setup-$($Version.TrimStart('v')).exe"
     } else {

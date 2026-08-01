@@ -66,6 +66,15 @@ jobs:
             choco install innosetup -y --no-progress
             $env:Path += ";C:\Program Files (x86)\Inno Setup 6"
           }
+          # 官方 Inno 不带简体中文语言包, 从官方仓库补一份, 否则编译报缺文件.
+          $isl = "$env:LOCALAPPDATA\Programs\Inno Setup 6\Languages\ChineseSimplified.isl"
+          if (-not (Test-Path $isl)) {
+            $isl = "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
+          }
+          if (-not (Test-Path $isl)) {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" `
+              -OutFile $isl -UseBasicParsing
+          }
           $version = "${{ github.ref_name }}".TrimStart('v')
           iscc /DVERSION=$version installer\steamtools.iss
           Get-ChildItem dist | Select-Object Name, Length
