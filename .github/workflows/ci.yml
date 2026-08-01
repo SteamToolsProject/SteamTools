@@ -19,7 +19,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 按变更内容决定哪些 job 需要跑: 只改文档/README 时跳过全部编译.
+  changes:
+    runs-on: windows-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      ui: ${{ steps.filter.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+            ui:
+              - 'crates/stt-steamui/ui/**'
+              - '.github/workflows/ci.yml'
+
   fmt:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +54,8 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +69,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +83,8 @@ jobs:
 
   release:
     # 产物验证只在合入 master 前执行; dev PR 快速反馈不跑 release 编译.
-    if: github.base_ref == 'master'
+    needs: changes
+    if: github.base_ref == 'master' && needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +96,8 @@ jobs:
         run: cargo build -p stt-host -p stt-store-accel -p stt-loader-dwmapi -p stt-loader-xinput --release
 
   ui:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,4 +111,3 @@ jobs:
         run: |
           npm ci
           npm run check
-
