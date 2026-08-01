@@ -54,6 +54,8 @@ jobs:
         run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=1
 
   release:
+    # 产物验证只在合入 master 前执行; dev PR 快速反馈不跑 release 编译.
+    if: github.base_ref == 'master'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
