@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use stt_config::{ToolId, ToolRegistry};
 use stt_core::AppId;
@@ -61,7 +61,7 @@ type UiActionHandler = Box<dyn Fn(UiLicenseAction) + Send>;
 struct PackageRuntime {
     queue: Arc<LicenseQueue>,
     /// 配置内 app (owned / 应拦截 CheckAppOwnership).
-    configured: Arc<Mutex<HashSet<AppId>>>,
+    configured: Arc<RwLock<HashSet<AppId>>>,
     on_ui: Mutex<Option<UiActionHandler>>,
 }
 
@@ -85,7 +85,7 @@ fn package_hooks_enabled_by_env() -> bool {
 }
 
 /// 进程内共享运行时 (host init 时注册一次).
-pub fn register_runtime(queue: Arc<LicenseQueue>, configured: Arc<Mutex<HashSet<AppId>>>) {
+pub fn register_runtime(queue: Arc<LicenseQueue>, configured: Arc<RwLock<HashSet<AppId>>>) {
     let _ = RUNTIME.set(PackageRuntime {
         queue,
         configured,
@@ -108,32 +108,52 @@ pub fn runtime_queue() -> Option<Arc<LicenseQueue>> {
     RUNTIME.get().map(|r| Arc::clone(&r.queue))
 }
 
+/// 配置集合非空标志: 热路径先看它, 为空时完全跳过查询与重写.
+static CONFIGURED_NONEMPTY: AtomicBool = AtomicBool::new(false);
+
+fn refresh_configured_nonempty() {
+    let nonempty = RUNTIME
+        .get()
+        .map(|rt| {
+            !rt.configured
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        })
+        .unwrap_or(false);
+    CONFIGURED_NONEMPTY.store(nonempty, Ordering::Relaxed);
+}
+
 pub fn set_configured_apps(apps: impl IntoIterator<Item = AppId>) {
     if let Some(rt) = RUNTIME.get() {
         let mut g = rt
             .configured
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.clear();
         g.extend(apps);
+        drop(g);
+        refresh_configured_nonempty();
     }
 }
 
 pub fn add_configured_app(app_id: AppId) {
     if let Some(rt) = RUNTIME.get() {
         rt.configured
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(app_id);
+        refresh_configured_nonempty();
     }
 }
 
 pub fn remove_configured_app(app_id: AppId) {
     if let Some(rt) = RUNTIME.get() {
         rt.configured
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&app_id);
+        refresh_configured_nonempty();
     }
 }
 
@@ -157,11 +177,15 @@ pub fn package_info_stats() -> (u64, Option<u32>) {
 }
 
 fn is_configured(app_id: AppId) -> bool {
+    // 热路径快速返回: 无受管 app 时不取读锁.
+    if !CONFIGURED_NONEMPTY.load(Ordering::Relaxed) {
+        return false;
+    }
     RUNTIME
         .get()
         .map(|rt| {
             rt.configured
-                .lock()
+                .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&app_id)
         })
@@ -336,7 +360,8 @@ unsafe extern "C" fn hk_get_package_info(
     access_token: u64,
 ) -> *mut c_void {
     if !this.is_null() {
-        C_PACKAGE_INFO.store(this, Ordering::SeqCst);
+        // 捕获指针无顺序要求, Relaxed 即可 (热路径).
+        C_PACKAGE_INFO.store(this, Ordering::Relaxed);
     }
     let target = FN_GET_PACKAGE.load(Ordering::SeqCst);
     if target.is_null() {
@@ -368,7 +393,8 @@ unsafe extern "C" fn hk_get_package_info(
 unsafe extern "C" fn hk_check_app_ownership(this: *mut c_void, app_id: u32, p_own: *mut u8) -> u8 {
     CHECK_HITS.fetch_add(1, Ordering::Relaxed);
     if !this.is_null() {
-        C_USER.store(this, Ordering::SeqCst);
+        // 捕获指针无顺序要求, Relaxed 即可 (热路径).
+        C_USER.store(this, Ordering::Relaxed);
     }
 
     let target = FN_CHECK.load(Ordering::SeqCst);
@@ -447,7 +473,7 @@ fn try_init_fake_license_once() {
     }
     let apps: Vec<AppId> = rt
         .configured
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .copied()
