@@ -145,6 +145,7 @@ fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) -> Li
     q.queue_addition(app_id);
     let plan = stt_steamclient::notify_license_changed(&q);
     append_host_log(steam_root, &plan.summary_line());
+    state.with_rules(|rules| library_ux().sync_from_rules(rules));
     library_ux().on_rules_app_present(app_id);
     if plan.client_applied {
         LibraryAddedResult {
@@ -175,6 +176,7 @@ fn catalog_button_label(result: CatalogJobResult, app_id: AppId) -> String {
 fn on_library_removed(steam_root: &Path, state: &ConfigState, app_id: AppId) {
     sync_download_runtime(state);
     stt_steamclient::remove_configured_app(app_id);
+    state.with_rules(|rules| library_ux().sync_from_rules(rules));
     let Some(q) = license_queue() else {
         append_host_log(steam_root, "package=notify skip=no_license_queue");
         return;
@@ -204,6 +206,15 @@ fn on_rules_reloaded(
     };
     let owned: Vec<AppId> = state.with_rules(|r| r.owned_iter().collect());
     q.reconcile_owned(owned.iter().copied());
+    // 从配置消失的 app 走 UI 移除队列 (RunFrame drain 清 ownership).
+    let before: std::collections::HashSet<AppId> =
+        library_ux().owned_snapshot().into_iter().collect();
+    state.with_rules(|rules| library_ux().sync_from_rules(rules));
+    let after: std::collections::HashSet<AppId> =
+        library_ux().owned_snapshot().into_iter().collect();
+    for id in before.difference(&after) {
+        library_ux().queue_removal(*id);
+    }
     // 重载后取消仍在配置里的 app 的 UI 移除标记.
     for id in &owned {
         library_ux().on_rules_app_present(*id);
@@ -1269,15 +1280,19 @@ fn log_library_ux_plan(
     patterns: &stt_metadata::PatternStore,
 ) -> stt_steamui::LibraryUxInstallReport {
     let tools = state.tools();
-    let report = stt_steamui::plan_library_ux_install(&tools, patterns, "steamui");
-    append_host_log(steam_root, &report.summary_line());
-    // 配置里已有的 app 取消移除标记 (纯逻辑; steamui 写内存 detour 仍未挂).
     let ux = library_ux();
+    // 受管集合与购买时间同步给状态机 (RunFrame/FillIn 只读它).
     state.with_rules(|rules| {
+        ux.sync_from_rules(rules);
         for app_id in rules.owned_iter() {
             ux.on_rules_app_present(app_id);
         }
     });
+    let report = stt_steamui::try_install_library_detours(&tools, patterns, ux);
+    append_host_log(steam_root, &report.summary_line());
+    if let Some(detail) = &report.detail {
+        append_host_log(steam_root, &format!("library_ux=detail {detail}"));
+    }
     report
 }
 
@@ -2075,6 +2090,9 @@ fn run_watch_loop(
     let mut package_rearm_ticks: u32 = 0;
     let mut package_attached_logged = stt_steamclient::is_attached();
     let mut last_package_hook_stats = ((0, 0), (0, None));
+    let mut last_library_stats = (0u64, 0u64, 0u64, 0u64);
+    let mut library_rearm_ticks: u32 = 0;
+    let mut library_attached_logged = stt_steamui::library_detour_attached();
     #[cfg(feature = "download-manifest")]
     let mut manifest_attached_logged = stt_steamclient::is_manifest_hook_attached();
     #[cfg(feature = "download-manifest")]
@@ -2099,6 +2117,7 @@ fn run_watch_loop(
 
         // ~2s 一轮: 未 attach 且 catalog_add 开着则重试 package hooks.
         package_rearm_ticks = package_rearm_ticks.wrapping_add(1);
+        library_rearm_ticks = library_rearm_ticks.wrapping_add(1);
         let package_hook_stats = (
             stt_steamclient::hook_stats(),
             stt_steamclient::package_info_stats(),
@@ -2117,6 +2136,31 @@ fn run_watch_loop(
                 ),
             );
             last_package_hook_stats = package_hook_stats;
+        }
+
+        // 库 UX detour 统计: 有变化才写.
+        let library_stats = stt_steamui::library_detour_stats();
+        if library_stats != last_library_stats && library_stats != (0, 0, 0, 0) {
+            append_host_log(
+                steam_root,
+                &format!(
+                    "library_ux_stats run_frame={} drained={} fill_in={} build_complete={}",
+                    library_stats.0, library_stats.1, library_stats.2, library_stats.3
+                ),
+            );
+            last_library_stats = library_stats;
+        }
+        // steamui 常驻, 一般不会晚加载; 万一没挂上仍按周期重试一次.
+        if !library_attached_logged
+            && library_rearm_ticks.is_multiple_of(16)
+            && state.tools().is_enabled(ToolId::LibraryUx)
+        {
+            let report =
+                stt_steamui::try_install_library_detours(&state.tools(), &patterns, library_ux());
+            if stt_steamui::library_detour_attached() {
+                library_attached_logged = true;
+                append_host_log(steam_root, &report.summary_line());
+            }
         }
         if !package_attached_logged
             && package_rearm_ticks.is_multiple_of(8)
