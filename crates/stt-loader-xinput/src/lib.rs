@@ -125,7 +125,7 @@ unsafe fn load_steam_tools_if_steam() -> bool {
             }
         }
     }
-    !LoadLibraryA(c"SteamTools.dll".as_ptr().cast()).is_null()
+    !LoadLibraryA(c"stbase.dll".as_ptr().cast()).is_null()
 }
 
 #[no_mangle]

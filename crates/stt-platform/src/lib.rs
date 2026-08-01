@@ -29,7 +29,7 @@ pub use module::{
 
 pub const DATA_DIR_NAME: &str = "steamtools";
 pub const LEGACY_DATA_DIR_NAME: &str = "opensteamtool";
-pub const HOST_DLL_NAME: &str = "SteamTools.dll";
+pub const HOST_DLL_NAME: &str = "stbase.dll";
 
 pub fn pattern_cache_dir(steam_root: &Path, component: &str) -> PathBuf {
     data_dir(steam_root).join("pattern").join(component)
@@ -168,6 +168,6 @@ mod tests {
 
     #[test]
     fn host_dll_name() {
-        assert_eq!(HOST_DLL_NAME, "SteamTools.dll");
+        assert_eq!(HOST_DLL_NAME, "stbase.dll");
     }
 }

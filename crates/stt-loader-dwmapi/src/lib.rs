@@ -11,7 +11,7 @@ extern "system" {
     fn DisableThreadLibraryCalls(h: *mut core::ffi::c_void) -> i32;
 }
 
-/// 仅当进程是 steam.exe 且 SteamTools.dll 加载失败时返回 false.
+/// 仅当进程是 steam.exe 且 stbase.dll 加载失败时返回 false.
 unsafe fn load_steam_tools_if_steam() -> bool {
     let mut buf = [0u8; 260];
     let len = GetModuleFileNameA(core::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32);
@@ -24,7 +24,7 @@ unsafe fn load_steam_tools_if_steam() -> bool {
             }
         }
     }
-    !LoadLibraryA(c"SteamTools.dll".as_ptr().cast()).is_null()
+    !LoadLibraryA(c"stbase.dll".as_ptr().cast()).is_null()
 }
 
 const DLL_PROCESS_ATTACH: u32 = 1;
