@@ -113,7 +113,7 @@ impl ConfigSnapshot {
             catalog_modes: CATALOG_MODES,
             catalog_url_template: host.catalog.url_template,
             catalog_status: match host.catalog.mode {
-                crate::CatalogMode::Disabled => "未配置".to_owned(),
+                crate::CatalogMode::Disabled => "已禁用".to_owned(),
                 crate::CatalogMode::CustomHttp => "CustomHttp".to_owned(),
                 crate::CatalogMode::Lua => "Lua (config/lua/catalog.lua)".to_owned(),
                 crate::CatalogMode::Community => "Community (多源聚合)".to_owned(),

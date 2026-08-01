@@ -195,15 +195,15 @@ impl StoreAccelSection {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogMode {
-    /// 不配置完整目录源, 入库操作明确失败.
+    /// 内置社区多源聚合, 开箱即用的默认入库源.
     #[default]
+    Community,
+    /// 不配置完整目录源, 入库操作明确失败.
     Disabled,
     /// 从 URL 模板拉取 SteamTools wire v1.
     CustomHttp,
     /// 从固定的 `config/lua/catalog.lua` 调用 SteamTools wire v1 扩展.
     Lua,
-    /// 内置社区多源聚合.
-    Community,
     /// 仅用于显式开发模式的确定性假数据.
     Mock,
 }
@@ -254,7 +254,7 @@ pub struct CatalogSection {
 impl Default for CatalogSection {
     fn default() -> Self {
         Self {
-            mode: CatalogMode::Disabled,
+            mode: CatalogMode::Community,
             url_template: String::new(),
             timeout_resolve_ms: default_timeout_5s(),
             timeout_connect_ms: default_timeout_5s(),
@@ -490,7 +490,7 @@ mod tests {
     fn parse_minimal_defaults() {
         let c = HostConfig::parse_str("").unwrap();
         assert_eq!(c.log.level, "debug");
-        assert_eq!(c.catalog.mode, CatalogMode::Disabled);
+        assert_eq!(c.catalog.mode, CatalogMode::Community);
         assert_eq!(c.manifest.url, "opensteamtool");
         assert_eq!(c.store_accel.egress, StoreAccelEgress::Disabled);
         assert!(c.is_tool_enabled(ToolId::CatalogAdd));

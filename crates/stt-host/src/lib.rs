@@ -1637,7 +1637,7 @@ fn tool_details(context: ToolDetailsContext<'_>) -> stt_config::ToolDetails {
     } = context;
     let tools = state.tools();
     let catalog = match state.host().catalog.mode {
-        CatalogMode::Disabled => "Catalog 未配置",
+        CatalogMode::Disabled => "Catalog 已禁用",
         CatalogMode::CustomHttp => "Catalog: CustomHttp",
         CatalogMode::Lua => "Catalog: Lua (config/lua/catalog.lua)",
         CatalogMode::Community => "Catalog: Community 多源聚合",
@@ -2778,31 +2778,26 @@ mod tests {
 
     #[test]
     fn default_catalog_does_not_fall_back_to_synthetic_mock() {
-        let dir = std::env::temp_dir().join(format!(
-            "steamtools-host-catalog-disabled-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let state = ConfigState::new();
-        let epoch = state.rules_epoch();
+        let dir = Path::new("unused");
+        let config = CatalogSection::default();
 
-        let error = add_from_config(&state, &dir, 42).unwrap_err();
-
-        assert!(error.to_string().contains("disabled"));
-        assert!(!stt_config::catalog_lua_path(&dir, 42).exists());
-        assert_eq!(state.rules_epoch(), epoch);
-        assert!(!state.with_rules(|rules| rules.is_owned(42)));
-        let _ = fs::remove_dir_all(&dir);
+        // 默认走内置社区链, 不静默回退 synthetic Mock.
+        let provider = build_catalog_provider(dir, &config).unwrap();
+        assert_eq!(provider.id(), "chain");
+        assert_ne!(provider.id(), "mock");
     }
 
     #[test]
     fn mock_provider_requires_explicit_mode() {
         let dir = Path::new("unused");
-        let mut config = CatalogSection::default();
-        assert!(build_catalog_provider(dir, &config).is_err());
+        let config = CatalogSection::default();
+        let provider = build_catalog_provider(dir, &config).unwrap();
+        assert_ne!(provider.id(), "mock");
 
-        config.mode = CatalogMode::Mock;
+        let config = CatalogSection {
+            mode: CatalogMode::Mock,
+            ..CatalogSection::default()
+        };
         let provider = build_catalog_provider(dir, &config).unwrap();
 
         assert_eq!(provider.id(), "mock");
