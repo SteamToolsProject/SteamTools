@@ -15,27 +15,44 @@ use crate::{
 };
 
 const PROVIDER: &str = "community:caigamer";
-const URL_TEMPLATE: &str = "https://auth1.caigamer.cn/GetAppinfo/{app_id}";
+// 上游只有 HTTP (HTTPS 端口无有效证书), 请求本身是公开混淆, 见 RC4 注释.
+const DEFAULT_URL_TEMPLATE: &str = "http://auth1.caigamer.cn/GetAppinfo/{app_id}";
 // RC4 密钥只是公开混淆, 只防一眼人读, 可从二进制中直接提取; 真正的传输保护是 TLS.
-const RC4_KEY: &[u8] = &[
+// 测试要构造同密钥加密的 payload, 所以 `pub(crate)`.
+pub(crate) const RC4_KEY: &[u8] = &[
     0xA1, 0xFC, 0xA1, 0xFC, 0xA1, 0xFD, 0xA1, 0xFD, 0xA1, 0xFB, 0xA1, 0xFA, 0xA1, 0xFB, 0xA1, 0xFA,
     0x42, 0x41, 0x42, 0x41,
 ];
 const MAX_DECRYPTED_BYTES: usize = 2 * 1024 * 1024;
 
 /// CaiGamer 目录源, 仅执行用户主动入库时的一次 AppId 查询.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CaigamerCatalogProvider {
     options: WinHttpGetOptions,
+    url_template: &'static str,
 }
 
 impl CaigamerCatalogProvider {
     pub const fn new(options: WinHttpGetOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            url_template: DEFAULT_URL_TEMPLATE,
+        }
+    }
+
+    /// 测试用: 指向本地假服务器.
+    #[cfg(test)]
+    pub(crate) fn with_url(options: WinHttpGetOptions, url_template: &'static str) -> Self {
+        Self {
+            options,
+            url_template,
+        }
     }
 
     fn fetch_outcome(&self, app_id: AppId) -> CatalogResult<CatalogFetchOutcome> {
-        let url = URL_TEMPLATE.replacen("{app_id}", &app_id.to_string(), 1);
+        let url = self
+            .url_template
+            .replacen("{app_id}", &app_id.to_string(), 1);
         let response = winhttp_get(&url, self.options).map_err(map_http_error)?;
         if !(200..300).contains(&response.status) {
             let kind = if response.status == 404 {
@@ -84,7 +101,10 @@ impl CaigamerCatalogProvider {
             .collect();
         if let Some(config) = fields.get("config") {
             if let Some(token) = find_access_token(config)? {
-                bundle.access_tokens.insert(app_id, token);
+                // app_token 为 0 表示上游也没收录, 不当作有效 token.
+                if token != 0 {
+                    bundle.access_tokens.insert(app_id, token);
+                }
             }
         }
 
@@ -139,7 +159,8 @@ fn provider_error(detail: impl Into<String>, kind: ProviderErrorKind) -> Catalog
     }
 }
 
-fn rc4(key: &[u8], input: &[u8]) -> Vec<u8> {
+/// RC4 流加密 (对称), 测试用 `pub(crate)` 构造加密 payload.
+pub(crate) fn rc4(key: &[u8], input: &[u8]) -> Vec<u8> {
     let mut state = [0u8; 256];
     for (index, value) in state.iter_mut().enumerate() {
         *value = index as u8;
@@ -337,8 +358,39 @@ impl<'a> PythonDictParser<'a> {
     }
 }
 
+/// 从扁平 appinfo 文本中提取 `"depots" {...}` 段 (按括号配对).
+///
+/// CaiGames 的 appinfo 是标准 Steam appinfo 格式: 根级并列多个键
+/// (`"appid"`, `"common"`, `"depots"`, ...), 而 keyvalues_parser 只接受
+/// 单个根 pair, 所以先切出 depots 对象再解析.
+fn extract_depots_section(text: &str) -> &str {
+    let Some(marker) = text.find("\"depots\"") else {
+        return "";
+    };
+    let Some(open) = text[marker..].find('{') else {
+        return "";
+    };
+    let start = marker + open;
+    let mut depth = 0i32;
+    for (offset, byte) in text[start..].char_indices() {
+        match byte {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + 1;
+                    return &text[marker..end];
+                }
+            }
+            _ => {}
+        }
+    }
+    ""
+}
+
 fn parse_appinfo(app_id: AppId, text: &str) -> CatalogResult<CatalogBundle> {
-    let parsed = keyvalues_parser::parse(text)
+    let depots = extract_depots_section(text);
+    let parsed = keyvalues_parser::parse(depots)
         .map_err(|_| provider_error("invalid appinfo VDF", ProviderErrorKind::Rejected))?;
     let mut bundle = CatalogBundle {
         apps: vec![app_id],
@@ -488,8 +540,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_template_uses_https() {
-        assert!(URL_TEMPLATE.starts_with("https://auth1.caigamer.cn/GetAppinfo/"));
+    fn url_template_points_at_caigamer() {
+        // 上游只有 HTTP 可达 (HTTPS 无有效证书), 见模块注释.
+        assert!(
+            DEFAULT_URL_TEMPLATE.starts_with("http://auth1.caigamer.cn/GetAppinfo/"),
+            "{DEFAULT_URL_TEMPLATE}"
+        );
+    }
+
+    #[test]
+    fn parses_flat_steam_appinfo_without_root_object() {
+        // 真实 CaiGames appinfo 是标准 Steam 格式: 根级并列多键, 无外层 {}.
+        // 必须能提取 depots 段并解析出 public manifest.
+        let flat = r#""appid" "1129580"
+"common"
+{
+"name" "Medieval Dynasty"
+}
+"depots"
+{
+"228988"
+{
+"config"
+{
+"oslist" "windows"
+}
+"depotfromapp" "228980"
+}
+"1129581"
+{
+"manifests"
+{
+"public"
+{
+"gid" "7565454548429046356"
+"size" "20835598749"
+"download" "13671716240"
+}
+}
+}
+}
+"_missing_token" "False"
+"#;
+        let bundle = parse_appinfo(1129580, flat).unwrap();
+        assert_eq!(bundle.app_depots[&1129580], vec![1129581]);
+        assert_eq!(
+            bundle.manifests[&1129581].manifest_gid,
+            7565454548429046356u64
+        );
+        // 无 public manifest 的 depot (228988) 不进入列表.
+        assert!(!bundle.app_depots[&1129580].contains(&228988));
+    }
+
+    #[test]
+    fn extract_depots_section_handles_missing_or_malformed() {
+        assert_eq!(extract_depots_section("no depots here"), "");
+        assert_eq!(extract_depots_section("\"depots\" no brace"), "");
+        assert_eq!(extract_depots_section("\"depots\" { \"43\" { }"), "");
+        let ok = extract_depots_section("\"a\" \"b\"\n\"depots\"\n{\n\"43\"\n{\n}\n}\n\"tail\"");
+        assert!(ok.starts_with("\"depots\""));
+        assert!(ok.ends_with('}'));
+        assert!(ok.contains("43"));
     }
 
     #[test]
@@ -528,5 +639,22 @@ mod tests {
         let bundle = parse_appinfo(42, vdf).unwrap();
         assert_eq!(bundle.app_depots[&42], vec![43]);
         assert_eq!(bundle.manifests[&43].manifest_gid, 99);
+    }
+
+    #[test]
+    fn diag_test_payload_round_trip() {
+        // 复现 community 测试里构造的 payload, 验证 parser 能吃.
+        let appinfo_vdf = r#""appinfo" { "depots" { "43" { "manifests" { "public" { "gid" "99" "size" "100" } } } } }"#;
+        let plain = format!(
+            "{{'Key': '{}', 'appinfo': '{}', 'config': '{{\"appid\": 42, \"app_token\": \"777\"}}'}}",
+            "cd".repeat(32),
+            appinfo_vdf
+        );
+        eprintln!("PLAIN: {plain:?}");
+        let fields = parse_python_string_dict(&plain).unwrap();
+        assert_eq!(fields["Key"], "cd".repeat(32));
+        assert_eq!(fields["config"], r#"{"appid": 42, "app_token": "777"}"#);
+        let token = find_access_token(&fields["config"]).unwrap();
+        assert_eq!(token, Some(777));
     }
 }

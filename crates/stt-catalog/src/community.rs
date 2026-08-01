@@ -14,8 +14,9 @@ use stt_platform::{
 use zip::ZipArchive;
 
 use crate::{
-    validate_bundle, CatalogError, CatalogFetchOutcome, CatalogLimits, CatalogProvider,
-    CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, ProviderErrorKind,
+    caigamer::CaigamerCatalogProvider, validate_bundle, CatalogError, CatalogFetchOutcome,
+    CatalogLimits, CatalogProvider, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome,
+    ProviderErrorKind,
 };
 
 const APP_ID_PLACEHOLDER: &str = "{app_id}";
@@ -90,6 +91,8 @@ pub struct CommunityCatalogProvider {
     options: WinHttpGetOptions,
     metadata_sources: Vec<HttpMetadataSource>,
     archive_sources: Vec<ArchiveSource>,
+    /// access token 缺失时的补充源 (CaiGames appinfo 内含 app_token).
+    caigamer: Option<CaigamerCatalogProvider>,
     max_snapshot_bytes: usize,
     max_archive_bytes: usize,
 }
@@ -102,6 +105,7 @@ impl CommunityCatalogProvider {
             options,
             metadata_sources: built_in_metadata_sources(),
             archive_sources: built_in_archive_sources(),
+            caigamer: Some(CaigamerCatalogProvider::new(options)),
             max_snapshot_bytes: MAX_SNAPSHOT_BYTES,
             max_archive_bytes: MAX_ARCHIVE_BYTES,
         }
@@ -135,10 +139,15 @@ impl CommunityCatalogProvider {
 
         match self.enrich_access_token(app_id, &mut bundle) {
             Ok(true) => trace.push(hit_trace("community:token_snapshot")),
-            Ok(false) => trace.push(CatalogTraceEntry {
-                provider: "community:token_snapshot".to_owned(),
-                outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
-            }),
+            Ok(false) => {
+                trace.push(CatalogTraceEntry {
+                    provider: "community:token_snapshot".to_owned(),
+                    outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
+                });
+                // 快照没 token 不代表没有: CaiGames 的 appinfo 内含 app_token,
+                // 元数据命中但 token 缺失时用它补一次 (入库不阻塞, 补不上就提示).
+                self.enrich_token_from_caigamer(app_id, &mut bundle, &mut trace);
+            }
             Err(error) => trace.push(failed_trace("community:token_snapshot", &error)),
         }
 
@@ -299,6 +308,36 @@ impl CommunityCatalogProvider {
         Ok(true)
     }
 
+    /// token 快照缺失时用 CaiGames appinfo 补 access token.
+    ///
+    /// CaiGames 的 `GetAppinfo/{app_id}` 返回里带 `config` 字段, 内含 `app_token`.
+    /// 快照链覆盖不全的游戏 (冷门/新游戏) 常能从这里补上. 补不上不算错误,
+    /// 只记 trace, 入库照常进行 (缺 token 由上层弹窗提示).
+    fn enrich_token_from_caigamer(
+        &self,
+        app_id: AppId,
+        bundle: &mut CatalogBundle,
+        trace: &mut Vec<CatalogTraceEntry>,
+    ) {
+        let Some(caigamer) = &self.caigamer else {
+            return;
+        };
+        match caigamer.fetch_with_trace(app_id) {
+            Ok(outcome) => match outcome.bundle.access_tokens.get(&app_id) {
+                // app_token 为 0 表示 CaiGames 也未收录, 不补.
+                Some(&token) if token != 0 => {
+                    bundle.access_tokens.insert(app_id, token);
+                    trace.push(hit_trace("community:caigamer_token"));
+                }
+                _ => trace.push(CatalogTraceEntry {
+                    provider: "community:caigamer_token".to_owned(),
+                    outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
+                }),
+            },
+            Err(error) => trace.push(failed_trace("community:caigamer_token", &error)),
+        }
+    }
+
     #[cfg(test)]
     fn with_test_sources(
         cache_dir: PathBuf,
@@ -313,9 +352,16 @@ impl CommunityCatalogProvider {
             options,
             metadata_sources,
             archive_sources,
+            caigamer: None,
             max_snapshot_bytes,
             max_archive_bytes,
         }
+    }
+
+    #[cfg(test)]
+    fn with_caigamer(mut self, caigamer: CaigamerCatalogProvider) -> Self {
+        self.caigamer = Some(caigamer);
+        self
     }
 }
 
@@ -851,8 +897,10 @@ fn insert_archive_key(
     if depot_id == 0 {
         return Err(CatalogError::ZeroDepotId);
     }
+    // 非 64 hex 的 key 是上游数据格式问题 (如 CaiGames 主 depot 的超长 key),
+    // 跳过该 depot 而不是让整份 archive 解析失败.
     if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(CatalogError::InvalidDepotKey { depot_id });
+        return Ok(());
     }
     match keys.get(&depot_id) {
         Some(existing) if !existing.eq_ignore_ascii_case(key) => {
@@ -1034,33 +1082,58 @@ mod tests {
 
     impl FakeHttpServer {
         fn spawn(body: Vec<u8>) -> Self {
+            Self::spawn_with(&[("info", body)])
+        }
+
+        /// 按 URL 路径段分发响应: 每个连接 accept 一次, 顺序处理直到超时.
+        /// 用于 metadata + caigamer 补源等多请求场景.
+        fn spawn_with(routes: &[(&str, Vec<u8>)]) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
             let template =
                 Box::leak(format!("http://127.0.0.1:{port}/info/{{app_id}}").into_boxed_str());
+            let routes: Vec<(String, Vec<u8>)> = routes
+                .iter()
+                .map(|(path, body)| (path.to_string(), body.clone()))
+                .collect();
             let thread = std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            if Instant::now() >= deadline {
-                                return;
-                            }
                             std::thread::sleep(Duration::from_millis(5));
+                            continue;
                         }
                         Err(_) => return,
-                    }
-                };
-                let mut request = [0u8; 2048];
-                let _ = stream.read(&mut request);
-                let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(headers.as_bytes());
-                let _ = stream.write_all(&body);
+                    };
+                    let mut request = [0u8; 4096];
+                    let Ok(read) = stream.read(&mut request) else {
+                        continue;
+                    };
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    // 取路径第一段 (如 /info/42 取 info) 匹配路由.
+                    let path = request
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .trim_start_matches('/')
+                        .split('/')
+                        .next()
+                        .unwrap_or("");
+                    let body = routes
+                        .iter()
+                        .find(|(name, _)| name == path)
+                        .map(|(_, body)| body.clone())
+                        .unwrap_or_else(|| b"not found".to_vec());
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    let _ = stream.write_all(&body);
+                }
             });
             Self {
                 template,
@@ -1082,6 +1155,15 @@ mod tests {
                 id: "community:test_archive",
                 url_template: self.template,
             }
+        }
+
+        fn caigamer_source(&self) -> CaigamerCatalogProvider {
+            // 同一服务器, 用 /GetAppinfo/ 路径段让路由分发到 caigamer 的响应.
+            let url = self
+                .template
+                .replace("/info/{app_id}", "/GetAppinfo/{app_id}");
+            let url: &'static str = Box::leak(url.into_boxed_str());
+            CaigamerCatalogProvider::with_url(options(1024), url)
         }
     }
 
@@ -1363,5 +1445,108 @@ mod tests {
         assert_eq!(outcome.bundle.depot_keys[&43], key);
         assert_eq!(outcome.bundle.manifests[&43].manifest_gid, 99);
         assert_eq!(outcome.source, "community:test_archive");
+    }
+
+    /// CaiGames 补 token: 快照无 token 但 caigamer appinfo 里有 → 补上并记录 trace.
+    #[test]
+    fn community_fills_missing_token_from_caigamer() {
+        let _guard = crate::http_test_guard();
+        let dir = TestDir::new();
+        // 只有 depot key, 没有 token 快照 (空文件 = 未收录).
+        std::fs::write(
+            dir.0.join(DEPOT_KEYS_FILE),
+            format!(r#"{{"43":"{}"}}"#, "ab".repeat(32)),
+        )
+        .unwrap();
+        std::fs::write(dir.0.join(APP_TOKENS_FILE), "{}").unwrap();
+
+        // 同一服务器按路径分发: /info/ 给 metadata, /GetAppinfo/ 给 caigamer.
+        // Key 是 VDF 格式 (depots/DecryptionKey), 不是裸 hex.
+        let appinfo_vdf = r#""appinfo" { "depots" { "43" { "manifests" { "public" { "gid" "99" "size" "100" } } } } }"#;
+        let key_vdf = format!(
+            "\"depots\"\n{{\n\"43\"\n{{\n\"DecryptionKey\" \"{}\"\n}}\n}}",
+            "cd".repeat(32)
+        );
+        let plain = format!(
+            "{{'Key': '{}', 'appinfo': '{}', 'config': '{{\"appid\": 42, \"app_token\": \"777\"}}'}}",
+            key_vdf, appinfo_vdf
+        );
+        let encrypted = crate::caigamer::rc4(crate::caigamer::RC4_KEY, plain.as_bytes());
+        let server =
+            FakeHttpServer::spawn_with(&[("info", valid_body()), ("GetAppinfo", encrypted)]);
+
+        let provider = CommunityCatalogProvider::with_test_sources(
+            dir.0.clone(),
+            options(1024),
+            vec![server.source()],
+            Vec::new(),
+            1024,
+            1024,
+        )
+        .with_caigamer(server.caigamer_source());
+
+        let outcome = provider.fetch_with_trace(42).unwrap();
+
+        // token 从 caigamer 补到.
+        assert_eq!(outcome.bundle.access_tokens[&42], 777);
+        // trace 里有补源记录.
+        assert!(
+            outcome
+                .trace
+                .iter()
+                .any(|entry| entry.provider == "community:caigamer_token"),
+            "{:?}",
+            outcome.trace
+        );
+    }
+
+    /// CaiGames 也没 token 时: 不阻塞入库, trace 记录 NotFound.
+    #[test]
+    fn community_keeps_going_when_caigamer_has_no_token() {
+        let _guard = crate::http_test_guard();
+        let dir = TestDir::new();
+        std::fs::write(
+            dir.0.join(DEPOT_KEYS_FILE),
+            format!(r#"{{"43":"{}"}}"#, "ab".repeat(32)),
+        )
+        .unwrap();
+        std::fs::write(dir.0.join(APP_TOKENS_FILE), "{}").unwrap();
+
+        // config 里没有 app_token 字段.
+        let appinfo_vdf = r#""appinfo" { "depots" { "43" { "manifests" { "public" { "gid" "99" "size" "100" } } } } }"#;
+        let key_vdf = format!(
+            "\"depots\"\n{{\n\"43\"\n{{\n\"DecryptionKey\" \"{}\"\n}}\n}}",
+            "cd".repeat(32)
+        );
+        let plain = format!(
+            "{{'Key': '{}', 'appinfo': '{}', 'config': '{{\"appid\": 42}}'}}",
+            key_vdf, appinfo_vdf
+        );
+        let encrypted = crate::caigamer::rc4(crate::caigamer::RC4_KEY, plain.as_bytes());
+        let server =
+            FakeHttpServer::spawn_with(&[("info", valid_body()), ("GetAppinfo", encrypted)]);
+
+        let provider = CommunityCatalogProvider::with_test_sources(
+            dir.0.clone(),
+            options(1024),
+            vec![server.source()],
+            Vec::new(),
+            1024,
+            1024,
+        )
+        .with_caigamer(server.caigamer_source());
+
+        let outcome = provider.fetch_with_trace(42).unwrap();
+
+        assert!(outcome.bundle.access_tokens.is_empty());
+        assert!(
+            outcome
+                .trace
+                .iter()
+                .any(|entry| entry.provider == "community:caigamer_token"
+                    && entry.outcome == CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound)),
+            "{:?}",
+            outcome.trace
+        );
     }
 }
