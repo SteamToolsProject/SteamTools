@@ -39,6 +39,7 @@ pub struct LibraryUxInstallReport {
     pub status: LibraryUxInstallStatus,
     pub resolved: Vec<String>,
     pub missing: Vec<String>,
+    pub detail: Option<String>,
 }
 
 impl LibraryUxInstallReport {
@@ -53,6 +54,11 @@ impl LibraryUxInstallReport {
                 self.missing.join(",")
             }
         )
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 }
 
@@ -69,6 +75,7 @@ pub fn plan_library_ux_install(
             status: LibraryUxInstallStatus::Disabled,
             resolved: Vec::new(),
             missing: Vec::new(),
+            detail: None,
         };
     }
 
@@ -82,6 +89,7 @@ pub fn plan_library_ux_install(
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                detail: None,
             }
         }
     };
@@ -102,8 +110,8 @@ pub fn plan_library_ux_install(
     let status = if !hooks_ok {
         LibraryUxInstallStatus::SymbolsMissing
     } else {
-        // 有 pattern 条目仍不够: CSteamApp 字段偏移 / RunFrame 入口未在本机
-        // SteamUI 上钉死前不 attach 业务 detour (写 PurchasedTime 会踩内存).
+        // pattern 齐全只是规划就绪; 真正 attach 由 library_detour 按
+        // exact-SHA 门禁 + 本机钉定的布局偏移执行.
         LibraryUxInstallStatus::LogicOnly
     };
 
@@ -111,6 +119,7 @@ pub fn plan_library_ux_install(
         status,
         resolved,
         missing,
+        detail: None,
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! 不碰 steamui 内存布局; 业务 detour 装上后调用这些纯逻辑.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use stt_core::{AppId, AppRules};
@@ -26,11 +26,51 @@ pub struct LibraryUx {
 struct LibraryUxInner {
     pending_removals: Vec<AppId>,
     removed_app_ids: HashSet<AppId>,
+    /// 配置里受管 (owned) 的 app; RunFrame 跳过它们 (对标 IsOwned).
+    owned: HashSet<AppId>,
+    /// app → 购买时间 (unix 秒), FillIn 写入 CSteamApp::PurchasedTime.
+    purchase_times: HashMap<AppId, u32>,
 }
 
 impl LibraryUx {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 全量同步受管集合与购买时间 (host 从 AppRules 推送).
+    pub fn sync_from_rules(&self, rules: &AppRules) {
+        let mut g = self.lock();
+        g.owned.clear();
+        g.purchase_times.clear();
+        for app_id in rules.owned_iter() {
+            g.owned.insert(app_id);
+            if let Some(t) = rules.purchase_time(app_id) {
+                g.purchase_times.insert(app_id, t);
+            }
+        }
+    }
+
+    /// 配置里受管 (owned) 判断; RunFrame 跳过, 避免把刚入库的又摘掉.
+    pub fn is_owned(&self, app_id: AppId) -> bool {
+        self.lock().owned.contains(&app_id)
+    }
+
+    /// 当前受管集合快照 (host 在 reload 时做差集).
+    pub fn owned_snapshot(&self) -> Vec<AppId> {
+        let g = self.lock();
+        let mut v: Vec<_> = g.owned.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// 配置里的购买时间 (unix 秒); 无配置返回 None.
+    pub fn purchase_time(&self, app_id: AppId) -> Option<u32> {
+        self.lock().purchase_times.get(&app_id).copied()
+    }
+
+    /// 已卸载时由 RunFrame 标记 removed (供 BuildComplete 重注入).
+    pub fn mark_removed(&self, app_id: AppId) {
+        self.lock().removed_app_ids.insert(app_id);
     }
 
     /// 跨线程入队; UI RunFrame 再 drain (对标 QueueRemoval).
