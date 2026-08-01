@@ -17,7 +17,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use host_log::{HostLogLevel, HostLogger};
@@ -38,7 +38,7 @@ use stt_steamclient::{LicenseQueue, UiLicenseAction};
 /// 进程内 package 许可队列 (init 时注册).
 static LICENSE_QUEUE: OnceLock<Arc<LicenseQueue>> = OnceLock::new();
 /// 配置内 app 集合, CheckAppOwnership 钩子只读这份.
-static CONFIGURED_APPS: OnceLock<Arc<Mutex<HashSet<AppId>>>> = OnceLock::new();
+static CONFIGURED_APPS: OnceLock<Arc<RwLock<HashSet<AppId>>>> = OnceLock::new();
 /// 库 UX 纯逻辑控制器 (CancelRemoval / QueueRemoval).
 static LIBRARY_UX: OnceLock<stt_steamui::LibraryUx> = OnceLock::new();
 /// 进程内日志写入器, 只在 init 工作线程中创建.
@@ -71,18 +71,18 @@ fn library_ux() -> &'static stt_steamui::LibraryUx {
     LIBRARY_UX.get_or_init(stt_steamui::LibraryUx::new)
 }
 
-fn configured_apps() -> Option<Arc<Mutex<HashSet<AppId>>>> {
+fn configured_apps() -> Option<Arc<RwLock<HashSet<AppId>>>> {
     CONFIGURED_APPS.get().map(Arc::clone)
 }
 
 fn sync_configured_from_state(state: &ConfigState) {
-    // 先收集 id, 再锁 mutex 一次.
-    // CONFIGURED_APPS 与 package runtime 共用同一把 Arc<Mutex<HashSet>>,
-    // 若持锁时再调 set_configured_apps 会 **自死锁** (非可重入 Mutex).
+    // 先收集 id, 再锁一次.
+    // CONFIGURED_APPS 与 package runtime 共用同一把 Arc<RwLock<HashSet>>,
+    // 若持写锁时再调 set_configured_apps 会 **自死锁** (RwLock 写锁不可重入).
     let ids: Vec<AppId> = state.with_rules(|rules| rules.owned_iter().collect());
     if let Some(set) = configured_apps() {
         let mut g = set
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.clear();
         g.extend(ids.iter().copied());
@@ -1288,11 +1288,11 @@ fn setup_package_layer(
     patterns: &stt_metadata::PatternStore,
 ) -> stt_steamclient::PackageInstallReport {
     let queue = Arc::new(LicenseQueue::new());
-    let configured = Arc::new(Mutex::new(HashSet::new()));
+    let configured = Arc::new(RwLock::new(HashSet::new()));
     let owned: Vec<AppId> = state.with_rules(|rules| rules.owned_iter().collect());
     {
         let mut g = configured
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.extend(owned.iter().copied());
     }
@@ -1309,7 +1309,7 @@ fn setup_package_layer(
             "package=license_queue seeded_injected={} configured={}",
             queue.injected_len(),
             configured
-                .lock()
+                .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len()
         ),
@@ -2844,7 +2844,7 @@ end
         state.apply_host(host);
 
         let queue = Arc::new(LicenseQueue::new());
-        let configured = Arc::new(Mutex::new(HashSet::new()));
+        let configured = Arc::new(RwLock::new(HashSet::new()));
         let _ = LICENSE_QUEUE.set(Arc::clone(&queue));
         let _ = CONFIGURED_APPS.set(Arc::clone(&configured));
         stt_steamclient::register_runtime(Arc::clone(&queue), Arc::clone(&configured));
@@ -2880,7 +2880,7 @@ end
         assert_eq!(snapshot.request_code_depots, HashSet::from([43]));
         assert!(queue.injected_contains(42));
         assert!(configured
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&42));
 
