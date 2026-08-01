@@ -109,7 +109,8 @@ try {
     if ($iscc) {
         Invoke-Step "iscc installer" {
             # 官方 Inno 不带简体中文语言包, 从官方仓库补一份, 否则编译报缺文件.
-            $langDir = Join-Path (Split-Path (Split-Path $iscc.FullName)) 'Languages'
+            # ISCC.exe 在 <安装目录>\ISCC.exe; Languages 在 <安装目录>\Languages.
+            $langDir = Join-Path (Split-Path $iscc.FullName) 'Languages'
             $isl = Join-Path $langDir 'ChineseSimplified.isl'
             if (-not (Test-Path $isl)) {
                 Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl' `

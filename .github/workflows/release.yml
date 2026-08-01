@@ -67,11 +67,13 @@ jobs:
             $env:Path += ";C:\Program Files (x86)\Inno Setup 6"
           }
           # 官方 Inno 不带简体中文语言包, 从官方仓库补一份, 否则编译报缺文件.
-          $isl = "$env:LOCALAPPDATA\Programs\Inno Setup 6\Languages\ChineseSimplified.isl"
-          if (-not (Test-Path $isl)) {
-            $isl = "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
+          $langDir = "$env:LOCALAPPDATA\Programs\Inno Setup 6\Languages"
+          if (-not (Test-Path $langDir)) {
+            $langDir = "C:\Program Files (x86)\Inno Setup 6\Languages"
           }
+          $isl = Join-Path $langDir "ChineseSimplified.isl"
           if (-not (Test-Path $isl)) {
+            New-Item -ItemType Directory -Force -Path $langDir | Out-Null
             Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" `
               -OutFile $isl -UseBasicParsing
           }
