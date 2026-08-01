@@ -54,3 +54,5 @@
 
 - 日志脱敏: 不记录 key / token / ticket / cookie / 查询参数
 - store_accel allowlist 外请求不经过 helper; 不安装根证书
+
+## [test] - doc-only change
