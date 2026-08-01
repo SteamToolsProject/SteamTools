@@ -30,7 +30,8 @@ use stt_catalog::{
 use stt_config::{
     add_to_library, apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent,
     ConfigSnapshot, ConfigState, HostConfig, LuaCatalogProvider, LuaHttpClient, LuaHttpErrorKind,
-    LuaHttpMethod, LuaHttpRequest, LuaHttpResponse, StoreAccelEgress, StoreAccelSection, ToolId,
+    LuaHttpMethod, LuaHttpRequest, LuaHttpResponse, MissingDownloadData, StoreAccelEgress,
+    StoreAccelSection, ToolId,
 };
 use stt_core::{AppId, AppRules};
 use stt_steamclient::{LicenseQueue, UiLicenseAction};
@@ -172,6 +173,26 @@ fn catalog_job_note(result: CatalogJobResult, app_id: AppId, detail: &str) -> St
 
 fn catalog_button_label(result: CatalogJobResult, app_id: AppId) -> String {
     format!("入库{} {app_id}", result.label())
+}
+
+/// 缺下载数据时的日志后缀 (空 = 齐全).
+///
+/// 注意: `access_token=` 后跟任何值都会被日志脱敏成 `<redacted>`,
+/// 所以状态用 `missing_access_token=1`, 否则 `access_token=missing` 里的
+/// `missing` 会被当成 token 值藏掉, 日志反而看不出"缺"。
+fn missing_log_suffix(missing: &MissingDownloadData) -> String {
+    if missing.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !missing.depot_keys.is_empty() {
+        let ids: Vec<String> = missing.depot_keys.iter().map(u32::to_string).collect();
+        parts.push(format!("depot_keys={}", ids.join(",")));
+    }
+    if missing.access_token {
+        parts.push("missing_access_token=1".to_owned());
+    }
+    format!(" missing={}", parts.join(" "))
 }
 
 /// 移除成功后.
@@ -794,10 +815,11 @@ fn spawn_catalog_worker(
                 match add_from_config(&state, &root, job.app_id) {
                     Ok(out) => {
                         let applied = on_library_added(&root, &state, job.app_id);
+                        let missing_log = missing_log_suffix(&out.missing);
                         append_host_log(
                             &root,
                             &format!(
-                                "catalog_add={} result={} source={} app_id={} provider={} trace={} lua={} epoch={} owned={} detail={}",
+                                "catalog_add={} result={} source={} app_id={} provider={} trace={} lua={} epoch={} owned={} detail={}{missing_log}",
                                 if applied.result == CatalogJobResult::Success {
                                     "ok"
                                 } else {
@@ -820,8 +842,15 @@ fn spawn_catalog_worker(
                                 applied.result,
                                 job.app_id,
                                 &format!(
-                                    "已落盘; provider={}; owned={}; {}",
-                                    out.provider_id, out.owned_count, applied.detail
+                                    "已落盘; provider={}; owned={}; {}{}",
+                                    out.provider_id,
+                                    out.owned_count,
+                                    applied.detail,
+                                    if out.missing.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("; 缺 {}", out.missing.describe())
+                                    }
                                 ),
                             ),
                         );
@@ -831,6 +860,15 @@ fn spawn_catalog_worker(
                                 true,
                                 &catalog_button_label(applied.result, job.app_id),
                             ));
+                            // 有清单但缺下载数据 (key/token): 商店页弹窗提示,
+                            // 免得用户以为能直接下载.
+                            if !out.missing.is_empty() {
+                                let text = out.missing.describe();
+                                let _ = feedback_tx.send(stt_steamui::store_missing_key_warn_js(
+                                    job.app_id,
+                                    &text,
+                                ));
+                            }
                         }
                     }
                     Err(error) => {
@@ -3047,6 +3085,87 @@ end
         );
         assert!(log.contains("provider=custom_http"), "{log}");
         assert!(log.contains("package=notify mode=logic insert=1"), "{log}");
+    }
+
+    #[cfg(all(
+        feature = "download-manifest",
+        feature = "download-key",
+        feature = "download-token",
+        feature = "download-request-code"
+    ))]
+    #[test]
+    fn store_catalog_job_warns_when_manifest_missing_depot_key() {
+        // provider 只给 manifest 不给 key: 入库成功, 但必须弹"缺下载密钥"提示.
+        let body = r#"{"schema_version":1,"apps":[{"app_id":42,"depots":[{"depot_id":43,"manifest":{"gid":"99","size":"100"}}]}]}"#
+            .as_bytes()
+            .to_vec();
+        let server = FakeCatalogServer::spawn(body);
+
+        let root = tempfile::tempdir().unwrap();
+        stt_platform::ensure_data_dir(root.path()).unwrap();
+        let state = ConfigState::new();
+        let mut host = HostConfig::default();
+        host.catalog.mode = CatalogMode::CustomHttp;
+        host.catalog.url_template = server.template.clone();
+        state.apply_host(host);
+
+        let queue = Arc::new(LicenseQueue::new());
+        let configured = Arc::new(RwLock::new(HashSet::new()));
+        let _ = LICENSE_QUEUE.set(Arc::clone(&queue));
+        let _ = CONFIGURED_APPS.set(Arc::clone(&configured));
+        stt_steamclient::register_runtime(Arc::clone(&queue), Arc::clone(&configured));
+        stt_steamclient::set_ui_action_handler(apply_ui_license_action);
+
+        let note = Arc::new(Mutex::new(String::new()));
+        let (jobs, feedback) = spawn_catalog_worker(root.path(), &state, &note);
+        queue_catalog_job(
+            &jobs,
+            CatalogJob {
+                app_id: 42,
+                source: CatalogJobSource::StoreCdp,
+            },
+        )
+        .unwrap();
+
+        // 第一条是按钮回写, 第二条是缺下载数据弹窗.
+        let first = feedback.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(first.contains("入库部分成功 42"), "{first}");
+        let warn = feedback.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(warn.contains("stt-missing-key"), "{warn}");
+        assert!(warn.contains("Depot 43"), "{warn}");
+
+        let note = note
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(note.contains("缺 下载密钥 (Depot 43)"), "{note}");
+        // 有 manifest 没给 token, 弹窗文案也要提 token.
+        assert!(note.contains("访问令牌"), "{note}");
+
+        let log = fs::read_to_string(stt_platform::host_log_path(root.path())).unwrap();
+        assert!(
+            log.contains("missing=depot_keys=43 missing_access_token=1"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn missing_log_suffix_flags_each_missing_kind() {
+        let empty = MissingDownloadData::default();
+        assert_eq!(missing_log_suffix(&empty), "");
+        let keys = MissingDownloadData {
+            depot_keys: vec![43, 7],
+            access_token: false,
+        };
+        assert_eq!(missing_log_suffix(&keys), " missing=depot_keys=43,7");
+        let token = MissingDownloadData {
+            depot_keys: vec![],
+            access_token: true,
+        };
+        assert_eq!(
+            missing_log_suffix(&token),
+            " missing=missing_access_token=1"
+        );
     }
 
     #[test]

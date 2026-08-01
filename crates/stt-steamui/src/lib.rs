@@ -23,8 +23,8 @@ pub use library_detour::{
 
 pub use cdp_bridge::{
     cdp_store_inject_js, poll_store_cdp, poll_store_cdp_default, run_store_cdp_loop,
-    run_store_cdp_loop_with_js, store_button_result_js, store_teardown_js, StoreCdpPoll,
-    CDP_STORE_INJECT_JS, STORE_TEARDOWN_JS,
+    run_store_cdp_loop_with_js, store_button_result_js, store_missing_key_warn_js,
+    store_teardown_js, StoreCdpPoll, CDP_STORE_INJECT_JS, STORE_TEARDOWN_JS,
 };
 pub use cdp_pipe::{poll_store_pipe, run_store_pipe_loop, CdpPipeSession, PipeTarget};
 pub use cef_debug::{

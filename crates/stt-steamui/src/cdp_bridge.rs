@@ -120,6 +120,54 @@ pub fn store_teardown_js() -> String {
     STORE_TEARDOWN_JS.to_owned()
 }
 
+/// 一次入库结果: 缺下载数据 (depot key / access token) 时提示用户.
+///
+/// 自绘 DOM 遮罩, 不用 alert — Steam 商店页 CSP / CEF 下 alert 可能被吞, 遮罩稳定可见.
+/// `missing_text` 由调用方按 `MissingDownloadData::describe()` 生成, 如
+/// "下载密钥 (Depot 43)" 或 "访问令牌"; 空串调用方不该调这个函数.
+///
+/// 幂等: 已存在弹窗就更新文案, 不重复叠加. 可每轮 evaluate.
+pub fn store_missing_key_warn_js(app_id: u32, missing_text: &str) -> String {
+    // 只允许中文/字母/数字/空格/逗号/括号, 防止引号/分号/换行进脚本.
+    let safe: String = missing_text
+        .chars()
+        .filter(|c| {
+            c.is_alphanumeric() || *c == ' ' || *c == ',' || *c == '、' || *c == '(' || *c == ')'
+        })
+        .take(80)
+        .collect();
+    format!(
+        r##"(function(){{
+  var d=document,wrap=d.getElementById("stt-missing-key");
+  var text="入库成功, 但 AppID {app_id} 缺少{safe}, 可能无法下载。可在 Steam 库中右键该游戏「刷新清单」重试。";
+  if(wrap){{ var old=wrap.querySelector(".stt-mk-body"); if(old) old.textContent=text; wrap.style.display=""; return "update"; }}
+  wrap=d.createElement("div");
+  wrap.id="stt-missing-key";
+  wrap.style.cssText="position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;";
+  var box=d.createElement("div");
+  box.style.cssText="max-width:420px;background:#1b2838;border:1px solid #4b6b80;border-radius:6px;padding:16px 20px;color:#c7d5e0;font:13px/1.5 Arial,sans-serif;box-shadow:0 8px 32px rgba(0,0,0,.5);";
+  var title=d.createElement("div");
+  title.textContent="缺少下载数据";
+  title.style.cssText="font-size:15px;font-weight:bold;color:#dbe9f4;margin-bottom:10px;";
+  var body=d.createElement("div");
+  body.className="stt-mk-body";
+  body.textContent=text;
+  var ok=d.createElement("button");
+  ok.textContent="知道了";
+  ok.style.cssText="margin-top:14px;padding:6px 18px;background:#66c0f4;border:none;border-radius:2px;color:#1b2838;font-size:13px;cursor:pointer;";
+  ok.addEventListener("click",function(){{ wrap.style.display="none"; }});
+  ok.addEventListener("keydown",function(ev){{
+    if(ev.key==="Escape"){{ wrap.style.display="none"; }}
+  }});
+  box.appendChild(title); box.appendChild(body); box.appendChild(ok);
+  wrap.appendChild(box);
+  (d.body||d.documentElement).appendChild(wrap);
+  try{{ ok.focus(); }}catch(e){{}}
+  return "shown";
+}})()"##
+    )
+}
+
 /// 把一次入库结果写回商店按钮 (短脚本, 可每轮 evaluate).
 ///
 /// 只改带 `data-stt-store-btn` 且 `data-stt-app` 对得上的按钮; 对不上就不动,
@@ -1437,6 +1485,38 @@ mod tests {
         // 模板自身固定 18 个单引号 (9 对: 选择器/属性/赋值/return);
         // 标签漏一个引号进字面量就会变 20, 这里必须是 18.
         assert_eq!(bad.matches('\'').count(), 18);
+    }
+
+    #[test]
+    fn missing_key_warn_js_lists_depots_and_is_idempotent() {
+        let js = store_missing_key_warn_js(570, "下载密钥 (Depot 43, 7)");
+        assert!(js.contains("AppID 570"));
+        assert!(js.contains("Depot 43, 7"));
+        assert!(js.contains("stt-missing-key"));
+        assert!(js.contains("刷新清单"));
+        // 幂等: 已存在时只更新文案, 不重复建遮罩.
+        assert!(js.contains("if(wrap)"));
+        assert!(js.contains("return \"update\""));
+    }
+
+    #[test]
+    fn missing_key_warn_js_renders_token_text() {
+        let js = store_missing_key_warn_js(570, "访问令牌");
+        assert!(js.contains("缺少访问令牌"));
+        assert!(js.contains("stt-missing-key"));
+        // 标题是通用的"缺少下载数据".
+        assert!(js.contains("缺少下载数据"));
+    }
+
+    #[test]
+    fn missing_key_warn_js_escapes_hostile_text() {
+        // missing_text 若混入脚本字符必须被剥掉, 不能原样进脚本.
+        // (textContent 赋值无 XSS, 但要保证引号/分号/换行进不了字符串字面量.)
+        let js = store_missing_key_warn_js(1, "下载密钥\"; alert(1); //");
+        assert!(!js.contains("; //"));
+        assert!(!js.contains("alert(1);"));
+        assert!(!js.contains("\\\""));
+        assert!(js.contains("stt-missing-key"));
     }
 
     #[test]
