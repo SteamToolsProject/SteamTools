@@ -1,10 +1,12 @@
 name: CI
 
 on:
+  # master 受分支保护只能 PR 合入, 合入前 PR 检查已覆盖, 故不监听 master push
+  # (避免合入时 PR + push 重复跑两遍).
   push:
-    branches: [master]
+    branches: [dev]
   pull_request:
-    branches: [master]
+    branches: [master, dev]
 
 env:
   CARGO_TERM_COLOR: always
