@@ -89,7 +89,7 @@ download_kit = true       # download data (default on)
 store_accel = false       # store accel (default off)
 
 [catalog]
-mode = "disabled"         # disabled / custom_http / lua / community / mock
+mode = "community"        # default: community; disabled / custom_http / lua / community / mock
 url_template = ""         # for custom_http: https://example.com/catalog/{app_id}
 
 [manifest]

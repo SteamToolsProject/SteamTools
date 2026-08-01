@@ -90,7 +90,7 @@ download_kit = true       # 下载清单（默认开）
 store_accel = false       # 商店加速（默认关）
 
 [catalog]
-mode = "disabled"         # disabled / custom_http / lua / community / mock
+mode = "community"        # 默认: community; disabled / custom_http / lua / community / mock
 url_template = ""         # custom_http 时: https://example.com/catalog/{app_id}
 
 [manifest]
