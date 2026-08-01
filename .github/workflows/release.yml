@@ -49,10 +49,26 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/SteamTools.dll, target/release/dwmapi.dll, target/release/xinput1_4.dll dist/
+          Copy-Item target/release/stbase.dll, target/release/dwmapi.dll, target/release/xinput1_4.dll dist/
           Copy-Item LICENSE, README.md dist/
+          # 自更新用的 SHA-256 清单 (sha256sum 格式: <hex>  <name>).
+          Get-FileHash dist/stbase.dll, dist/dwmapi.dll, dist/xinput1_4.dll -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) } |
+            Set-Content -Path dist/checksums.sha256 -Encoding ascii
+          # 便携 zip (不用安装器时手动解压).
           Compress-Archive -Path dist/* -DestinationPath "SteamTools-$tag-win64.zip"
           Get-ChildItem dist, SteamTools-$tag-win64.zip | Select-Object Name, Length
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress
+            $env:Path += ";C:\Program Files (x86)\Inno Setup 6"
+          }
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          iscc /DVERSION=$version installer\steamtools.iss
+          Get-ChildItem dist | Select-Object Name, Length
 
       - name: Create GitHub Release
         shell: pwsh
@@ -60,10 +76,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
           gh release create $tag `
             --title "SteamTools $tag" `
             --notes-file release-notes.txt `
             SteamTools-$tag-win64.zip `
-            target/release/SteamTools.dll `
+            target/release/stbase.dll `
             target/release/dwmapi.dll `
-            target/release/xinput1_4.dll
+            target/release/xinput1_4.dll `
+            dist/checksums.sha256 `
+            dist/SteamTools-Setup-$version.exe

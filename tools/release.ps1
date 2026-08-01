@@ -81,12 +81,28 @@ try {
     }
     $dist = Join-Path $RepoRoot 'dist'
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
-    Copy-Item target/release/stbase.dll     $dist -Force
+    Copy-Item target/release/stbase.dll      $dist -Force
     Copy-Item target/release/dwmapi.dll      $dist -Force
     Copy-Item target/release/xinput1_4.dll   $dist -Force
     Copy-Item LICENSE $dist -Force
     Copy-Item README.md $dist -Force
-    Log "产物已复制到 dist/"
+    # 自更新用的 SHA-256 清单 (sha256sum 格式: <hex>  <name>).
+    Get-FileHash $dist/stbase.dll, $dist/dwmapi.dll, $dist/xinput1_4.dll -Algorithm SHA256 |
+        ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) } |
+        Set-Content -Path (Join-Path $dist 'checksums.sha256') -Encoding ascii
+    Log "产物已复制到 dist/ (含 checksums.sha256)"
+
+    # ---------- 3.5 安装器 (可选) ----------
+    $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+    if ($iscc) {
+        Invoke-Step "iscc installer" {
+            $ver = $Version.TrimStart('v')
+            & $iscc.Source "/DVERSION=$ver" (Join-Path $RepoRoot 'installer\steamtools.iss')
+        }
+        Log "安装器已生成: dist/SteamTools-Setup-$($Version.TrimStart('v')).exe"
+    } else {
+        Log "未找到 iscc, 跳过安装器 (CI 会自动构建)"
+    }
 
     # ---------- 4. 更新日志草稿 ----------
     $draft = Join-Path $dist 'release-notes.draft.md'
