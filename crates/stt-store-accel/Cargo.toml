@@ -15,9 +15,11 @@ thiserror = "2"
 # 仅用于候选 IP 的 SNI/证书/HEAD 健康探测, 真实 Steam TLS 仍透明透传.
 rustls = "0.23"
 webpki-roots = "1"
+# 密码学随机数仅用于本机控制端点鉴权 (stop 请求的 Bearer token).
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Networking_WinInet",
+    "Win32_Security_Cryptography",
     "Win32_System_Registry",
 ] }
 

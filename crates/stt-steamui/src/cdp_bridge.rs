@@ -15,7 +15,7 @@ use crate::config_panel::{
     apply_library_menu_drain, library_menu_inject_js, panel_step, EvalTarget, PanelBridge,
     PanelState, ViewRole, LIBRARY_MENU_DRAIN_JS,
 };
-use crate::store_debug::cdp_host_port;
+use crate::store_debug::{cdp_host_port, session_port_live};
 use crate::store_inject::{app_id_from_store_path, STORE_INJECT_JS};
 
 pub(crate) const DRAIN_JS: &str = r#"(function(){var p=window.__SteamToolsPending||[];window.__SteamToolsPending=[];return p;})()"#;
@@ -128,7 +128,8 @@ pub fn store_button_result_js(app_id: u32, ok: bool, label: &str) -> String {
     let safe: String = label
         .chars()
         .map(|c| match c {
-            '\\' | '"' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
+            // 单引号是字面量边界, 分号能终止语句, 都抹成空格 (对显示文本无害).
+            '\\' | '"' | '\'' | ';' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
             _ => c,
         })
         .take(24)
@@ -321,6 +322,69 @@ pub fn poll_store_cdp_default() -> StoreCdpPoll {
     poll_store_cdp(&cdp_host_port(), STORE_INJECT_JS)
 }
 
+/// 从 `/json/version` 的 `Browser` 字段解析 Chrome 主版本号.
+///
+/// 输入可以是整个 `/json/version` 响应, 也可以直接是 Browser 字段值;
+/// `"Chrome/126.0.0.0"` → 126. 字段缺失 / 不是 Chrome / 垃圾输入一律 None.
+pub fn parse_browser_major(version_json: &str) -> Option<u32> {
+    let browser = serde_json::from_str::<Value>(version_json)
+        .ok()
+        .and_then(|v| v.get("Browser").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| version_json.to_string());
+    let after = browser.split_once("Chrome/")?.1;
+    let major: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if major.is_empty() {
+        None
+    } else {
+        major.parse().ok()
+    }
+}
+
+/// 回退端口上的端点是不是 steamui 的页面.
+///
+/// 审计实测的 steamui 文档特征: 裸启动页带 `createflags`, 内存页
+/// `data:text/html`, 或 `steamloopback.host` 域 (clientui 页面).
+pub fn looks_like_steamui_target(url: &str) -> bool {
+    url.starts_with("about:blank?createflags=")
+        || url.starts_with("data:text/html")
+        || url.contains("steamloopback.host")
+}
+
+/// 回退端口 (8080) 上的 CDP 端点校验: attach 前先确认它真是 steamui 的 webhelper.
+///
+/// 1. `/json/version` 的 Browser 必须是 Chrome 且主版本 >= 111 — 111 起
+///    Chromium 默认拒绝带 Origin 头的 ws 升级, 低于它没有 Origin 防线;
+/// 2. `/json` 里至少有一个 `type == "page"` 且带 steamui 页面特征的目标.
+///
+/// 任一失败返回 Err(reason), 调用方必须跳过本轮: 商店按钮降级, 不连陌生端点.
+fn verify_cef_endpoint(host_port: &str) -> Result<(), String> {
+    let version_body = http_get(
+        &format!("http://{host_port}/json/version"),
+        Duration::from_secs(2),
+    )?;
+    let ver: Value =
+        serde_json::from_str(&version_body).map_err(|e| format!("version json: {e}"))?;
+    let browser = ver.get("Browser").and_then(Value::as_str).unwrap_or("");
+    let major = parse_browser_major(browser)
+        .ok_or_else(|| format!("browser field not Chrome: {browser:?}"))?;
+    if major < 111 {
+        return Err(format!("chrome {major} < 111"));
+    }
+    let list_body = http_get(&format!("http://{host_port}/json"), Duration::from_secs(2))?;
+    let targets: Value = serde_json::from_str(&list_body).map_err(|e| format!("list json: {e}"))?;
+    let arr = targets
+        .as_array()
+        .ok_or_else(|| "list not array".to_string())?;
+    let steamui = arr.iter().any(|t| {
+        t.get("type").and_then(Value::as_str) == Some("page")
+            && looks_like_steamui_target(t.get("url").and_then(Value::as_str).unwrap_or(""))
+    });
+    if !steamui {
+        return Err("no steamui page target".into());
+    }
+    Ok(())
+}
+
 /// 后台循环: 注入按钮, 并把点击排下的 app_id 回调出去.
 pub fn run_store_cdp_loop(
     poll_every: Duration,
@@ -350,6 +414,10 @@ pub fn run_store_cdp_loop_with_js(
     let mut last_down_log = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
+    // 回退校验失败也节流: 600ms 一轮, 不通时每 15s 最多记一条.
+    let mut last_fallback_log = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
     let mut last_up = false;
     let mut last_pages: usize = 0;
     // "一个商店页都没摸到" 每轮都会复现: 只在刚进入这个状态时记一次.
@@ -357,6 +425,18 @@ pub fn run_store_cdp_loop_with_js(
     let mut zero_logged = false;
     loop {
         let js = make_js();
+        // 回退端口 (8080) 是未知服务: hook 没赶上时 Steam 自己的调试参数可能
+        // 原样活着. attach 前先验证它真是 steamui 的 webhelper, 不过就跳过本轮.
+        if !session_port_live() {
+            if let Err(reason) = verify_cef_endpoint(&cdp_host_port()) {
+                if last_fallback_log.elapsed() >= Duration::from_secs(15) {
+                    on_log(format!("store_cdp=unsafe_fallback_8080 reason={reason}"));
+                    last_fallback_log = Instant::now();
+                }
+                std::thread::sleep(poll_every);
+                continue;
+            }
+        }
         // 单次轮询 panic 不能弄死整条桥: 之前 ws 握手 panic 让线程静默退出,
         // 表现就是日志停在 store_pages=0 且按钮永远挂不上.
         let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -568,7 +648,7 @@ pub(crate) fn log_panel_step(
         on_log(format!(
             "config_ui=requested by={} via={}",
             clip(title, 32),
-            out.asked_why
+            clip_why(&out.asked_why)
         ));
     }
     if out.opened {
@@ -638,6 +718,14 @@ fn list_page_targets(host_port: &str) -> Result<Vec<PageTarget>, String> {
 /// 按字符截断; 按字节切可能落在 UTF-8 中间.
 pub(crate) fn clip(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+/// 日志用的 why 值: 页面可塞任意长度与控制字符, 先剥 \0/\r/\n 再截 64 字符.
+fn clip_why(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\0' && *c != '\r' && *c != '\n')
+        .take(64)
+        .collect()
 }
 
 /// 一个调试目标该怎么处理.
@@ -1341,11 +1429,27 @@ mod tests {
         assert!(js.contains("data-stt-app"));
         assert!(js.contains("570"));
         assert!(js.contains("已入库 570"));
-        // 引号/换行不能原样进脚本, 否则 evaluate 直接炸.
-        let bad = store_button_result_js(1, false, "失败: \"x\ny");
-        assert!(bad.contains("失败:  x y"));
+        // 引号/换行/单引号/分号不能原样进脚本, 否则 evaluate 直接炸.
+        let bad = store_button_result_js(1, false, "失败: \"x\ny';pwn");
+        assert!(bad.contains("失败:  x y  pwn"));
         assert!(!bad.contains("\"x"));
         assert!(!bad.contains("x\ny"));
+        // 模板自身固定 18 个单引号 (9 对: 选择器/属性/赋值/return);
+        // 标签漏一个引号进字面量就会变 20, 这里必须是 18.
+        assert_eq!(bad.matches('\'').count(), 18);
+    }
+
+    #[test]
+    fn why_clips_control_chars_and_length() {
+        // 页面可控的 why 值: 控制字符剥掉, 超过 64 字符截断, 不能带换行进日志.
+        let long = format!("a\u{0}\r\n{}", "x".repeat(200));
+        let clipped = clip_why(&long);
+        assert_eq!(clipped.len(), 64);
+        assert!(!clipped.contains('\0'));
+        assert!(!clipped.contains('\r'));
+        assert!(!clipped.contains('\n'));
+        assert!(clipped.starts_with('a'));
+        assert_eq!(clip_why("正常原因"), "正常原因");
     }
 
     /// 页面 CSP 只放行 27060, 发不出去; 留着只会每次点击都报一条控制台错误.
@@ -1369,5 +1473,43 @@ mod tests {
     fn parse_pending() {
         let v = json!([{"app_id": 570, "reason": "store_btn"}, {"app_id": 0}]);
         assert_eq!(parse_pending_app_ids(&v), vec![570]);
+    }
+
+    /// 整个 /json/version 响应和 Browser 字段值两种输入都要能解析.
+    #[test]
+    fn browser_major_parses_from_version_json() {
+        let full = r#"{"Browser": "Chrome/126.0.0.0", "Protocol-Version": "1.3"}"#;
+        assert_eq!(parse_browser_major(full), Some(126));
+        assert_eq!(parse_browser_major("Chrome/126.0.0.0"), Some(126));
+        assert_eq!(parse_browser_major("Chrome/100"), Some(100));
+        assert_eq!(parse_browser_major("Chrome/111"), Some(111));
+    }
+
+    #[test]
+    fn browser_major_rejects_garbage() {
+        assert_eq!(parse_browser_major("garbage"), None);
+        assert_eq!(parse_browser_major(""), None);
+        assert_eq!(parse_browser_major(r#"{"Browser": "Safari/17.4"}"#), None);
+        assert_eq!(parse_browser_major("Chrome/"), None);
+        assert_eq!(parse_browser_major("Chrome/abc"), None);
+    }
+
+    /// 回退校验只认 steamui 文档特征, 普通站点不算.
+    #[test]
+    fn steamui_target_signatures() {
+        assert!(looks_like_steamui_target(
+            "about:blank?createflags=274&minwidth=1010"
+        ));
+        assert!(looks_like_steamui_target(
+            "data:text/html,<body></body><!--tracking:x:/library/home-->"
+        ));
+        assert!(looks_like_steamui_target(
+            "https://steamloopback.host/index.html"
+        ));
+        assert!(!looks_like_steamui_target("https://evil.example/"));
+        assert!(!looks_like_steamui_target("about:blank"));
+        assert!(!looks_like_steamui_target(
+            "https://store.steampowered.com/app/570/"
+        ));
     }
 }

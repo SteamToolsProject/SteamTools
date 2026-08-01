@@ -172,10 +172,12 @@ pub fn resolve_in_image(
     image: &[u8],
     module_base: usize,
 ) -> Option<usize> {
+    const PATCH_LEN: usize = 12; // detour 补丁写入宽度
     let entry = map.get_by_name(name)?;
     if let Some(rva) = entry.rva {
         let off = rva as usize;
-        if off < image.len() {
+        // 整个补丁写入窗口须落在映像内, 否则放弃 RVA (防越界写).
+        if off.saturating_add(PATCH_LEN) <= image.len() {
             return Some(module_base.wrapping_add(off));
         }
         // RVA 越界: 若有特征码则继续扫.
@@ -188,7 +190,9 @@ pub fn resolve_in_image(
     None
 }
 
-/// 仅按 RVA 解析 (映像映射在 `module_base`; 不检查实存边界).
+/// 仅按 RVA 解析 (映像映射在 `module_base`).
+///
+/// 仅测试/工具用途, 不做实存边界检查; 生产路径请用 find_in_image / find_by_rva_only.
 pub fn resolve_rva(module_base: usize, rva: u64) -> usize {
     module_base.wrapping_add(rva as usize)
 }
@@ -221,5 +225,62 @@ sig = "90 90"
         let sig = ByteSig::parse("48 89 ?? 5C").unwrap();
         let hay = [0x00, 0x48, 0x89, 0xAB, 0x5C, 0x00];
         assert_eq!(sig.find_in(&hay), Some(1));
+    }
+
+    #[test]
+    fn resolve_in_image_rva_window_fits_at_image_end() {
+        // rva = 0x14 (20), 补丁窗口 20..32 恰好贴住映像末尾 (32) -> 接受.
+        let hash = fnv1a32_str("DemoFunc");
+        let text = format!(
+            r#"
+[0x{hash:08X}]
+name = "DemoFunc"
+rva = "0x14"
+"#
+        );
+        let map = PatternMap::parse_str("steamui", &text).unwrap();
+        let image = vec![0u8; 0x20];
+        assert_eq!(
+            resolve_in_image(&map, "DemoFunc", &image, 0x1000),
+            Some(0x1014)
+        );
+    }
+
+    #[test]
+    fn resolve_in_image_rva_near_end_falls_back_to_sig() {
+        // rva = 0x18 (24), 24 + 12 > 32 -> rva 拒绝; 特征码在 4 处命中 -> 回落成功.
+        let hash = fnv1a32_str("DemoFunc");
+        let text = format!(
+            r#"
+[0x{hash:08X}]
+name = "DemoFunc"
+rva = "0x18"
+sig = "C3 C3"
+"#
+        );
+        let map = PatternMap::parse_str("steamui", &text).unwrap();
+        let mut image = vec![0u8; 0x20];
+        image[4] = 0xC3;
+        image[5] = 0xC3;
+        assert_eq!(
+            resolve_in_image(&map, "DemoFunc", &image, 0x1000),
+            Some(0x1004)
+        );
+    }
+
+    #[test]
+    fn resolve_in_image_rva_near_end_without_sig_is_none() {
+        // rva = 0x18 (24), 24 + 12 > 32 -> 拒绝; 无特征码 -> None (不 panic).
+        let hash = fnv1a32_str("DemoFunc");
+        let text = format!(
+            r#"
+[0x{hash:08X}]
+name = "DemoFunc"
+rva = "0x18"
+"#
+        );
+        let map = PatternMap::parse_str("steamui", &text).unwrap();
+        let image = vec![0u8; 0x20];
+        assert_eq!(resolve_in_image(&map, "DemoFunc", &image, 0x1000), None);
     }
 }

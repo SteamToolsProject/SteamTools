@@ -15,7 +15,8 @@ use crate::{
 };
 
 const PROVIDER: &str = "community:caigamer";
-const URL_TEMPLATE: &str = "http://auth1.caigamer.cn/GetAppinfo/{app_id}";
+const URL_TEMPLATE: &str = "https://auth1.caigamer.cn/GetAppinfo/{app_id}";
+// RC4 密钥只是公开混淆, 只防一眼人读, 可从二进制中直接提取; 真正的传输保护是 TLS.
 const RC4_KEY: &[u8] = &[
     0xA1, 0xFC, 0xA1, 0xFC, 0xA1, 0xFD, 0xA1, 0xFD, 0xA1, 0xFB, 0xA1, 0xFA, 0xA1, 0xFB, 0xA1, 0xFA,
     0x42, 0x41, 0x42, 0x41,
@@ -485,6 +486,11 @@ fn parse_json_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_template_uses_https() {
+        assert!(URL_TEMPLATE.starts_with("https://auth1.caigamer.cn/GetAppinfo/"));
+    }
 
     #[test]
     fn rc4_round_trip() {

@@ -70,7 +70,7 @@ impl ConfigIntent {
 
     pub fn set_catalog_url_template(template: &str) -> Option<Self> {
         let template = template.trim();
-        stt_catalog::validate_url_template(template)
+        stt_catalog::validate_url_template_remote(template)
             .is_ok()
             .then(|| Self::SetCatalogUrlTemplate(template.to_owned()))
     }
@@ -321,7 +321,7 @@ mod tests {
         apply_intent(
             &state,
             root.path(),
-            &ConfigIntent::set_catalog_url_template("http://127.0.0.1/{app_id}").unwrap(),
+            &ConfigIntent::set_catalog_url_template("https://catalog.test/v1/{app_id}").unwrap(),
         )
         .unwrap();
         apply_intent(

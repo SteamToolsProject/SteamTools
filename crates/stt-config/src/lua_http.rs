@@ -79,6 +79,59 @@ pub(crate) fn register_lua_http(lua: &Lua, client: Arc<dyn LuaHttpClient>) -> ml
     Ok(())
 }
 
+/// 从 URL 提取 host: 去掉 scheme 与 path 部分.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// host 是否禁止访问: 回环/链路本地/组播/IPv6/本地主机名.
+/// 残余说明: 主机名 DNS 重绑定到回环 IP 的场景本层不覆盖 (脚本作者即信任边界).
+fn host_forbidden(host: &str) -> bool {
+    // 剥掉 :port 后缀 (仅当后缀全是数字); IPv6 字面量里的 ':' 不匹配数字后缀,
+    // 会整体保留并在下一行因含 ':' 被拒.
+    let host = match host.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => host,
+    };
+    // 任何含 ':' 的 host 都是 IPv6 字面量 (::1 / fe80:: / :: / ff00:: 等), 一律拒绝.
+    if host.contains(':') {
+        return true;
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return true;
+    }
+    let Some(octets) = parse_ipv4(&lower) else {
+        return false;
+    };
+    // 127.0.0.0/8 回环, 169.254.0.0/16 链路本地, 0.0.0.0, 224.0.0.0/4 组播.
+    octets[0] == 127
+        || (octets[0] == 169 && octets[1] == 254)
+        || (octets[0] == 0 && octets[1] == 0 && octets[2] == 0 && octets[3] == 0)
+        || octets[0] >= 224
+}
+
+/// 手写 dotted-quad IPv4 解析, 避免新增依赖.
+fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
+    let mut parts = host.split('.');
+    let mut octets = [0u8; 4];
+    for octet in &mut octets {
+        let part = parts.next()?;
+        if part.is_empty() || part.len() > 3 || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *octet = part.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(octets)
+}
+
 fn build_request(
     method: LuaHttpMethod,
     url: String,
@@ -90,6 +143,11 @@ fn build_request(
         && (url.starts_with("http://") || url.starts_with("https://"))
         && !url.contains(['\0', '\r', '\n', '#']);
     if !valid_url {
+        return Err(LuaHttpErrorKind::InvalidRequest);
+    }
+    // 合法校验后解析 host, 拒绝回环/链路本地/组播/IPv6/本地主机名, 防 SSRF.
+    let host = url_host(&url).ok_or(LuaHttpErrorKind::InvalidRequest)?;
+    if host_forbidden(host) {
         return Err(LuaHttpErrorKind::InvalidRequest);
     }
     if body.len() > MAX_REQUEST_BODY_BYTES {
@@ -215,5 +273,73 @@ mod tests {
         assert!(body.is_none());
         assert_eq!(category, "invalid_request");
         assert!(client.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn host_forbidden_rejects_loopback_link_local_multicast_and_ipv6() {
+        for host in [
+            "127.0.0.1",
+            "127.8.9.10",
+            "169.254.1.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "239.255.255.255",
+            "::1",
+            "[::1]",
+            "[::1]:8080",
+            "::",
+            "fe80::1",
+            "ff02::1",
+            "localhost",
+            "foo.localhost",
+        ] {
+            assert!(host_forbidden(host), "should reject {host}");
+        }
+    }
+
+    #[test]
+    fn host_forbidden_allows_normal_hosts_with_and_without_port() {
+        for host in [
+            "store.steampowered.com",
+            "store.steampowered.com:443",
+            "api.example.com",
+            "api.example.com:8080",
+            "8.8.8.8",
+            "203.0.113.5",
+            "sub.localhost.test",
+        ] {
+            assert!(!host_forbidden(host), "should allow {host}");
+        }
+    }
+
+    #[test]
+    fn build_request_rejects_forbidden_hosts() {
+        for url in [
+            "http://127.0.0.1:8080/secret",
+            "http://169.254.169.254/latest/meta-data",
+            "http://0.0.0.0/x",
+            "http://224.0.0.1/x",
+            "http://::1/",
+            "http://[::1]/",
+            "https://localhost/x",
+            "https://steam.localhost/x",
+        ] {
+            assert_eq!(
+                build_request(LuaHttpMethod::Get, url.into(), None, Vec::new()),
+                Err(LuaHttpErrorKind::InvalidRequest),
+                "should reject {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_allows_public_urls_with_port_and_path() {
+        for url in [
+            "https://store.steampowered.com/app/730/",
+            "http://api.example.com:8080/x?y=1",
+        ] {
+            let request = build_request(LuaHttpMethod::Get, url.into(), None, Vec::new()).unwrap();
+            assert_eq!(request.url, url);
+        }
     }
 }

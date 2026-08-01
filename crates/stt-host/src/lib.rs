@@ -688,6 +688,7 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
 enum CatalogJobSource {
     StoreCdp,
     ConfigRefresh,
+    Inbox,
 }
 
 impl CatalogJobSource {
@@ -695,6 +696,7 @@ impl CatalogJobSource {
         match self {
             Self::StoreCdp => "store_cdp",
             Self::ConfigRefresh => "config_refresh",
+            Self::Inbox => "inbox",
         }
     }
 }
@@ -940,7 +942,7 @@ impl stt_steamui::PanelBridge for HostPanel {
     fn on_recon(&mut self, sample: &str) {
         // 每份都写 (后一份是界面渲染完之后取的, 更有用); 日志只提一次.
         let path = stt_platform::data_dir(&self.steam_root).join("ui-recon.txt");
-        if std::fs::write(&path, sample).is_ok() && !self.recon_done {
+        if std::fs::write(&path, clip_recon_sample(sample)).is_ok() && !self.recon_done {
             self.recon_done = true;
             append_host_log(
                 &self.steam_root,
@@ -948,6 +950,20 @@ impl stt_steamui::PanelBridge for HostPanel {
             );
         }
     }
+}
+
+/// recon 样本最多留 4 KiB 并去掉控制字符: 页面内容不可信,
+/// 别让一份大样本把磁盘占满或把控制字符写进文件.
+fn clip_recon_sample(sample: &str) -> String {
+    const MAX_RECON_BYTES: usize = 4096;
+    let mut clipped = String::new();
+    for ch in sample.chars().filter(|ch| !ch.is_control()) {
+        if clipped.len() + ch.len_utf8() > MAX_RECON_BYTES {
+            break;
+        }
+        clipped.push(ch);
+    }
+    clipped
 }
 
 /// 后台: CEF CDP 向商店页注入按钮并取回点击, 顺带把配置页挂进客户端界面.
@@ -1077,8 +1093,10 @@ fn log_module_hashes(steam_root: &Path) {
     }
 }
 
+/// 更新 pattern 时随发布流程改这个 commit (git ls-remote 取 main 最新),
+/// 别直接指 main: manifest 没有完整性校验, 钉死 commit 才算钉死信任根.
 const PATTERN_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/SteamToolsProject/SteamTools-Patterns/main/manifests/stable.json";
+    "https://raw.githubusercontent.com/SteamToolsProject/SteamTools-Patterns/a17f3a98db60b2f8427125e673aa0d2e9b5fef39/manifests/stable.json";
 const PATTERN_RAW_BASE_URL: &str =
     "https://raw.githubusercontent.com/SteamToolsProject/SteamTools-Patterns/main";
 
@@ -1912,10 +1930,25 @@ const fn store_accel_egress_name(egress: StoreAccelEgress) -> &'static str {
     }
 }
 
+/// inbox 单文件大小上限: 超过就当噪音跳过, 不读.
+const MAX_INBOX_FILE_BYTES: u64 = 1024 * 1024;
+
+/// bad_line 日志不回显整行内容: 去掉控制字符再截到 120 字符.
+fn clip_bad_line(line: &str) -> String {
+    const MAX_BAD_LINE_CHARS: usize = 120;
+    line.chars()
+        .filter(|ch| !matches!(ch, '\0' | '\r' | '\n'))
+        .take(MAX_BAD_LINE_CHARS)
+        .collect()
+}
+
 /// 处理 steamtools/inbox/*.txt: 每行一个 app_id, 按当前 Catalog 配置入库.
+///
+/// 有效行只入有界 catalog worker 队列 (容量 32), 由 worker 线程跑 provider 链;
+/// 队列满就记日志放弃, 不让 watch 线程同步网络, 也不阻塞轮询.
 fn process_inbox(
     steam_root: &Path,
-    state: &ConfigState,
+    catalog_jobs: &SyncSender<CatalogJob>,
     seen: &mut std::collections::HashSet<std::path::PathBuf>,
 ) {
     let dir = stt_platform::inbox_dir(steam_root);
@@ -1931,7 +1964,30 @@ fn process_inbox(
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("txt"));
-        if !is_txt || !seen.insert(path.clone()) {
+        if !is_txt {
+            continue;
+        }
+        // 符号链接 / 超过 1 MiB 的文件都不读: 前者防路径被指向别处,
+        // 后者防把大文件整个拖进内存再逐行解析.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || meta.len() > MAX_INBOX_FILE_BYTES {
+            append_host_log(
+                steam_root,
+                &format!(
+                    "catalog_add=inbox skip path={} reason={}",
+                    path.display(),
+                    if meta.file_type().is_symlink() {
+                        "symlink"
+                    } else {
+                        "large"
+                    }
+                ),
+            );
+            continue;
+        }
+        if !seen.insert(path.clone()) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1951,36 +2007,25 @@ fn process_inbox(
                 append_host_log(
                     steam_root,
                     &format!(
-                        "catalog_add=inbox bad_line path={} line={} text={line}",
+                        "catalog_add=inbox bad_line path={} line={} text={}",
                         path.display(),
-                        lineno + 1
+                        lineno + 1,
+                        clip_bad_line(line)
                     ),
                 );
                 continue;
             };
             any = true;
-            match add_from_config(state, steam_root, app_id) {
-                Ok(out) => {
-                    append_host_log(
-                        steam_root,
-                        &format!(
-                            "catalog_add=ok app_id={app_id} provider={} trace={} lua={} epoch={} owned={}",
-                            out.provider_id,
-                            catalog_trace_text(&out.provider_trace),
-                            out.lua_path.display(),
-                            out.epoch,
-                            out.owned_count
-                        ),
-                    );
-                    on_library_added(steam_root, state, app_id);
-                }
-                Err(error) => append_host_log(
+            let job = CatalogJob {
+                app_id,
+                source: CatalogJobSource::Inbox,
+            };
+            if let Err(error) = queue_catalog_job(catalog_jobs, job) {
+                // 有界队列, 满就丢这一次, 不阻塞 watch 轮询.
+                append_host_log(
                     steam_root,
-                    &format!(
-                        "catalog_add=err app_id={app_id} {}",
-                        catalog_error_text(&error)
-                    ),
-                ),
+                    &format!("catalog_add=queue_err source=inbox app_id={app_id} {error}"),
+                );
             }
         }
         if !any {
@@ -1989,12 +2034,15 @@ fn process_inbox(
                 &format!("catalog_add=inbox empty path={}", path.display()),
             );
         }
-        // 处理完挪到 done, 避免反复触发.
+        // 处理完挪到 done, 避免反复触发; 挪成功才从 seen 摘掉,
+        // 不然集合会随长会话里不断出现的 inbox 文件越攒越大.
         let done_dir = dir.join("done");
         let _ = std::fs::create_dir_all(&done_dir);
         if let Some(name) = path.file_name() {
             let dest = done_dir.join(name);
-            let _ = std::fs::rename(&path, &dest);
+            if std::fs::rename(&path, &dest).is_ok() {
+                seen.remove(&path);
+            }
         }
     }
 }
@@ -2079,6 +2127,9 @@ fn run_watch_loop(
     };
     let mut inbox_seen: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
+    // inbox 只入队, 由这里独立的有界 worker 处理; 反馈通道没人读, 丢弃即可.
+    let watch_note = Arc::new(Mutex::new(String::new()));
+    let (catalog_jobs, _catalog_feedback) = spawn_catalog_worker(steam_root, state, &watch_note);
 
     // 定期重扫目录, 好把新建的 .lua 纳入监视.
     let mut rescan_ticks: u32 = 0;
@@ -2112,7 +2163,7 @@ fn run_watch_loop(
 
     loop {
         std::thread::sleep(WATCH_POLL);
-        process_inbox(steam_root, state, &mut inbox_seen);
+        process_inbox(steam_root, &catalog_jobs, &mut inbox_seen);
         cef_rearm.tick(steam_root, state);
 
         // ~2s 一轮: 未 attach 且 catalog_add 开着则重试 package hooks.

@@ -10,6 +10,7 @@
 //! 注入脚本与 pending 解析仍复用 `cdp_bridge`, 这里只负责把话送到.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +32,9 @@ use crate::config_panel::{
 /// 比 ws 版的 1.5s 宽松一点: 管道没有连接建立开销, 但 CEF 忙时回得慢,
 /// 卡死风险由读线程隔离, 不会拖住轮询线程之外的东西.
 const CALL_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// 通道满时被丢弃的 CDP 帧数 (事件流, 丢帧可接受, 计数供诊断).
+static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 /// 一个 CDP 目标 (页面 / iframe).
 #[derive(Debug, Clone)]
@@ -57,7 +61,8 @@ impl CdpPipeSession {
     /// 否则 CEF 一不吭声就会把整条轮询线程钉死.
     pub fn new(pipe: DevToolsPipe) -> Self {
         let pipe = Arc::new(pipe);
-        let (tx, rx) = mpsc::channel();
+        // 事件流, 满时丢帧可接受: 有界通道封顶读线程积压.
+        let (tx, rx) = mpsc::sync_channel(64);
         let reader = Arc::clone(&pipe);
         // 起不来线程就没人收回复, 后续调用会全部超时 → 验活失败 → 回退端口模式.
         // 这条降级路径本来就有, 所以这里不必额外处理.
@@ -622,7 +627,7 @@ fn str_field(v: &Value, key: &str) -> String {
 }
 
 /// 读线程: 按 `\0` 切帧, 解析成 JSON 丢给主逻辑.
-fn read_loop(pipe: &DevToolsPipe, tx: &mpsc::Sender<Value>) {
+fn read_loop(pipe: &DevToolsPipe, tx: &mpsc::SyncSender<Value>) {
     let mut acc: Vec<u8> = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     loop {
@@ -637,8 +642,13 @@ fn read_loop(pipe: &DevToolsPipe, tx: &mpsc::Sender<Value>) {
             let Ok(v) = serde_json::from_slice::<Value>(&frame[..i]) else {
                 continue; // 坏帧丢掉, 不拖累后面的
             };
-            if tx.send(v).is_err() {
-                return; // 会话没了
+            match tx.try_send(v) {
+                Ok(()) => {}
+                // 满时丢新帧可接受 (事件流), 不能阻塞读线程.
+                Err(mpsc::TrySendError::Full(_)) => {
+                    DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return, // 会话没了
             }
         }
         // 防御: 对端一直不发 \0 就别无限涨.
@@ -669,5 +679,18 @@ mod tests {
         let t = json!({"targetId": "abc"});
         assert_eq!(str_field(&t, "targetId"), "abc");
         assert_eq!(str_field(&t, "url"), "");
+    }
+
+    #[test]
+    fn bounded_channel_full_drops_without_blocking() {
+        // 有界通道: 满时 try_send 立即返回 Full, 不阻塞读线程; 接收侧照常工作.
+        let (tx, rx) = mpsc::sync_channel::<u32>(4);
+        for i in 0..8 {
+            let r = tx.try_send(i);
+            assert!(r.is_ok() || matches!(r, Err(mpsc::TrySendError::Full(_))));
+        }
+        // 只送出容量内的帧, 多出的被丢; 接收侧 API 与普通 channel 一致.
+        assert_eq!(rx.recv_timeout(Duration::from_millis(100)).unwrap(), 0);
+        assert_eq!(rx.try_iter().count(), 3);
     }
 }

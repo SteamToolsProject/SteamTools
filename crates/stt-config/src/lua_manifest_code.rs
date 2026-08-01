@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
-use mlua::{Function, Lua, Value};
+use mlua::{Function, Value};
 
 use crate::lua_http::{register_lua_http, LuaHttpClient};
+use crate::lua_vm::new_sandboxed;
 
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -67,7 +68,7 @@ impl LuaManifestCodeExecutor {
         function_name: &str,
         call: impl FnOnce(Function) -> mlua::Result<Value>,
     ) -> LuaManifestCodeResult {
-        let lua = Lua::new();
+        let lua = new_sandboxed().map_err(|_| LuaManifestCodeErrorKind::Internal)?;
         if let Some(client) = &self.http_client {
             register_lua_http(&lua, Arc::clone(client))
                 .map_err(|_| LuaManifestCodeErrorKind::Internal)?;

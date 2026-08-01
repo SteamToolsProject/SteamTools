@@ -1526,7 +1526,7 @@ mod tests {
     #[test]
     fn catalog_intents_are_parsed_separately_from_manifest() {
         let tick = parse_panel_tick(&json!({"q":[
-            {"kind":"set_catalog_url_template","value":"http://127.0.0.1/{app_id}"},
+            {"kind":"set_catalog_url_template","value":"https://catalog.test/{app_id}"},
             {"kind":"set_catalog_mode","value":"custom_http"},
             {"kind":"set_manifest_url","value":"wudrm"}
         ]}));

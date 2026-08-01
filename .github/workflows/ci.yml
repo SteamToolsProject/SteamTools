@@ -1,10 +1,12 @@
 name: CI
 
 on:
-  # 只有 PR 才跑 CI: master 与 dev 均仅合入, push 到 dev 的是有权限的
-  # 协作者, 不再重复检查; 合入 master 前 PR 检查已覆盖.
+  # 所有人(除 owner)合入 master 走 PR, PR 跑完整检查;
+  # owner 直接 push master 也触发完整检查做反馈.
+  push:
+    branches: [master]
   pull_request:
-    branches: [master, dev]
+    branches: [master]
 
 env:
   CARGO_TERM_COLOR: always
@@ -82,9 +84,9 @@ jobs:
         run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=1
 
   release:
-    # 产物验证只在合入 master 前执行; dev PR 快速反馈不跑 release 编译.
+    # 完整检查的一部分: 事件只会是 master 的 push 或 PR, 有 Rust 变更就验证产物.
     needs: changes
-    if: github.base_ref == 'master' && needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

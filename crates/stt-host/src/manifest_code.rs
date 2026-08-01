@@ -171,7 +171,8 @@ impl HttpManifestProvider {
                 HttpResponseFormat::PlainDecimal,
             ),
             "wudrm" => (
-                "http://gmrc.wudrm.com/manifest/{manifest_gid}",
+                // 强制 HTTPS: 该 provider 必须自行终止 TLS, 不允许明文回落
+                "https://gmrc.wudrm.com/manifest/{manifest_gid}",
                 HttpResponseFormat::PlainDecimal,
             ),
             "steamrun" => (

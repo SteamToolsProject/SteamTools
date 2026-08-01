@@ -23,6 +23,7 @@ use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::Networking::WinInet::{
     InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
 };
+use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
@@ -45,6 +46,9 @@ const MAX_PROBE_HEADER_BYTES: usize = 8 * 1024;
 const LOOP_SLEEP: Duration = Duration::from_millis(20);
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 
+/// 本进程共享的 stop 端点 token, run 时生成; host 与 DLL 同进程, request_stop 直接读取.
+static STOP_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
 #[derive(Debug, Error)]
 pub enum StoreAccelError {
     #[error("I/O: {0}")]
@@ -55,6 +59,8 @@ pub enum StoreAccelError {
     Snapshot(#[from] serde_json::Error),
     #[error("无效请求: {0}")]
     InvalidRequest(String),
+    #[error("未鉴权: {0}")]
+    Unauthorized(String),
     #[error("DNS: {0}")]
     Dns(String),
     #[error("TLS 探测: {0}")]
@@ -134,6 +140,11 @@ impl TryFrom<&StoreAccelSection> for HelperConfig {
 pub fn run(steam_root: &Path, stop: Arc<AtomicBool>) -> Result<()> {
     let host = HostConfig::load_from_steam_root(steam_root)?;
     let config = HelperConfig::try_from(&host.store_accel)?;
+    // 每次运行生成新 token, 旧代自然失效; 生成失败直接拒绝启动, 不跑未鉴权服务.
+    let token = generate_stop_token()?;
+    *STOP_TOKEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.clone());
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.listen_port))?;
     listener.set_nonblocking(true)?;
 
@@ -142,7 +153,7 @@ pub fn run(steam_root: &Path, stop: Arc<AtomicBool>) -> Result<()> {
         .join("steamtools")
         .join("store-accel-system-proxy.json");
     let mut system_proxy = SystemProxyGuard::install(&snapshot_path, pac_url)?;
-    let serve_result = serve(listener, config, stop, steam_root);
+    let serve_result = serve(listener, config, stop, steam_root, token);
     let restore_result = system_proxy.restore();
     match (serve_result, restore_result) {
         (Err(error), _) => Err(error),
@@ -151,14 +162,41 @@ pub fn run(steam_root: &Path, stop: Arc<AtomicBool>) -> Result<()> {
     }
 }
 
+/// 生成 16 字节随机 token 的 32 位小写十六进制字符串.
+fn generate_stop_token() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    let status = unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status.is_err() {
+        return Err(StoreAccelError::Io(io::Error::other(format!(
+            "BCryptGenRandom 失败: 0x{:08X}",
+            status.0 as u32
+        ))));
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        token.push(HEX[usize::from(byte >> 4)] as char);
+        token.push(HEX[usize::from(byte & 0x0F)] as char);
+    }
+    Ok(token)
+}
+
 /// 向当前 DLL 内运行时发送本机停止请求. 失败不会改任何系统设置.
 pub fn request_stop(port: u16) -> Result<()> {
+    let token = STOP_TOKEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let auth_header = match &token {
+        Some(token) => format!("Authorization: Bearer {token}\r\n"),
+        None => String::new(),
+    };
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.write_all(
         format!(
-            "POST {STOP_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            "POST {STOP_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_header}Connection: close\r\nContent-Length: 0\r\n\r\n"
         )
         .as_bytes(),
     )?;
@@ -167,6 +205,10 @@ pub fn request_stop(port: u16) -> Result<()> {
     let text = std::str::from_utf8(&response[..read]).unwrap_or_default();
     if text.starts_with("HTTP/1.1 204") {
         Ok(())
+    } else if text.starts_with("HTTP/1.1 403") {
+        Err(StoreAccelError::Unauthorized(
+            "stop 请求被拒绝, 未带 token 或 token 不匹配".into(),
+        ))
     } else {
         Err(StoreAccelError::InvalidRequest(
             "helper 未确认停止请求".into(),
@@ -256,6 +298,7 @@ fn serve(
     config: HelperConfig,
     stop: Arc<AtomicBool>,
     steam_root: &Path,
+    token: String,
 ) -> Result<()> {
     let state = Arc::new(ServerState {
         egress: Egress::from_config(config.egress, config.dns_timeout),
@@ -264,6 +307,7 @@ fn serve(
         active_connections: Arc::new(AtomicUsize::new(0)),
         running: AtomicBool::new(true),
         stop,
+        token,
         request_logger: RequestLogger::new(steam_root),
     });
 
@@ -299,6 +343,7 @@ struct ServerState {
     active_connections: Arc<AtomicUsize>,
     running: AtomicBool,
     stop: Arc<AtomicBool>,
+    token: String,
     request_logger: RequestLogger,
 }
 
@@ -439,6 +484,35 @@ impl Drop for ConnectionPermit {
     }
 }
 
+/// 从请求头取 Authorization: Bearer 凭证, 头名与 scheme 均大小写不敏感.
+fn bearer_token(header: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(header).ok()?;
+    let first_line_end = text.find("\r\n")?;
+    for line in text[first_line_end + 2..].split("\r\n") {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let Some((scheme, credential)) = value.trim().split_once(' ') else {
+            continue;
+        };
+        if scheme.eq_ignore_ascii_case("bearer") {
+            return Some(credential.trim());
+        }
+    }
+    None
+}
+
+/// 校验 stop 请求凭证: 缺失或与当前 token 不一致都拒绝.
+fn authorized(credential: Option<&str>, token: &str) -> bool {
+    credential.is_some_and(|credential| credential == token)
+}
+
 fn handle_connection(mut client: TcpStream, state: &Arc<ServerState>) -> Result<()> {
     // TcpListener 的非阻塞标志会传给 accept 的 socket; 隧道复制必须阻塞等待 TLS 数据.
     client.set_nonblocking(false)?;
@@ -450,6 +524,9 @@ fn handle_connection(mut client: TcpStream, state: &Arc<ServerState>) -> Result<
             write_response(client, "200 OK", &pac, "application/x-ns-proxy-autoconfig")
         }
         ProxyRequest::Stop => {
+            if !authorized(bearer_token(&header), &state.token) {
+                return write_response(client, "403 Forbidden", "forbidden", "text/plain");
+            }
             state.running.store(false, Ordering::Release);
             write_response(client, "204 No Content", "", "text/plain")
         }
@@ -602,6 +679,7 @@ const fn error_stage(error: &StoreAccelError) -> &'static str {
         StoreAccelError::Config(_) => "config",
         StoreAccelError::Snapshot(_) => "snapshot",
         StoreAccelError::InvalidRequest(_) => "proxy_or_egress",
+        StoreAccelError::Unauthorized(_) => "auth",
         StoreAccelError::Dns(_) => "dns",
         StoreAccelError::Tls(_) => "tls_probe",
         StoreAccelError::SystemProxy(_) => "system_proxy",
@@ -1139,7 +1217,7 @@ impl DnsResolver {
         socket.send(&request)?;
         let mut response = [0_u8; MAX_DNS_RESPONSE_BYTES];
         let length = socket.recv(&mut response)?;
-        parse_dns_response(id, record_type, &response[..length])
+        parse_dns_response(id, host, record_type, &response[..length])
     }
 
     fn is_cooling_down(&self, host: &str, address: IpAddr) -> bool {
@@ -1280,7 +1358,12 @@ fn build_dns_query(id: u16, host: &str, record_type: DnsRecordType) -> Result<Ve
     Ok(query)
 }
 
-fn parse_dns_response(id: u16, expected_type: DnsRecordType, response: &[u8]) -> Result<DnsAnswer> {
+fn parse_dns_response(
+    id: u16,
+    host: &str,
+    expected_type: DnsRecordType,
+    response: &[u8],
+) -> Result<DnsAnswer> {
     if response.len() < 12 {
         return Err(StoreAccelError::Dns("响应头不足".into()));
     }
@@ -1291,25 +1374,55 @@ fn parse_dns_response(id: u16, expected_type: DnsRecordType, response: &[u8]) ->
     if flags & 0x8000 == 0 || flags & 0x000F != 0 {
         return Err(StoreAccelError::Dns("解析器返回错误".into()));
     }
+    if flags & 0x0200 != 0 {
+        // R8: 截断的响应只含部分记录, 直接丢弃不缓存.
+        return Err(StoreAccelError::Dns("响应被截断 (TC 位)".into()));
+    }
     let questions = usize::from(u16::from_be_bytes([response[4], response[5]]));
     let answers = usize::from(u16::from_be_bytes([response[6], response[7]]));
+    if questions != 1 {
+        return Err(StoreAccelError::Dns("question 段数量不为 1".into()));
+    }
+    let host_key = host.trim_end_matches('.').to_ascii_lowercase();
     let mut cursor = 12;
-    for _ in 0..questions {
-        skip_dns_name(response, &mut cursor)?;
-        advance_dns(response, &mut cursor, 4)?;
+    // M5: question 段必须与发出的查询一致, 防伪造/串台响应.
+    let question_name = read_dns_name(response, &mut cursor)?;
+    if question_name.trim_end_matches('.') != host_key {
+        return Err(StoreAccelError::Dns("question 域名与查询不一致".into()));
+    }
+    let question_type = read_u16(response, &mut cursor)?;
+    let question_class = read_u16(response, &mut cursor)?;
+    if question_type != expected_type.number() || question_class != 1 {
+        return Err(StoreAccelError::Dns("question 记录类型不匹配".into()));
     }
 
+    // M5: 每条 answer 的 owner 必须为查询 host, 或本响应先前 CNAME 的目标.
+    let mut acceptable_names = vec![host_key];
     let mut addresses = Vec::new();
     let mut min_ttl = None;
     for _ in 0..answers {
-        skip_dns_name(response, &mut cursor)?;
+        let owner = read_dns_name(response, &mut cursor)?;
+        let owner_key = owner.trim_end_matches('.').to_ascii_lowercase();
+        if !acceptable_names.contains(&owner_key) {
+            return Err(StoreAccelError::Dns(format!(
+                "answer 所有者 {owner_key} 与查询不一致"
+            )));
+        }
         let answer_type = read_u16(response, &mut cursor)?;
         let class = read_u16(response, &mut cursor)?;
         let ttl = read_u32(response, &mut cursor)?;
         let length = usize::from(read_u16(response, &mut cursor)?);
         let data_start = cursor;
         advance_dns(response, &mut cursor, length)?;
-        if answer_type == expected_type.number() && class == 1 {
+        if answer_type == 5 && class == 1 {
+            // CNAME 目标加入可接受集合, 后续记录可跟随该链.
+            let mut target_cursor = data_start;
+            let target = read_dns_name(response, &mut target_cursor)?;
+            let target_key = target.trim_end_matches('.').to_ascii_lowercase();
+            if !acceptable_names.contains(&target_key) {
+                acceptable_names.push(target_key);
+            }
+        } else if answer_type == expected_type.number() && class == 1 {
             let address = match expected_type {
                 DnsRecordType::A if length == 4 => IpAddr::V4(Ipv4Addr::new(
                     response[data_start],
@@ -1340,23 +1453,49 @@ fn parse_dns_response(id: u16, expected_type: DnsRecordType, response: &[u8]) ->
     })
 }
 
-fn skip_dns_name(input: &[u8], cursor: &mut usize) -> Result<()> {
+/// 解析 DNS 名称(支持压缩指针), 返回小写域名; 无指针时游标越过名称, 有指针时仅越过指针.
+fn read_dns_name(input: &[u8], cursor: &mut usize) -> Result<String> {
+    let mut offset = *cursor;
+    let mut jumped = false;
+    let mut pointer_count = 0;
+    let mut labels = Vec::new();
     loop {
-        let Some(&length) = input.get(*cursor) else {
+        let Some(&length) = input.get(offset) else {
             return Err(StoreAccelError::Dns("DNS 名称越界".into()));
         };
         if length == 0 {
-            *cursor += 1;
-            return Ok(());
+            if !jumped {
+                *cursor = offset + 1;
+            }
+            return Ok(labels.join("."));
         }
         if length & 0xC0 == 0xC0 {
-            advance_dns(input, cursor, 2)?;
-            return Ok(());
+            let Some(&second) = input.get(offset + 1) else {
+                return Err(StoreAccelError::Dns("DNS 名称越界".into()));
+            };
+            if !jumped {
+                *cursor = offset + 2;
+                jumped = true;
+            }
+            offset = usize::from(u16::from_be_bytes([length, second]) & 0x3FFF);
+            pointer_count += 1;
+            if pointer_count > 32 {
+                return Err(StoreAccelError::Dns("DNS 名称指针过深".into()));
+            }
+            continue;
         }
         if length & 0xC0 != 0 {
             return Err(StoreAccelError::Dns("DNS 名称编码无效".into()));
         }
-        advance_dns(input, cursor, usize::from(length) + 1)?;
+        let end = offset + 1 + usize::from(length);
+        if end > input.len() {
+            return Err(StoreAccelError::Dns("DNS 名称越界".into()));
+        }
+        let label = std::str::from_utf8(&input[offset + 1..end])
+            .map_err(|_| StoreAccelError::Dns("DNS 名称包含非 ASCII 标签".into()))?
+            .to_ascii_lowercase();
+        labels.push(label);
+        offset = end;
     }
 }
 
@@ -1807,16 +1946,264 @@ mod tests {
     fn dns_parser_reads_compressed_a_record() {
         let response = [
             0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x05, b's',
-            b't', b'o', b'r', b'e', 0x05, b's', b't', b'e', b'a', b'm', 0x03, b'c', b'o', b'm',
-            0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
-            0x3c, 0x00, 0x04, 104, 85, 0, 101,
+            b't', b'o', b'r', b'e', 0x0c, b's', b't', b'e', b'a', b'm', b'p', b'o', b'w', b'e',
+            b'r', b'e', b'd', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 104, 85, 0, 101,
         ];
-        let answer = parse_dns_response(0x1234, DnsRecordType::A, &response).unwrap();
+        let answer = parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response,
+        )
+        .unwrap();
         assert_eq!(
             answer.addresses,
             vec![IpAddr::V4(Ipv4Addr::new(104, 85, 0, 101))]
         );
         assert_eq!(answer.ttl, Duration::from_secs(60));
+    }
+
+    /// 测试用: 把域名编码为未压缩的 DNS 名称.
+    fn encode_name(name: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in name.trim_end_matches('.').split('.') {
+            out.push(u8::try_from(label.len()).unwrap());
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    /// 测试用: 构造一个 question + answer 列表的伪响应 (无压缩, 无附加段).
+    fn fake_dns_response(
+        id: u16,
+        flags: u16,
+        qname: &str,
+        qtype: u16,
+        answers: &[(Vec<u8>, u16, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut response = Vec::new();
+        response.extend_from_slice(&id.to_be_bytes());
+        response.extend_from_slice(&flags.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&u16::try_from(answers.len()).unwrap().to_be_bytes());
+        response.extend_from_slice(&0_u16.to_be_bytes());
+        response.extend_from_slice(&0_u16.to_be_bytes());
+        response.extend_from_slice(&encode_name(qname));
+        response.extend_from_slice(&qtype.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        for (owner, rtype, rdata) in answers {
+            response.extend_from_slice(owner);
+            response.extend_from_slice(&rtype.to_be_bytes());
+            response.extend_from_slice(&1_u16.to_be_bytes());
+            response.extend_from_slice(&60_u32.to_be_bytes());
+            response.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+            response.extend_from_slice(rdata);
+        }
+        response
+    }
+
+    #[test]
+    fn dns_parser_accepts_valid_response_for_queried_host() {
+        let response = fake_dns_response(
+            0x1234,
+            0x8180,
+            "store.steampowered.com",
+            1,
+            &[(
+                encode_name("store.steampowered.com"),
+                1,
+                vec![104, 85, 0, 101],
+            )],
+        );
+        let answer = parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response,
+        )
+        .unwrap();
+        assert_eq!(
+            answer.addresses,
+            vec![IpAddr::V4(Ipv4Addr::new(104, 85, 0, 101))]
+        );
+        assert_eq!(answer.ttl, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn dns_parser_tolerates_case_and_trailing_dot() {
+        let response = fake_dns_response(
+            0x1234,
+            0x8180,
+            "Store.SteamPowered.Com.",
+            1,
+            &[(
+                encode_name("store.steampowered.com"),
+                1,
+                vec![104, 85, 0, 101],
+            )],
+        );
+        let answer = parse_dns_response(
+            0x1234,
+            "STORE.steampowered.com.",
+            DnsRecordType::A,
+            &response,
+        )
+        .unwrap();
+        assert_eq!(
+            answer.addresses,
+            vec![IpAddr::V4(Ipv4Addr::new(104, 85, 0, 101))]
+        );
+    }
+
+    #[test]
+    fn dns_parser_rejects_wrong_question_name() {
+        let response = fake_dns_response(
+            0x1234,
+            0x8180,
+            "evil.example.com",
+            1,
+            &[(
+                encode_name("store.steampowered.com"),
+                1,
+                vec![104, 85, 0, 101],
+            )],
+        );
+        let error = parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("question 域名"));
+    }
+
+    #[test]
+    fn dns_parser_rejects_wrong_question_type() {
+        let response = fake_dns_response(
+            0x1234,
+            0x8180,
+            "store.steampowered.com",
+            28,
+            &[(
+                encode_name("store.steampowered.com"),
+                1,
+                vec![104, 85, 0, 101],
+            )],
+        );
+        let error = parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("记录类型"));
+    }
+
+    #[test]
+    fn dns_parser_rejects_truncated_flag() {
+        let response = fake_dns_response(
+            0x1234,
+            0x8380,
+            "store.steampowered.com",
+            1,
+            &[(
+                encode_name("store.steampowered.com"),
+                1,
+                vec![104, 85, 0, 101],
+            )],
+        );
+        let error = parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("TC"));
+    }
+
+    #[test]
+    fn dns_parser_rejects_foreign_answer_owner() {
+        let response = fake_dns_response(
+            0x1234,
+            0x8180,
+            "store.steampowered.com",
+            1,
+            &[(encode_name("evil.example.com"), 1, vec![104, 85, 0, 101])],
+        );
+        let error = parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("所有者"));
+    }
+
+    #[test]
+    fn dns_parser_rejects_multiple_questions() {
+        let mut response = fake_dns_response(0x1234, 0x8180, "store.steampowered.com", 1, &[]);
+        response[5] = 2;
+        assert!(parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn dns_parser_accepts_cname_chain_to_query_host() {
+        let target = encode_name("cdn.steampowered.com");
+        let response = fake_dns_response(
+            0x1234,
+            0x8180,
+            "store.steampowered.com",
+            1,
+            &[
+                (encode_name("store.steampowered.com"), 5, target.clone()),
+                (target, 1, vec![104, 85, 0, 101]),
+            ],
+        );
+        let answer = parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response,
+        )
+        .unwrap();
+        assert_eq!(
+            answer.addresses,
+            vec![IpAddr::V4(Ipv4Addr::new(104, 85, 0, 101))]
+        );
+    }
+
+    #[test]
+    fn dns_parser_rejects_answer_before_its_cname() {
+        let target = encode_name("cdn.steampowered.com");
+        let response = fake_dns_response(
+            0x1234,
+            0x8180,
+            "store.steampowered.com",
+            1,
+            &[
+                (target.clone(), 1, vec![104, 85, 0, 101]),
+                (encode_name("store.steampowered.com"), 5, target),
+            ],
+        );
+        assert!(parse_dns_response(
+            0x1234,
+            "store.steampowered.com",
+            DnsRecordType::A,
+            &response
+        )
+        .is_err());
     }
 
     #[test]
@@ -1943,5 +2330,84 @@ mod tests {
         let error = HelperConfig::try_from(&config).unwrap_err();
 
         assert!(error.to_string().contains("未配置"));
+    }
+
+    #[test]
+    fn stop_auth_rejects_missing_or_wrong_token() {
+        assert!(!authorized(None, "expected-token"));
+        assert!(!authorized(Some("wrong-token"), "expected-token"));
+        assert!(!authorized(Some(""), "expected-token"));
+        assert!(authorized(Some("expected-token"), "expected-token"));
+    }
+
+    #[test]
+    fn bearer_token_parses_header_case_insensitively() {
+        let token = "abc123def456";
+        let header = format!(
+            "POST /__steamtools__/stop HTTP/1.1\r\nHost: 127.0.0.1:18942\r\nAuthorization: Bearer {token}\r\n\r\n"
+        );
+        assert_eq!(bearer_token(header.as_bytes()), Some(token));
+
+        let header =
+            format!("POST /__steamtools__/stop HTTP/1.1\r\nauthorization: bearer {token}\r\n\r\n");
+        assert_eq!(bearer_token(header.as_bytes()), Some(token));
+
+        assert_eq!(
+            bearer_token(b"POST /__steamtools__/stop HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            bearer_token(
+                b"POST /__steamtools__/stop HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n"
+            ),
+            None
+        );
+        assert_eq!(
+            bearer_token(b"POST /__steamtools__/stop HTTP/1.1\r\nAuthorization: Bearer\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn request_stop_sends_bearer_and_reports_403_as_unauthorized() {
+        // 场景 1: 带正确 token, 服务端回 204.
+        let good_token = "unit-test-token-a1b2c3";
+        *STOP_TOKEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(good_token.into());
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = format!("Authorization: Bearer {good_token}");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let header = read_header(&mut stream).unwrap();
+            assert!(String::from_utf8(header).unwrap().contains(&expected));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        assert!(request_stop(port).is_ok());
+        worker.join().unwrap();
+
+        // 场景 2: token 不匹配, 服务端回 403, request_stop 报未鉴权错误.
+        *STOP_TOKEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("stale-token".into());
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_header(&mut stream).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let error = request_stop(port).unwrap_err();
+        worker.join().unwrap();
+        assert!(matches!(error, StoreAccelError::Unauthorized(_)));
+
+        *STOP_TOKEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }

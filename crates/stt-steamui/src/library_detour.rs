@@ -127,7 +127,7 @@ pub fn try_install_library_detours(
     let mut addrs: Vec<(&str, usize)> = Vec::with_capacity(LIBRARY_UX_SYMBOLS.len());
     let mut need_scan: Vec<&str> = Vec::new();
     for &name in LIBRARY_UX_SYMBOLS {
-        match patterns.find_by_rva_only("steamui", name, base) {
+        match patterns.find_by_rva_only("steamui", name, base, info.size) {
             Some(a) => addrs.push((name, a)),
             None => need_scan.push(name),
         }
@@ -238,23 +238,54 @@ pub fn try_install_library_detours(
 
 /// 卸补丁 → 调原入口 → 再挂上. 持 HOOKS 锁, 避免并发补丁竞态.
 ///
+/// 卸钩失败时 fail-closed: 不调用原函数, 返回 None; 恢复补丁再失败则把
+/// ATTACHED 置 false, 后续调用按未挂补丁直通原入口.
+///
 /// # Safety
 /// `f` 必须是已 resolve 的原函数入口; 调用期间补丁已卸.
-unsafe fn call_while_unhooked<R>(f: impl FnOnce() -> R) -> R {
+unsafe fn call_while_unhooked<R>(f: impl FnOnce() -> R) -> Option<R> {
     let mut slot = HOOKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(hooks) = slot.as_mut() {
-        let _ = hooks.run_frame.detach();
-        let _ = hooks.fill_in.detach();
-        let _ = hooks.build_complete.detach();
+        // 逐个卸补丁 (只卸仍挂着的); 任一失败立即 fail-closed, 不再调原函数.
+        let mut detached: Vec<&mut InlineHook> = Vec::with_capacity(3);
+        let mut detach_failed = false;
+        for h in [
+            &mut hooks.run_frame,
+            &mut hooks.fill_in,
+            &mut hooks.build_complete,
+        ] {
+            if !h.is_installed() {
+                continue;
+            }
+            if unsafe { h.detach() }.is_err() {
+                detach_failed = true;
+                break;
+            }
+            detached.push(h);
+        }
+        if detach_failed {
+            // 卸钩失败: 原入口可能仍带半补丁, 跳过本次调用; 尽量恢复已卸下的.
+            reattach_detached(&mut detached);
+            return None;
+        }
         let out = f();
-        let _ = hooks.run_frame.attach();
-        let _ = hooks.fill_in.attach();
-        let _ = hooks.build_complete.attach();
-        out
+        reattach_detached(&mut detached);
+        Some(out)
     } else {
-        f()
+        Some(f())
+    }
+}
+
+/// 把已卸下的补丁逐一挂回; 任一失败置 ATTACHED=false (后续调用直通原入口).
+fn reattach_detached(detached: &mut [&mut InlineHook]) {
+    for h in detached {
+        // # Safety
+        // 同 InlineHook::attach 的 Safety 要求; 持锁期间无其它写者.
+        if unsafe { h.attach() }.is_err() {
+            ATTACHED.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -280,6 +311,7 @@ unsafe extern "C" fn hk_run_frame(controller: *mut c_void) -> *mut c_void {
             let f: RunFrameFn = std::mem::transmute(target);
             f(controller)
         })
+        .unwrap_or(std::ptr::null_mut())
     }
 }
 
@@ -343,11 +375,13 @@ unsafe extern "C" fn hk_fill_in(
     FILL_IN_HITS.fetch_add(1, Ordering::Relaxed);
     if !p_app.is_null() {
         if let Some(ux) = ux() {
-            // CSteamApp::nAppID = vtable 第 0 方法.
+            // CSteamApp::nAppID 取自 vtable 第 0 方法: 先解引用对象取 vptr,
+            // 再解引用 vptr 取第 0 槽 (直接调用 vptr 会跳进 .rdata 数据段 = AV).
             let vtable = *(p_app as *const *const c_void);
             if !vtable.is_null() {
+                let first_slot = *(vtable as *const *const c_void);
                 let get_app_id: unsafe extern "C" fn(*mut c_void) -> u32 =
-                    std::mem::transmute::<*const c_void, _>(vtable);
+                    std::mem::transmute::<*const c_void, _>(first_slot);
                 let app_id = unsafe { get_app_id(p_app) };
                 if let Some(t) = ux.purchase_time(app_id) {
                     // # Safety
@@ -370,6 +404,7 @@ unsafe extern "C" fn hk_fill_in(
             let f: FillInFn = std::mem::transmute(target);
             f(controller, overview, p_app)
         })
+        .unwrap_or(std::ptr::null_mut())
     }
 }
 
@@ -393,6 +428,7 @@ unsafe extern "C" fn hk_build_complete(
                 f(controller, change, slot)
             })
         }
+        .unwrap_or(std::ptr::null_mut())
     };
 
     // 全量重建后重注入 removed_appid, 避免已移除 app 闪回.

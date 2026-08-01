@@ -19,6 +19,8 @@ mod lua_http;
 mod lua_load;
 #[cfg(feature = "lua")]
 mod lua_manifest_code;
+#[cfg(feature = "lua")]
+mod lua_vm;
 
 pub use appinfo::app_names;
 #[cfg(feature = "lua")]

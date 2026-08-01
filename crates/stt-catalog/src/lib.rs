@@ -19,7 +19,7 @@ pub use community::CommunityCatalogProvider;
 pub use error::{
     CatalogError, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, ProviderErrorKind,
 };
-pub use http::{validate_url_template, CustomHttpCatalogProvider};
+pub use http::{validate_url_template, validate_url_template_remote, CustomHttpCatalogProvider};
 pub use mock::MockCatalogProvider;
 pub use snapshot::{ensure_community_snapshots, CommunitySnapshotReport, CommunitySnapshotState};
 pub use validate::{validate_bundle, CatalogLimits};

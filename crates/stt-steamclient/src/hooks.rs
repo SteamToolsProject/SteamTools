@@ -18,8 +18,8 @@ use crate::install::{
     plan_package_install, PackageInstallReport, PackageInstallStatus, PACKAGE_P0_SYMBOLS,
 };
 use crate::layout::{
-    app_ownership, package_info, APP_RELEASE_STATE_RELEASED, INJECTED_PACKAGE_ACCESS_TOKEN,
-    INJECTED_PACKAGE_ID, PACKAGE_STATUS_AVAILABLE,
+    app_ownership, package_info, utl_vector, APP_RELEASE_STATE_RELEASED,
+    INJECTED_PACKAGE_ACCESS_TOKEN, INJECTED_PACKAGE_ID, PACKAGE_STATUS_AVAILABLE,
 };
 use crate::license::{LicenseNotifyPlan, LicenseQueue, UiLicenseAction};
 use crate::ownership::{decide_ownership_rewrite, ForgedOwnershipFields, OwnershipRewrite};
@@ -52,6 +52,8 @@ static CHECK_HITS: AtomicU64 = AtomicU64::new(0);
 static FORGE_HITS: AtomicU64 = AtomicU64::new(0);
 static PACKAGE0_HITS: AtomicU64 = AtomicU64::new(0);
 static PACKAGE0_STATUS: AtomicU32 = AtomicU32::new(u32::MAX);
+/// grow 校验失败计数 (与 PACKAGE0_HITS 同模式的统计上报, 供诊断).
+pub(crate) static APPEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 static RUNTIME: OnceLock<PackageRuntime> = OnceLock::new();
 
@@ -237,7 +239,7 @@ pub fn try_install_package_hooks(
     let mut addrs = Vec::with_capacity(PACKAGE_P0_SYMBOLS.len());
     let mut need_scan: Vec<&str> = Vec::new();
     for &name in PACKAGE_P0_SYMBOLS {
-        match patterns.find_by_rva_only("steamclient", name, base) {
+        match patterns.find_by_rva_only("steamclient", name, base, info.size) {
             Some(a) => addrs.push((name, a)),
             None => need_scan.push(name),
         }
@@ -525,10 +527,18 @@ unsafe fn append_app_ids(pkg: *mut c_void, apps: &[AppId]) -> bool {
     let vec_ptr = (pkg as *mut u8).add(package_info::APP_ID_VEC_MEMORY) as *mut c_void;
     let old_size = read_u32(pkg as *mut u8, package_info::APP_ID_VEC_SIZE) as usize;
     let f: CUtlMemoryGrowFn = std::mem::transmute(grow);
-    let _ = f(vec_ptr, apps.len() as i32);
-    // Grow 之后重新读指针 (可能 realloc).
+    let grown = f(vec_ptr, apps.len() as i32);
+    // 写前校验: grow 返回值必须非空, 且重读的 size/capacity 足以覆盖 old + apps.
+    // Grow 之后重新读指针与容量 (可能 realloc).
+    let new_size = read_u32(pkg as *mut u8, package_info::APP_ID_VEC_SIZE) as usize;
+    let capacity = read_u32(
+        pkg as *mut u8,
+        package_info::APP_ID_VEC_MEMORY + utl_vector::ALLOCATION_COUNT,
+    ) as usize;
     let mem = read_usize(pkg as *mut u8, package_info::APP_ID_VEC_MEMORY) as *mut u32;
-    if mem.is_null() {
+    let need = old_size + apps.len();
+    if grown.is_null() || mem.is_null() || new_size < need || capacity < need {
+        APPEND_FAILURES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     for (i, &id) in apps.iter().enumerate() {
@@ -672,10 +682,72 @@ unsafe fn read_usize(base: *mut u8, off: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::utl_vector;
 
     #[test]
     fn env_default_allows_attach() {
         // 不依赖真实环境变量内容做强断言; 仅保证函数可调用.
         let _ = package_hooks_enabled_by_env();
+    }
+
+    /// 模拟 CUtlMemoryGrow 失败: 返回空指针, 不扩容量.
+    unsafe extern "C" fn mock_grow_null(_vec: *mut c_void, _add: i32) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    /// 模拟 CUtlMemoryGrow 成功: 扩 ALLOCATION_COUNT 与 SIZE 并返回内存指针.
+    unsafe extern "C" fn mock_grow_ok(vec: *mut c_void, add: i32) -> *mut c_void {
+        let base = vec as *mut u8;
+        let cap = std::ptr::read_unaligned(base.add(utl_vector::ALLOCATION_COUNT) as *const u32);
+        let size = std::ptr::read_unaligned(base.add(utl_vector::SIZE) as *const u32);
+        std::ptr::write_unaligned(
+            base.add(utl_vector::ALLOCATION_COUNT) as *mut u32,
+            cap + add as u32,
+        );
+        std::ptr::write_unaligned(base.add(utl_vector::SIZE) as *mut u32, size + add as u32);
+        std::ptr::read(base as *const *mut c_void)
+    }
+
+    #[test]
+    fn append_app_ids_skips_write_when_grow_fails() {
+        let mut buf = [0u8; 0x58];
+        let pkg = buf.as_mut_ptr() as *mut c_void;
+        FN_GROW.store(
+            mock_grow_null as *const c_void as *mut c_void,
+            Ordering::SeqCst,
+        );
+        let before = APPEND_FAILURES.load(Ordering::Relaxed);
+        let ok = unsafe { append_app_ids(pkg, &[1001]) };
+        assert!(!ok);
+        assert!(APPEND_FAILURES.load(Ordering::Relaxed) > before);
+        // 失败路径不写任何元素.
+        assert_eq!(
+            unsafe { read_u32(buf.as_mut_ptr(), package_info::APP_ID_VEC_SIZE) },
+            0
+        );
+        FN_GROW.store(std::ptr::null_mut(), Ordering::SeqCst);
+    }
+
+    #[test]
+    fn append_app_ids_writes_when_grow_succeeds() {
+        let mut store = [0u32; 8];
+        let mut buf = [0u8; 0x58];
+        unsafe {
+            std::ptr::write_unaligned(
+                buf.as_mut_ptr().add(package_info::APP_ID_VEC_MEMORY) as *mut *mut u32,
+                store.as_mut_ptr(),
+            );
+            std::ptr::write_unaligned(buf.as_mut_ptr().add(0x48) as *mut u32, store.len() as u32);
+        }
+        let pkg = buf.as_mut_ptr() as *mut c_void;
+        FN_GROW.store(
+            mock_grow_ok as *const c_void as *mut c_void,
+            Ordering::SeqCst,
+        );
+        let ok = unsafe { append_app_ids(pkg, &[1001, 1002]) };
+        assert!(ok);
+        assert_eq!(store[0], 1001);
+        assert_eq!(store[1], 1002);
+        FN_GROW.store(std::ptr::null_mut(), Ordering::SeqCst);
     }
 }

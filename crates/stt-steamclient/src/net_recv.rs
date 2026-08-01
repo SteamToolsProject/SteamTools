@@ -11,7 +11,9 @@ use crate::request_code::ManifestCodeResponseRewrite;
 use crate::verified::resolve_verified_symbol;
 
 const SYMBOL: &str = "RecvPkt";
-const MAX_PACKET_SIZE: usize = 8 + 1024 + 65_536;
+
+/// 单帧上限: 8 字节头 + 1024 命令前缀 + 64 KiB 载荷 (与 net_send 共用同一常量).
+pub(crate) const MAX_PACKET_SIZE: usize = 8 + 1024 + 65_536;
 
 #[repr(C)]
 struct NetPacket {

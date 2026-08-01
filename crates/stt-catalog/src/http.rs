@@ -84,6 +84,83 @@ pub fn validate_url_template(template: &str) -> CatalogResult<()> {
     Ok(())
 }
 
+/// 页面意图来源的模板校验: 格式校验之外, 拒绝回环/链路本地/组播/IPv6/localhost 主机,
+/// 防止被伪造 intent 指向本机或内网服务. 用户手写配置不受此限 (走 `validate_url_template`).
+///
+/// # Errors
+///
+/// 模板格式非法或主机被禁止时返回 unavailable 错误.
+pub fn validate_url_template_remote(template: &str) -> CatalogResult<()> {
+    validate_url_template(template)?;
+    let Some(host) = template_url_host(template) else {
+        return Err(provider_error(
+            ProviderErrorKind::Unavailable,
+            "invalid URL template; expected one {app_id} in an HTTP(S) URL",
+        ));
+    };
+    if host_forbidden(host) {
+        return Err(provider_error(
+            ProviderErrorKind::Unavailable,
+            "URL template host is not allowed (loopback/link-local/multicast/IPv6/localhost)",
+        ));
+    }
+    Ok(())
+}
+
+/// 提取 URL 模板的 host 段 (不含 scheme 和路径), 失败返回 None.
+fn template_url_host(template: &str) -> Option<&str> {
+    let rest = template
+        .strip_prefix("http://")
+        .or_else(|| template.strip_prefix("https://"))?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// host 是否禁止访问: 回环/链路本地/组播/IPv6/本地主机名.
+/// 与 stt-config/src/lua_http.rs 的 host_forbidden 是双胞胎, 改动需两边同步.
+/// 残余说明: 主机名被 DNS 重绑定到回环 IP 的场景本层不覆盖 (模板作者即信任边界).
+fn host_forbidden(host: &str) -> bool {
+    // 剥掉 :port 后缀 (仅当后缀全是数字); IPv6 字面量里的 ':' 不匹配数字后缀,
+    // 会整体保留并在下一行因含 ':' 被拒.
+    let host = match host.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => host,
+    };
+    // 任何含 ':' 的 host 都是 IPv6 字面量 (::1 / fe80:: / :: / ff00:: 等), 一律拒绝.
+    if host.contains(':') {
+        return true;
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return true;
+    }
+    let Some(octets) = parse_ipv4(&lower) else {
+        return false;
+    };
+    // 127.0.0.0/8 回环, 169.254.0.0/16 链路本地, 0.0.0.0, 224.0.0.0/4 组播.
+    octets[0] == 127
+        || (octets[0] == 169 && octets[1] == 254)
+        || (octets[0] == 0 && octets[1] == 0 && octets[2] == 0 && octets[3] == 0)
+        || octets[0] >= 224
+}
+
+/// 手写 dotted-quad IPv4 解析, 避免新增依赖.
+fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
+    let mut parts = host.split('.');
+    let mut octets = [0u8; 4];
+    for octet in &mut octets {
+        let part = parts.next()?;
+        if part.is_empty() || part.len() > 3 || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *octet = part.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(octets)
+}
+
 fn map_http_error(error: HttpError) -> CatalogError {
     match error {
         HttpError::Timeout { .. } => provider_error(ProviderErrorKind::Timeout, error.to_string()),
@@ -166,7 +243,11 @@ mod tests {
         }
 
         fn provider(&self, options: WinHttpGetOptions) -> CustomHttpCatalogProvider {
-            CustomHttpCatalogProvider::new(self.template.clone(), options).unwrap()
+            // 直连回环测试服务器需要跳过模板主机校验; 该路径只测 wire 协议, 模板校验有专门测试.
+            CustomHttpCatalogProvider {
+                url_template: self.template.clone(),
+                options,
+            }
         }
     }
 
@@ -206,6 +287,52 @@ mod tests {
             WinHttpGetOptions::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_loopback_link_local_multicast_and_ipv6_hosts() {
+        for template in [
+            "http://127.0.0.1/catalog/{app_id}",
+            "http://127.255.1.1/catalog/{app_id}",
+            "https://127.0.0.1:8443/catalog/{app_id}",
+            "http://169.254.169.254/latest/{app_id}",
+            "http://0.0.0.0/catalog/{app_id}",
+            "http://224.0.0.1/catalog/{app_id}",
+            "http://239.255.255.250/catalog/{app_id}",
+            "http://[::1]/catalog/{app_id}",
+            "http://fe80::1/catalog/{app_id}",
+            "http://localhost/catalog/{app_id}",
+            "http://foo.localhost/catalog/{app_id}",
+            "https://steam.localhost:8443/catalog/{app_id}",
+        ] {
+            assert!(
+                validate_url_template_remote(template).is_err(),
+                "should reject {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_external_hosts() {
+        for template in [
+            "https://store.steampowered.com/app/{app_id}",
+            "https://api.steampowered.com/catalog/{app_id}",
+            "http://cdn.example.com/catalog/{app_id}",
+            "https://sub.domain.test:8443/catalog/{app_id}",
+            "http://1.2.3.4/catalog/{app_id}",
+            "https://github.com/SteamToolsProject/SteamTools/raw/{app_id}",
+        ] {
+            assert!(
+                validate_url_template_remote(template).is_ok(),
+                "should accept {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_host_templates_are_allowed_in_written_config() {
+        // 用户手写配置允许本地自建 catalog 服务; 页面意图路径才拒绝 (见 remote 校验).
+        assert!(validate_url_template("http://127.0.0.1:8081/catalog/{app_id}").is_ok());
     }
 
     #[test]

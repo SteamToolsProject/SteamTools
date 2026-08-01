@@ -103,25 +103,154 @@ fn ensure_snapshot(
         }
     }
 
-    for &(source, url) in sources {
-        let response = match winhttp_get(
+    // depot key 走双镜像对账; token 只有单源, 保持按序取用.
+    let candidate = if matches!(kind, SnapshotKind::DepotKey) {
+        reconciled_candidate(max_bytes, max_entries, sources, timeouts)
+    } else {
+        first_valid_candidate(kind, max_bytes, max_entries, sources, timeouts)
+    };
+    let Some((source, body)) = candidate else {
+        return CommunitySnapshotState::Unavailable;
+    };
+    let Ok(entries) = validate_snapshot(&body, kind, max_entries) else {
+        return CommunitySnapshotState::Unavailable;
+    };
+    if write_atomic(&path, &body).is_ok() {
+        CommunitySnapshotState::Downloaded { source, entries }
+    } else {
+        CommunitySnapshotState::Unavailable
+    }
+}
+
+/// 双镜像策略: 两个镜像都成功则逐 key 对账, 仅两源一致的 key 保留; 单镜像
+/// 成功降级用该源; 都失败时回退到镜像之后的单源链 (github_raw 信任原站, 不对账).
+/// 约定: sources 前两项是镜像, 之后的源作为单源回退链.
+fn reconciled_candidate(
+    max_bytes: usize,
+    max_entries: usize,
+    sources: &'static [(&'static str, &'static str)],
+    timeouts: WinHttpTimeouts,
+) -> Option<(&'static str, Vec<u8>)> {
+    reconciled_candidate_with(max_entries, sources, |_, url| {
+        fetch_valid_body(
+            SnapshotKind::DepotKey,
             url,
-            WinHttpGetOptions {
-                timeouts,
-                max_body_bytes: max_bytes,
-            },
-        ) {
-            Ok(response) if (200..300).contains(&response.status) => response,
-            _ => continue,
-        };
-        let Ok(entries) = validate_snapshot(&response.body, kind, max_entries) else {
-            continue;
-        };
-        if write_atomic(&path, &response.body).is_ok() {
-            return CommunitySnapshotState::Downloaded { source, entries };
+            max_bytes,
+            max_entries,
+            timeouts,
+        )
+    })
+}
+
+fn reconciled_candidate_with<F>(
+    max_entries: usize,
+    sources: &'static [(&'static str, &'static str)],
+    mut fetch: F,
+) -> Option<(&'static str, Vec<u8>)>
+where
+    F: FnMut(&'static str, &'static str) -> Option<Vec<u8>>,
+{
+    let mirrors = sources.get(..2).unwrap_or(&[]);
+    let mut valid: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for &(source, url) in mirrors {
+        if let Some(body) = fetch(source, url) {
+            valid.push((source, body));
         }
     }
-    CommunitySnapshotState::Unavailable
+    if valid.len() == 2 {
+        let (_, second) = valid.pop().unwrap();
+        let (_, first) = valid.pop().unwrap();
+        if let Some((body, dropped)) = reconcile_key_snapshots(&first, &second, max_entries) {
+            diagnostic(format!(
+                "depot keys reconciled from two mirrors, dropped {dropped} keys"
+            ));
+            return Some(("mirrors", body));
+        }
+        diagnostic("depot keys: mirrors disagree entirely, trusting origin");
+    } else if valid.len() == 1 {
+        let (source, body) = valid.pop().unwrap();
+        diagnostic(format!("depot keys: single mirror {source} succeeded"));
+        return Some((source, body));
+    } else {
+        diagnostic("depot keys: both mirrors failed, trusting origin");
+    }
+    // 镜像不可用时的单源回退链 (github_raw 等), 信任原站.
+    for &(source, url) in sources.get(2..).unwrap_or(&[]) {
+        if let Some(body) = fetch(source, url) {
+            return Some((source, body));
+        }
+    }
+    None
+}
+
+/// 单源策略: 按顺序返回第一个校验通过的源.
+fn first_valid_candidate(
+    kind: SnapshotKind,
+    max_bytes: usize,
+    max_entries: usize,
+    sources: &'static [(&'static str, &'static str)],
+    timeouts: WinHttpTimeouts,
+) -> Option<(&'static str, Vec<u8>)> {
+    for &(source, url) in sources {
+        if let Some(body) = fetch_valid_body(kind, url, max_bytes, max_entries, timeouts) {
+            return Some((source, body));
+        }
+    }
+    None
+}
+
+/// 取回单份快照并校验, 失败返回 None (限长与条目上限与原逻辑一致).
+fn fetch_valid_body(
+    kind: SnapshotKind,
+    url: &str,
+    max_bytes: usize,
+    max_entries: usize,
+    timeouts: WinHttpTimeouts,
+) -> Option<Vec<u8>> {
+    let response = winhttp_get(
+        url,
+        WinHttpGetOptions {
+            timeouts,
+            max_body_bytes: max_bytes,
+        },
+    )
+    .ok()?;
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+    validate_snapshot(&response.body, kind, max_entries).ok()?;
+    Some(response.body)
+}
+
+/// 逐 key 对账两个镜像正文: 两源键值完全一致的 key 保留, 其余丢弃.
+/// 返回 (对账后正文, 丢弃的 key 数); 对账结果为空时返回 None 由调用方回退.
+fn reconcile_key_snapshots(
+    first: &[u8],
+    second: &[u8],
+    max_entries: usize,
+) -> Option<(Vec<u8>, usize)> {
+    let first: std::collections::HashMap<String, String> = serde_json::from_slice(first).ok()?;
+    let second: std::collections::HashMap<String, String> = serde_json::from_slice(second).ok()?;
+    let mut kept: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (key, value) in &first {
+        if second.get(key) == Some(value) {
+            kept.insert(key.clone(), value.clone());
+        }
+    }
+    if kept.is_empty() || kept.len() > max_entries {
+        return None;
+    }
+    let dropped = first
+        .len()
+        .saturating_sub(kept.len())
+        .saturating_add(second.len().saturating_sub(kept.len()));
+    let body = serde_json::to_vec(&kept).ok()?;
+    Some((body, dropped))
+}
+
+// 本 crate 无日志依赖, 诊断走 stderr (Steam 无控制台时自动丢弃), 前缀便于过滤.
+fn diagnostic(message: impl std::fmt::Display) {
+    eprintln!("steamtools snapshot: {message}");
 }
 
 fn read_bounded(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
@@ -270,6 +399,83 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["jsdmirror", "ghfast", "github_raw", "sudama"]
         );
+    }
+
+    #[test]
+    fn mirrors_agree_keeps_all_keys() {
+        let body = format!(
+            r#"{{"42":"{}","43":"{}"}}"#,
+            "ab".repeat(32),
+            "cd".repeat(32)
+        );
+
+        let (source, merged) = reconciled_candidate_with(10, KEY_SOURCES, |source, _| {
+            (source == "jsdmirror" || source == "ghfast").then(|| body.as_bytes().to_vec())
+        })
+        .unwrap();
+
+        assert_eq!(source, "mirrors");
+        let entries = validate_snapshot(&merged, SnapshotKind::DepotKey, 10).unwrap();
+        assert_eq!(entries, 2);
+    }
+
+    #[test]
+    fn mirrors_disagree_drops_differing_keys() {
+        let first = format!(
+            r#"{{"42":"{}","43":"{}"}}"#,
+            "ab".repeat(32),
+            "cd".repeat(32)
+        );
+        let second = format!(
+            r#"{{"42":"{}","43":"{}"}}"#,
+            "ab".repeat(32),
+            "ef".repeat(32)
+        );
+
+        let (source, merged) = reconciled_candidate_with(10, KEY_SOURCES, |source, _| {
+            let body = if source == "jsdmirror" {
+                &first
+            } else {
+                &second
+            };
+            (source == "jsdmirror" || source == "ghfast").then(|| body.as_bytes().to_vec())
+        })
+        .unwrap();
+
+        assert_eq!(source, "mirrors");
+        let kept: std::collections::HashMap<String, String> =
+            serde_json::from_slice(&merged).unwrap();
+        assert!(kept.contains_key("42"));
+        assert!(!kept.contains_key("43"));
+    }
+
+    #[test]
+    fn single_mirror_success_is_used() {
+        let body = format!(r#"{{"42":"{}"}}"#, "ab".repeat(32));
+
+        let (source, _) = reconciled_candidate_with(10, KEY_SOURCES, |source, _| {
+            (source == "ghfast").then(|| body.as_bytes().to_vec())
+        })
+        .unwrap();
+
+        assert_eq!(source, "ghfast");
+    }
+
+    #[test]
+    fn both_mirrors_fail_falls_back_to_github_raw() {
+        let body = format!(r#"{{"42":"{}"}}"#, "ab".repeat(32));
+
+        let (source, _) = reconciled_candidate_with(10, KEY_SOURCES, |source, _| {
+            (source == "github_raw").then(|| body.as_bytes().to_vec())
+        })
+        .unwrap();
+
+        assert_eq!(source, "github_raw");
+    }
+
+    #[test]
+    fn all_key_sources_fail_is_unavailable() {
+        assert!(reconciled_candidate_with(10, KEY_SOURCES, |_, _| None).is_none());
     }
 
     #[test]

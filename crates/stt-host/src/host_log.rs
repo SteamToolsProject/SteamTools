@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
@@ -114,9 +114,19 @@ impl HostLogger {
         );
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         let writer_session = session_id.clone();
+        let writer_path = path.to_path_buf();
         thread::Builder::new()
             .name("stt-log-writer".to_owned())
-            .spawn(move || run_writer(file, receiver, writer_session, started_ms, has_content))?;
+            .spawn(move || {
+                run_writer(
+                    writer_path,
+                    file,
+                    receiver,
+                    writer_session,
+                    started_ms,
+                    has_content,
+                )
+            })?;
 
         Ok(Self {
             sender,
@@ -165,18 +175,19 @@ impl HostLogger {
 }
 
 fn run_writer(
+    path: PathBuf,
     file: File,
     receiver: mpsc::Receiver<LogRecord>,
     session_id: String,
     started_ms: u128,
     has_content: bool,
 ) {
-    let mut writer = BufWriter::new(file);
-    if has_content && write_line(&mut writer, "").is_err() {
+    let mut writer = Some(BufWriter::new(file));
+    if has_content && write_line(writer.as_mut().unwrap(), "").is_err() {
         return;
     }
     if write_line(
-        &mut writer,
+        writer.as_mut().unwrap(),
         &format!(
             "ts_unix_ms={started_ms} level=info target=stt_host event=session_start session={session_id} thread=stt-log-writer uptime_ms=0 dropped_before=0 message=\"log session started\""
         ),
@@ -188,10 +199,32 @@ fn run_writer(
 
     while let Ok(record) = receiver.recv() {
         let line = format_record(&record, &session_id);
-        if write_line(&mut writer, &line).is_err() {
+        if write_line(writer.as_mut().unwrap(), &line).is_err() {
+            break;
+        }
+        // 每次写后看一眼文件大小, 超上限就地轮转, 别等下次启动才轮.
+        let over_limit = writer.as_ref().is_some_and(|w| {
+            w.get_ref()
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() > MAX_LOG_BYTES)
+        });
+        if over_limit && rotate_writer(&mut writer, &path).is_err() {
             break;
         }
     }
+}
+
+/// 会话中就地轮转: 关掉旧句柄, 当前文件挪成 .log.1 (老 .log.1 顺延 .log.2),
+/// 再在原名上开新文件继续写.
+fn rotate_writer(writer: &mut Option<BufWriter<File>>, path: &Path) -> io::Result<()> {
+    // 先落盘并关闭旧句柄, 不然 rename 会撞上仍打开的文件.
+    if let Some(mut w) = writer.take() {
+        w.flush()?;
+    }
+    rotate_log(path)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    *writer = Some(BufWriter::new(file));
+    Ok(())
 }
 
 fn write_line(writer: &mut BufWriter<File>, line: &str) -> io::Result<()> {
@@ -276,7 +309,9 @@ fn rotate_log(path: &Path) -> io::Result<()> {
 }
 
 fn sanitize_message(steam_root: &Path, line: &str) -> String {
-    let mut message = line.to_owned();
+    // 先截断再脱敏: 超大输入 (>4 KiB) 先脱敏要反复全量扫描, 白白烧 CPU,
+    // 而且截掉的部分本来就是丢弃的, 脱敏了也没人看.
+    let mut message = truncate_message(line.to_owned());
     let root = steam_root.to_string_lossy();
     if !root.is_empty() {
         message = message.replace(root.as_ref(), "<steam_root>");
@@ -286,7 +321,7 @@ fn sanitize_message(steam_root: &Path, line: &str) -> String {
         }
     }
     redact_sensitive_fields(&mut message);
-    truncate_message(message)
+    message
 }
 
 fn redact_sensitive_fields(message: &mut String) {
@@ -428,6 +463,7 @@ fn sanitize_token(token: &str) -> String {
 }
 
 fn escape_field(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -436,6 +472,14 @@ fn escape_field(value: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
+            // 其余控制字符 (0x00-0x1F 除 \t) 与 0x7F 一律转义成 \xNN,
+            // 免得 ESC/NUL 这类不可见字节混进日志文件.
+            ch if ch <= '\u{1f}' || ch == '\u{7f}' => {
+                let code = ch as u32;
+                escaped.push_str("\\x");
+                escaped.push(HEX[(code >> 4) as usize] as char);
+                escaped.push(HEX[(code & 0xf) as usize] as char);
+            }
             ch => escaped.push(ch),
         }
     }

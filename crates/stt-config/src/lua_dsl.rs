@@ -2,11 +2,12 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use mlua::{Lua, Table};
+use mlua::Table;
 use stt_core::{AppRules, CatalogBundle, ManifestOverride};
 
 use crate::error::{ConfigError, Result};
 use crate::lua_http::{register_lua_http, LuaHttpClient};
+use crate::lua_vm::new_sandboxed;
 
 fn lock_bundle(b: &Mutex<CatalogBundle>) -> MutexGuard<'_, CatalogBundle> {
     b.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -41,7 +42,7 @@ fn eval_lua_to_bundle_inner(
     source: &str,
     http_client: Option<Arc<dyn LuaHttpClient>>,
 ) -> Result<CatalogBundle> {
-    let lua = Lua::new();
+    let lua = new_sandboxed().map_err(lua_err)?;
     let bundle = Arc::new(Mutex::new(CatalogBundle::default()));
 
     if let Some(client) = http_client {

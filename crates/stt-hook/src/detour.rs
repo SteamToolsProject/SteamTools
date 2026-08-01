@@ -66,8 +66,14 @@ impl InlineHook {
             return Err(HookError::AlreadyInstalled);
         }
         let patch = abs_jmp_patch(self.detour as u64);
+        // 先写偏移 2..12 (imm64 + FF E0), 最后写偏移 0..2 (48 B8 前缀):
+        // 激活窗口从 12 字节收窄到末 2 字节, 且末次是 2 字节对齐 store,
+        // 并发线程只可能看到旧 prologue 或完整新补丁, 不会撞上半条指令.
         with_rwx(self.target, PATCH_LEN, || {
-            ptr::copy_nonoverlapping(patch.as_ptr(), self.target, PATCH_LEN);
+            ptr::copy_nonoverlapping(patch.as_ptr().add(2), self.target.add(2), PATCH_LEN - 2);
+        })?;
+        with_rwx(self.target, PATCH_LEN, || {
+            ptr::copy_nonoverlapping(patch.as_ptr(), self.target, 2);
         })?;
         self.installed = true;
         Ok(())
@@ -79,8 +85,17 @@ impl InlineHook {
         if !self.installed {
             return Err(HookError::NotInstalled);
         }
+        // 恢复顺序与 attach 相反: 先还原偏移 2..12 (imm64 + FF E0),
+        // 最后还原偏移 0..2 (48 B8 前缀), 同样把激活窗口收窄到末 2 字节.
         with_rwx(self.target, PATCH_LEN, || {
-            ptr::copy_nonoverlapping(self.original.as_ptr(), self.target, PATCH_LEN);
+            ptr::copy_nonoverlapping(
+                self.original.as_ptr().add(2),
+                self.target.add(2),
+                PATCH_LEN - 2,
+            );
+        })?;
+        with_rwx(self.target, PATCH_LEN, || {
+            ptr::copy_nonoverlapping(self.original.as_ptr(), self.target, 2);
         })?;
         self.installed = false;
         Ok(())

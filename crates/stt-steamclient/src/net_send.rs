@@ -7,6 +7,8 @@ use std::sync::Mutex;
 use stt_hook::InlineHook;
 use stt_metadata::PatternStore;
 
+#[cfg(any(feature = "download-request-code", feature = "download-token"))]
+use crate::net_recv::MAX_PACKET_SIZE;
 use crate::verified::resolve_verified_symbol;
 use crate::{DownloadCapability, DownloadCapabilityStatus, DownloadKitReport};
 
@@ -122,7 +124,10 @@ unsafe extern "C" fn hk_send_frame(
     }
 
     #[cfg(feature = "download-request-code")]
-    if REQUEST_CODE_ACTIVE.load(Ordering::SeqCst) && !data.is_null() {
+    if REQUEST_CODE_ACTIVE.load(Ordering::SeqCst)
+        && !data.is_null()
+        && size as usize <= MAX_PACKET_SIZE
+    {
         let packet = std::slice::from_raw_parts(data.cast_const(), size as usize);
         crate::request_code::submit_manifest_code_frame(u32::from(opcode), packet);
     }
@@ -130,7 +135,7 @@ unsafe extern "C" fn hk_send_frame(
     #[cfg(feature = "download-token")]
     let rewrite = if TOKEN_ACTIVE.load(Ordering::SeqCst) {
         crate::token::record_access_token_call();
-        if data.is_null() {
+        if data.is_null() || size as usize > MAX_PACKET_SIZE {
             crate::token::AccessTokenRewrite::Passthrough
         } else {
             let packet = std::slice::from_raw_parts(data.cast_const(), size as usize);

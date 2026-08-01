@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
-use mlua::{Function, Lua, Value};
+use mlua::{Function, Value};
 use stt_catalog::{
     parse_catalog_wire_v1, CatalogError, CatalogProvider, CatalogResult, ProviderErrorKind,
 };
 use stt_core::{AppId, CatalogBundle};
 
 use crate::lua_http::{register_lua_http, LuaHttpClient};
+use crate::lua_vm::new_sandboxed;
 
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -48,7 +49,12 @@ impl CatalogProvider for LuaCatalogProvider {
     }
 
     fn fetch(&self, app_id: AppId) -> CatalogResult<CatalogBundle> {
-        let lua = Lua::new();
+        let lua = new_sandboxed().map_err(|_| {
+            provider_error(
+                ProviderErrorKind::Unavailable,
+                "Lua VM could not be created",
+            )
+        })?;
         if let Some(client) = &self.http_client {
             register_lua_http(&lua, Arc::clone(client)).map_err(|_| {
                 provider_error(

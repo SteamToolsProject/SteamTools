@@ -380,11 +380,44 @@ impl ManifestSection {
     }
 }
 
+/// 额外 lua 目录的条数上限 (与 intent.rs 的 MAX_LUA_PATHS 一致).
+const MAX_LUA_PATHS: usize = 8;
+
+/// 单条路径的长度上限 (与 intent.rs 的 MAX_PATH_LEN 一致).
+const MAX_PATH_LEN: usize = 260;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LuaSection {
     /// 额外 lua 目录; 加载器总会再挂上默认的 `<Steam>/config/lua`.
     #[serde(default)]
     pub paths: Vec<String>,
+}
+
+impl LuaSection {
+    /// 解析期体检: 每条路径非空、≤260、无控制字符, 条数 ≤ 8; 目录存在性留到 intent 阶段查.
+    pub fn validate(&self) -> Result<()> {
+        if self.paths.len() > MAX_LUA_PATHS {
+            return Err(ConfigError::Invalid(format!(
+                "lua.paths: at most {MAX_LUA_PATHS} entries, got {}",
+                self.paths.len()
+            )));
+        }
+        for path in &self.paths {
+            // 镜像 intent.rs 的 sane_path: 先 trim 再查长度与非法字符.
+            let path = path.trim();
+            if path.is_empty() || path.len() > MAX_PATH_LEN {
+                return Err(ConfigError::Invalid(
+                    "lua.paths entry must be non-empty and at most 260 bytes".into(),
+                ));
+            }
+            if path.contains(['\0', '\n', '\r']) {
+                return Err(ConfigError::Invalid(
+                    "lua.paths entry must not contain NUL, CR, or LF".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -398,6 +431,7 @@ impl HostConfig {
         let config: Self = toml::from_str(s)?;
         config.catalog.validate()?;
         config.manifest.validate()?;
+        config.lua.validate()?;
         config.store_accel.validate()?;
         Ok(config)
     }
@@ -589,5 +623,57 @@ timeout_recv_ms = 2000
             "[store_accel]\negress = \"direct_dns\"\nclash_fallback = \"127.0.0.1:7890\"",
         )
         .is_err());
+    }
+
+    #[test]
+    fn lua_path_rejects_empty_entry() {
+        assert!(HostConfig::parse_str("[lua]\npaths = [\"\"]").is_err());
+        // 全空白也算空, 与 sane_path 的 trim 一致.
+        assert!(HostConfig::parse_str("[lua]\npaths = [\"   \"]").is_err());
+    }
+
+    #[test]
+    fn lua_path_rejects_overlong_entry() {
+        let long = "D:/".to_string() + &"a".repeat(258);
+        assert_eq!(long.len(), 261);
+        let error = HostConfig::parse_str(&format!("[lua]\npaths = [\"{long}\"]")).unwrap_err();
+        assert!(error.to_string().contains("lua.paths"));
+    }
+
+    #[test]
+    fn lua_path_rejects_control_characters() {
+        // TOML 的 \u0000 转义会解码成真正的 NUL 字节.
+        let error = HostConfig::parse_str("[lua]\npaths = [\"D:/x\\u0000y\"]").unwrap_err();
+        assert!(error.to_string().contains("NUL"));
+    }
+
+    #[test]
+    fn lua_paths_reject_more_than_eight_entries() {
+        let nine = (0..9)
+            .map(|i| format!("\"D:/dir{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = HostConfig::parse_str(&format!("[lua]\npaths = [{nine}]")).unwrap_err();
+        assert!(error.to_string().contains("at most 8"));
+    }
+
+    #[test]
+    fn lua_paths_accept_valid_entries() {
+        let parsed = HostConfig::parse_str("[lua]\npaths = [\"D:/extra/lua\"]").unwrap();
+        assert_eq!(parsed.lua.paths, vec!["D:/extra/lua"]);
+
+        // 上限 8 条也通过.
+        let eight = (0..8)
+            .map(|i| format!("\"D:/dir{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let parsed = HostConfig::parse_str(&format!("[lua]\npaths = [{eight}]")).unwrap();
+        assert_eq!(parsed.lua.paths.len(), 8);
+    }
+
+    #[test]
+    fn default_config_without_lua_section_still_parses() {
+        let parsed = HostConfig::parse_str("").unwrap();
+        assert!(parsed.lua.paths.is_empty());
     }
 }
