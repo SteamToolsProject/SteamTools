@@ -41,8 +41,9 @@ for (const forbidden of ["fetch(", "XMLHttpRequest", "WebSocket", "window.open",
   if (source.includes(forbidden)) throw new Error(`bundle contains forbidden ${forbidden}`);
 }
 
-const normalized = source.replace(/\s+$/u, "") + "\n";
-// 归一化旧产物行尾: Windows checkout 可能把 LF 转成 CRLF, 直接比较会误报 stale.
+// 归一化产物行尾: Windows checkout 可能把源文件转成 CRLF, esbuild
+// 会原样带进产物; 统一 LF 再比较/写回, 避免环境性误报.
+const normalized = source.replace(/\r\n?/gu, "\n").replace(/\s+$/u, "") + "\n";
 const previousNorm =
   previous === null ? null : previous.replace(/\r\n?/gu, "\n").replace(/\s+$/u, "") + "\n";
 if (verify && previousNorm !== null && previousNorm !== normalized) {
