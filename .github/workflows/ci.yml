@@ -1,51 +1,83 @@
 name: CI
 
 on:
-  # master 受分支保护只能 PR 合入, 合入前 PR 检查已覆盖, 故不监听 master push
-  # (避免合入时 PR + push 重复跑两遍).
-  push:
-    branches: [dev]
+  # 只有 PR 才跑 CI: master 与 dev 均仅合入, push 到 dev 的是有权限的
+  # 协作者, 不再重复检查; 合入 master 前 PR 检查已覆盖.
   pull_request:
     branches: [master, dev]
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache 共享编译缓存: 各 job 并行编译时互不重复.
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: 2G
+  RUSTC_WRAPPER: sccache
+
+# 同一 PR/分支的新 push 取消仍在跑的旧 run, 避免多次重复构建.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  ci:
+  fmt:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
+          components: rustfmt
       - name: Format check
         run: cargo fmt --all -- --check
 
+  clippy:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: mozilla/sccache-action@v0.0.11
+        with:
+          sccache-version: 0.17.0
       - name: Clippy (all targets, all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla/sccache-action@v0.0.11
+        with:
+          sccache-version: 0.17.0
       - name: Test (workspace, all features, serial)
         run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=1
 
+  release:
+    # 产物验证只在合入 master 前执行; dev PR 快速反馈不跑 release 编译.
+    if: github.base_ref == 'master'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla/sccache-action@v0.0.11
+        with:
+          sccache-version: 0.17.0
       - name: Release build (product artifacts)
         run: cargo build -p stt-host -p stt-store-accel -p stt-loader-dwmapi -p stt-loader-xinput --release
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+  ui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: crates/stt-steamui/ui/package-lock.json
-
       - name: Config panel UI check
         working-directory: crates/stt-steamui/ui
         run: |
           npm ci
           npm run check
+

@@ -41,9 +41,24 @@ for (const forbidden of ["fetch(", "XMLHttpRequest", "WebSocket", "window.open",
   if (source.includes(forbidden)) throw new Error(`bundle contains forbidden ${forbidden}`);
 }
 
-const normalized = source.replace(/\s+$/u, "") + "\n";
-if (verify && previous !== null && previous !== normalized) {
-  throw new Error("embed/panel.iife.js is stale; run npm run build");
+// 归一化产物行尾: Windows checkout 可能把源文件转成 CRLF, esbuild
+// 会把真实 CRLF 或字面 \r\n 转义带进产物; 统一 LF 再比较/写回,
+// 避免环境性误报.
+const normalizeEol = (text) =>
+  text.replace(/\\r\\n/gu, "\\n").replace(/\r\n?/gu, "\n").replace(/\s+$/u, "") + "\n";
+const normalized = normalizeEol(source);
+const previousNorm = previous === null ? null : normalizeEol(previous);
+if (verify && previousNorm !== null && previousNorm !== normalized) {
+  // 定位首个差异, 便于区分环境性差异 (行尾/空白) 与真实产物漂移.
+  let i = 0;
+  const max = Math.min(previousNorm.length, normalized.length);
+  while (i < max && previousNorm.charCodeAt(i) === normalized.charCodeAt(i)) i += 1;
+  const prevChunk = previousNorm.slice(Math.max(0, i - 40), i + 40);
+  const newChunk = normalized.slice(Math.max(0, i - 40), i + 40);
+  throw new Error(
+    `embed/panel.iife.js is stale; run npm run build ` +
+      `(first diff at ${i}, prev=${previousNorm.length} new=${normalized.length})`
+  );
 }
 await writeFile(output, normalized, "utf8");
 console.log(`panel.iife.js: ${size} bytes`);

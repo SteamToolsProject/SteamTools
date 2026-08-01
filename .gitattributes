@@ -1,0 +1,10 @@
+# 内嵌 UI 产物保持 LF: Windows checkout 默认转 CRLF 会导致
+# build.mjs --verify 漂移检查误报 (产物比较对行尾敏感).
+crates/stt-steamui/ui/embed/*.iife.js text eol=lf
+
+# UI 源文件同样强制 LF: esbuild 会把 CRLF 源转义为字面 \r\n 带进产物,
+# 导致各环境构建产物不一致.
+crates/stt-steamui/ui/src/** text eol=lf
+
+# 其余文本文件按仓库现有行尾处理 (默认).
+* text=auto
