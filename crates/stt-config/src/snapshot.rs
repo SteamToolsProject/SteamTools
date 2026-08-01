@@ -32,6 +32,8 @@ pub type ToolDetails = std::collections::HashMap<&'static str, String>;
 pub struct HostFacts {
     /// 各工具此刻在干什么 / 为什么没干成.
     pub tool_details: ToolDetails,
+    /// 自更新的一行状态 (已是最新 / 新版本已就绪等).
+    pub update_status: String,
     /// 我们自己入库的 app; 由宿主按 rules epoch 缓存, 见 [`managed_apps`].
     pub managed: Vec<u32>,
     /// 受管 app 的本地显示名称, 找不到时由页面回退到 AppId.
@@ -60,6 +62,8 @@ pub struct ConfigSnapshot {
     pub channel: String,
     /// 最近一次保存的结果, 给页面显示.
     pub note: String,
+    /// 自更新状态一行 (页面直接展示).
+    pub update_status: String,
     /// 我们自己入库的 app (有 `stt_{id}.lua` 那些), 升序.
     ///
     /// 库里右键要用它判断"这一项是不是我们加的" —— 不是我们加的就别抢 Steam 的菜单.
@@ -129,6 +133,7 @@ impl ConfigSnapshot {
             epoch: state.rules_epoch(),
             channel: channel.to_owned(),
             note: note.to_owned(),
+            update_status: facts.update_status.clone(),
             managed: facts.managed.clone(),
             managed_names: facts.managed_names.clone(),
         }

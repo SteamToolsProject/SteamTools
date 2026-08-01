@@ -43,6 +43,8 @@ static CONFIGURED_APPS: OnceLock<Arc<RwLock<HashSet<AppId>>>> = OnceLock::new();
 static LIBRARY_UX: OnceLock<stt_steamui::LibraryUx> = OnceLock::new();
 /// 进程内日志写入器, 只在 init 工作线程中创建.
 static HOST_LOGGER: OnceLock<HostLogger> = OnceLock::new();
+/// 自更新状态一行, 由后台 worker 写, 配置页快照读.
+static UPDATE_STATUS: OnceLock<Mutex<String>> = OnceLock::new();
 /// DLL 内商店代理的唯一运行实例.
 static STORE_ACCEL_RUNTIME: OnceLock<Mutex<StoreAccelRuntime>> = OnceLock::new();
 
@@ -361,6 +363,61 @@ fn spawn_community_snapshot_refresh(steam_root: &Path, state: &ConfigState) {
     }
 }
 
+/// 后台自更新检查: 发现新版本则下载校验并 swap 进根目录.
+///
+/// 全程网络在独立线程, 不阻塞 init; 结果写 [`UPDATE_STATUS`] 给配置页, 并进 host.log.
+fn spawn_update_worker(steam_root: &Path, state: &ConfigState) {
+    let config = state.host().update;
+    if !config.enabled {
+        set_update_status("已关闭");
+        append_host_log(steam_root, "update=disabled");
+        return;
+    }
+    let root = steam_root.to_path_buf();
+    let spawn = std::thread::Builder::new()
+        .name("update-check".to_owned())
+        .spawn(move || {
+            let outcome = stt_update::worker::run(&root, &stt_update::PlatformFetcher);
+            append_host_log(&root, &outcome.summary());
+            set_update_status(&status_for_panel(&outcome));
+        });
+    if let Err(error) = spawn {
+        append_host_log(steam_root, &format!("update=worker unavailable {error}"));
+    }
+}
+
+/// 配置页显示的一行: 尽量用人话, 不暴露内部细节.
+fn status_for_panel(outcome: &stt_update::worker::UpdateOutcome) -> String {
+    match outcome {
+        stt_update::worker::UpdateOutcome::Applied { tag } => {
+            format!("{tag} 已就绪, 重启 Steam 生效")
+        }
+        stt_update::worker::UpdateOutcome::AppliedPendingRestart { tag } => {
+            format!("{tag} 已就绪, 重启 Steam 生效")
+        }
+        stt_update::worker::UpdateOutcome::Latest => "已是最新版本".to_owned(),
+        stt_update::worker::UpdateOutcome::Failed(reason) => {
+            format!("更新检查失败 ({reason})")
+        }
+    }
+}
+
+fn set_update_status(text: &str) {
+    let slot = UPDATE_STATUS.get_or_init(|| Mutex::new(String::new()));
+    let mut guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = text.to_owned();
+}
+
+fn update_status() -> String {
+    let slot = UPDATE_STATUS.get_or_init(|| Mutex::new(String::new()));
+    let guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.clone()
+}
+
 fn community_snapshot_text(state: &CommunitySnapshotState) -> String {
     match state {
         CommunitySnapshotState::Cached { entries } => format!("cached entries={entries}"),
@@ -592,6 +649,7 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
     }
 
     spawn_community_snapshot_refresh(steam_root, &state);
+    spawn_update_worker(steam_root, &state);
     log_module_hashes(steam_root);
     let patterns = log_pattern_probe(steam_root);
     let library_ux_report = log_library_ux_plan(steam_root, &state, &patterns);
@@ -892,6 +950,7 @@ impl stt_steamui::PanelBridge for HostPanel {
     fn snapshot(&mut self) -> Option<ConfigSnapshot> {
         let facts = stt_config::HostFacts {
             tool_details: self.details.clone(),
+            update_status: update_status(),
             managed: self.managed_cached().to_vec(),
             managed_names: self.managed_names.clone(),
         };

@@ -12,7 +12,8 @@ use windows::Win32::Networking::WinHttp::{
     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTP,
     WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_OPEN_REQUEST_FLAGS,
     WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, WINHTTP_OPTION_REDIRECT_POLICY,
-    WINHTTP_OPTION_REDIRECT_POLICY_NEVER, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_OPTION_REDIRECT_POLICY_NEVER, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION,
+    WINHTTP_QUERY_STATUS_CODE,
 };
 
 const MAX_URL_CHARS: usize = 2048;
@@ -86,6 +87,11 @@ impl Default for WinHttpGetOptions {
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// `Location` 响应头 (重定向场景用). 没有该头或为空时为 None.
+    ///
+    /// WinHTTP 默认会自动跟随重定向; 我们显式禁用 (REDIRECT_POLICY_NEVER),
+    /// 所以 3xx 的 Location 由调用方自己决定怎么走.
+    pub location: Option<String>,
 }
 
 /// WinHTTP transport 错误.
@@ -275,8 +281,13 @@ pub fn winhttp_request(
         )?;
 
         let status = query_status(request.0)?;
+        let location = query_location(request.0)?;
         let body = read_body(request.0, options.max_response_body_bytes)?;
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            location,
+        })
     }
 }
 
@@ -409,6 +420,31 @@ fn query_status(request: *mut c_void) -> Result<u16, HttpError> {
     };
     map_result("query_status", result)?;
     u16::try_from(status).map_err(|_| HttpError::InvalidUrl("invalid HTTP status code"))
+}
+
+/// 读 `Location` 响应头; 没有该头时返回 None.
+fn query_location(request: *mut c_void) -> Result<Option<String>, HttpError> {
+    let mut buf = [0u16; 2048];
+    let mut index = 0u32;
+    // SAFETY: `request` 在调用期间有效, buf/index 都是可写缓冲.
+    let result = unsafe {
+        WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_LOCATION,
+            PCWSTR::null(),
+            Some(buf.as_mut_ptr().cast()),
+            &mut (buf.len() as u32),
+            &mut index,
+        )
+    };
+    if result.is_err() {
+        return Ok(None);
+    }
+    let len = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
+    if len == 0 {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf16_lossy(&buf[..len])))
 }
 
 fn read_body(request: *mut c_void, limit: usize) -> Result<Vec<u8>, HttpError> {

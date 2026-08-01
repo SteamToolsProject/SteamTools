@@ -152,7 +152,7 @@ export function LuaPage({ snapshot }: { snapshot: ConfigSnapshot }) {
 
 export function StatusPage({ snapshot }: { snapshot: ConfigSnapshot }) {
   const enabled = snapshot.tools.filter((tool) => tool.enabled).length;
-  const rows: Array<[string, string, string]> = [["连接方式", snapshot.channel || "等待连接", "SteamTools 与客户端界面之间的连接"], ["已加载应用", String(snapshot.owned_count), "当前配置中可识别的应用数量"], ["已启用工具", `${enabled} / ${snapshot.tools.length}`, "当前打开的功能数量"], ["版本", `v${snapshot.version || "?"}`, ""]];
+  const rows: Array<[string, string, string]> = [["连接方式", snapshot.channel || "等待连接", "SteamTools 与客户端界面之间的连接"], ["已加载应用", String(snapshot.owned_count), "当前配置中可识别的应用数量"], ["已启用工具", `${enabled} / ${snapshot.tools.length}`, "当前打开的功能数量"], ["版本", `v${snapshot.version || "?"}`, ""], ["自动更新", snapshot.update_status || "检查中", "新版本就绪后重启 Steam 生效"]];
   return <><Lead title="运行状态" description="当前会话的运行信息" />{rows.map(([title, value, detail]) => <FormRow key={title} title={title} detail={detail} control={<span className="stt-value-mono stt-spacer-value">{value}</span>} />)}</>;
 }
 

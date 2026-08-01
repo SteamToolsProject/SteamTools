@@ -23,6 +23,8 @@ pub struct HostConfig {
     pub lua: LuaSection,
     #[serde(default)]
     pub store_accel: StoreAccelSection,
+    #[serde(default)]
+    pub update: UpdateSection,
     /// 工具 id -> 是否启用; 缺省键走工具默认值.
     #[serde(default)]
     pub tools: ToolsSection,
@@ -186,6 +188,43 @@ impl StoreAccelSection {
                     "store_accel.clash_fallback requires egress = local_cdn".into(),
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+/// 自更新配置.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateSection {
+    /// 是否在启动时检查并应用新版本. 默认开; 关掉后完全不做网络请求.
+    #[serde(default = "default_update_enabled")]
+    pub enabled: bool,
+    /// 更新通道, 目前只有 stable.
+    #[serde(default = "default_update_channel")]
+    pub channel: String,
+}
+
+fn default_update_enabled() -> bool {
+    true
+}
+
+fn default_update_channel() -> String {
+    "stable".into()
+}
+
+impl Default for UpdateSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_update_enabled(),
+            channel: default_update_channel(),
+        }
+    }
+}
+
+impl UpdateSection {
+    pub fn validate(&self) -> Result<()> {
+        if self.channel != "stable" {
+            return Err(ConfigError::Invalid("update.channel must be stable".into()));
         }
         Ok(())
     }
@@ -433,6 +472,7 @@ impl HostConfig {
         config.manifest.validate()?;
         config.lua.validate()?;
         config.store_accel.validate()?;
+        config.update.validate()?;
         Ok(config)
     }
 
@@ -493,9 +533,23 @@ mod tests {
         assert_eq!(c.catalog.mode, CatalogMode::Community);
         assert_eq!(c.manifest.url, "opensteamtool");
         assert_eq!(c.store_accel.egress, StoreAccelEgress::Disabled);
+        assert!(c.update.enabled);
+        assert_eq!(c.update.channel, "stable");
         assert!(c.is_tool_enabled(ToolId::CatalogAdd));
         assert!(c.is_tool_enabled(ToolId::LibraryUx));
         assert!(!c.is_tool_enabled(ToolId::StoreAccel));
+    }
+
+    #[test]
+    fn parse_update_section() {
+        let c = HostConfig::parse_str("[update]\nenabled = false\n").unwrap();
+        assert!(!c.update.enabled);
+    }
+
+    #[test]
+    fn update_rejects_unknown_channel() {
+        let error = HostConfig::parse_str("[update]\nchannel = \"beta\"\n").unwrap_err();
+        assert!(error.to_string().contains("update.channel"));
     }
 
     #[test]

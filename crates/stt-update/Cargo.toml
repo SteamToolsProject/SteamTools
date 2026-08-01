@@ -1,0 +1,17 @@
+[package]
+name = "stt-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "SteamTools self-update: latest-tag discovery, staged download, verified swap"
+
+[dependencies]
+stt-platform = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

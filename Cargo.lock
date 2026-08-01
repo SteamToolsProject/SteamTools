@@ -654,6 +654,7 @@ dependencies = [
  "stt-steamclient",
  "stt-steamui",
  "stt-store-accel",
+ "stt-update",
  "tempfile",
  "thiserror",
 ]
@@ -724,6 +725,15 @@ dependencies = [
  "thiserror",
  "webpki-roots",
  "windows",
+]
+
+[[package]]
+name = "stt-update"
+version = "0.1.0"
+dependencies = [
+ "stt-platform",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

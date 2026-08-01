@@ -23,6 +23,7 @@ export interface ConfigSnapshot {
   epoch: number;
   channel: string;
   note: string;
+  update_status: string;
   managed: number[];
   managed_names: Record<string, string>;
 }
@@ -71,6 +72,7 @@ export const EMPTY_SNAPSHOT: ConfigSnapshot = {
   epoch: 0,
   channel: "",
   note: "",
+  update_status: "",
   managed: [],
   managed_names: {}
 };
