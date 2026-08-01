@@ -614,11 +614,6 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         Err(e) => append_host_log(steam_root, &format!("catalog_add=store_inject err {e}")),
     }
 
-    // 商店页在 steamwebhelper CEF, 不在 steam.exe CHTMLWindow — 主路径走 CDP.
-    // native hook 默认关 (STEAMTOOLS_STORE_NATIVE=inject 才开).
-    let native = stt_steamui::try_install_store_native(&state.tools(), &patterns);
-    append_host_log(steam_root, &native.summary_line());
-
     // 调试端点由 CreateProcessW hook 控制, 不再落 .cef-enable-remote-debugging
     // (ADR 0010): 端口只活在本会话, 且顺手剥掉 Steam 自带的 --remote-allow-origins=*.
     // hook 本身在 init 开头就装好了, 这里只报状态.
@@ -636,7 +631,6 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         library_ux: &library_ux_report,
         package: &package,
         download: &download,
-        _native: &native,
         use_pipe,
         caught: cef.caught_webhelper(),
     });
@@ -1249,19 +1243,6 @@ fn log_pattern_probe(steam_root: &Path) -> stt_metadata::PatternStore {
             }
         }
 
-        // 内置样本只保留作兼容回退, 不覆盖主仓库缓存.
-        if !primary.is_file() && component == "steamui" {
-            if let Some(p) = stt_steamui::ensure_builtin_steamui_pattern(steam_root, &sha) {
-                append_host_log(
-                    steam_root,
-                    &format!(
-                        "pattern_steamui=builtin_fallback path={} sha={sha}",
-                        p.display()
-                    ),
-                );
-            }
-        }
-
         let legacy = stt_platform::legacy_pattern_cache_file(steam_root, component, &sha);
         match store.load_with_fallback(component, &primary, Some(&legacy)) {
             Ok(loaded) => append_host_log(
@@ -1606,7 +1587,6 @@ struct ToolDetailsContext<'a> {
     library_ux: &'a stt_steamui::LibraryUxInstallReport,
     package: &'a stt_steamclient::PackageInstallReport,
     download: &'a stt_steamclient::DownloadKitReport,
-    _native: &'a stt_steamui::StoreNativeReport,
     use_pipe: bool,
     caught: bool,
 }
@@ -1619,7 +1599,6 @@ fn tool_details(context: ToolDetailsContext<'_>) -> stt_config::ToolDetails {
         library_ux,
         package,
         download,
-        _native: _,
         use_pipe,
         caught,
     } = context;
@@ -2088,7 +2067,6 @@ fn run_watch_loop(
 
     // 定期重扫目录, 好把新建的 .lua 纳入监视.
     let mut rescan_ticks: u32 = 0;
-    let mut last_stats = (0u64, 0u64, 0u64, 0usize);
     let mut cef_rearm = CefRearm {
         use_pipe,
         ..CefRearm::default()
@@ -2399,20 +2377,6 @@ fn run_watch_loop(
                 );
                 last_request_code_stats = stats;
             }
-        }
-
-        // 商店注入诊断: 有变化才写 log.
-        let stats = stt_steamui::store_native_stats();
-        if stats != last_stats && (stats.0 > 0 || stats.1 > 0 || stats.2 > 0 || stats.3 > 0) {
-            let ext = stt_steamui::store_native_stats_ext();
-            append_host_log(
-                steam_root,
-                &format!(
-                    "store_native_stats ctor={} exec={} posturl={} inject={} skip={} windows={}",
-                    ext.0, ext.1, ext.2, ext.3, ext.4, ext.5
-                ),
-            );
-            last_stats = stats;
         }
 
         let mut host_changed = false;

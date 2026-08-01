@@ -73,9 +73,7 @@ impl HostLogLevel {
             || contains_ascii_case_insensitive(line, " miss")
         {
             Self::Warn
-        } else if line.starts_with("store_native_stats")
-            || contains_ascii_case_insensitive(line, "_stats ")
-        {
+        } else if contains_ascii_case_insensitive(line, "_stats ") {
             Self::Debug
         } else {
             Self::Info
@@ -465,7 +463,7 @@ mod tests {
             HostLogLevel::Error
         );
         assert_eq!(
-            HostLogLevel::infer_legacy("store_native_stats ctor=1"),
+            HostLogLevel::infer_legacy("download_key_stats calls=1"),
             HostLogLevel::Debug
         );
     }

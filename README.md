@@ -103,7 +103,7 @@ clash_fallback = "127.0.0.1:7890"   # optional; loopback only, at most one retry
 ## Steam version compatibility
 
 - No hardcoded offsets: on every launch, the SHA-256 of `steamclient64.dll` / `steamui.dll` is matched against external patterns
-- Patterns are fetched from `SteamTools-Patterns` first (atomically cached per DLL SHA at `steamtools/pattern/{component}/{sha}.toml`); when the remote is unavailable or mismatched, fall back to the built-in compatible patterns and the `opensteamtool/pattern` path
+- Patterns are fetched from `SteamTools-Patterns` first (atomically cached per DLL SHA at `steamtools/pattern/{component}/{sha}.toml`); when the remote is unavailable or mismatched, fall back to the local cache and the `opensteamtool/pattern` legacy path
 - A missing pattern disables only the affected capability (UI contribution / hook); everything else keeps working, and host.log / the tool center state the degradation reason
 
 ## Build
