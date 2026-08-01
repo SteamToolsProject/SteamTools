@@ -5,13 +5,9 @@
 
 ## [Unreleased]
 
-### Added
-
-- 发布工程: `tools/release.ps1` 一键发包 + Release CI 自动读取 CHANGELOG 并创建 GitHub Release
-
 ## [v0.1.0] - 2026-08-01
 
-首个里程碑完整版 (M0–M8): Steam 内嵌工具箱, 纯 Rust, DLL 劫持加载。
+首个公测版 (M0–M8 + 发布形态): Steam 内嵌工具箱, 纯 Rust, DLL 劫持加载。
 
 ### Added
 
@@ -35,8 +31,15 @@
   不装根证书 / 不做 MITM / 不写 Hosts / 不加载 WinDivert, 启停回滚 PAC
 - **版本兼容**: 每启动按 SHA-256 匹配 `SteamTools-Patterns` 远端 pattern
   (原子缓存), 远端不可用回退内置样本与 legacy 缓存; 缺 pattern 只禁用该能力
+- **自动更新**: 启动时检查 GitHub `/releases/latest` (302 Location 取 tag), 下载
+  `checksums.sha256` + 宿主, SHA-256 钉定校验后 rename-swap 进 Steam 根目录,
+  重启生效; 崩溃自愈 (`.old` 回滚); `[update]` 可关; 配置页显示更新状态
+- **一键安装器**: `SteamTools-Setup-<ver>.exe` (Inno Setup) — 自动检测 Steam 根目录
+  (注册表), Steam 运行检测, 按需提权; 卸载器收敛在 `steamtools/` 数据目录,
+  卸载时删除文件与数据目录
 - **CI 与发布工程**: GitHub Actions CI (fmt / clippy / 串行测试 / release 构建 /
-  UI 产物检查); 一键发包脚本 + Release CI 自动发布
+  UI 产物检查); 一键发包脚本 + Release CI 自动发布; Release 资产含
+  `checksums.sha256` 供自更新校验
 
 ### Changed
 
@@ -44,13 +47,18 @@
 - `store_accel` 从独立 exe 内嵌为 `stbase.dll` 内线程 (无独立 helper)
 - 配置面板从 Rust 手写 DOM 迁移为 Preact + TSX 组件化 (M6.10)
 - 移除实验代码: native CEF ExecuteJavaScript 注入路径 (CDP 为主路径)
+- 宿主产物名 `SteamTools.dll` → `stbase.dll` (模块名中性化, 降低进程枚举指纹);
+  发布脚本同步修正
 
 ### Fixed
 
 - CEF hook 首拉错过导致入口丢失: hook 安装提前到 init 最前 (`6b4fd95`)
 - 商店 -118 静态资源失败边界: 有限 Clash 静态回退 + 同域候选重试
+- 发布管线产物名 stale: release 脚本仍拷已不存在的 `SteamTools.dll`
+- 安装器静默安装目录为空 (`GetSteamDir` 读未初始化页面值)
 
 ### Security
 
 - 日志脱敏: 不记录 key / token / ticket / cookie / 查询参数
 - store_accel allowlist 外请求不经过 helper; 不安装根证书
+- 自更新校验: 资产 SHA-256 钉定, 拒绝清单缺失/不匹配的下载
