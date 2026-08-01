@@ -116,7 +116,7 @@ impl HostLogger {
         let writer_session = session_id.clone();
         let writer_path = path.to_path_buf();
         thread::Builder::new()
-            .name("stt-log-writer".to_owned())
+            .name("log-writer".to_owned())
             .spawn(move || {
                 run_writer(
                     writer_path,
@@ -569,14 +569,14 @@ mod tests {
             uptime_ms: 2,
             level: HostLogLevel::Info,
             event: "status".to_owned(),
-            thread: "stt-watch".to_owned(),
+            thread: "watch".to_owned(),
             message: "status=ready \"ok\"".to_owned(),
             dropped_before: 3,
         };
         let line = format_record(&record, "session-1");
         assert!(line.contains("target=stt_host"));
         assert!(line.contains("session=session-1"));
-        assert!(line.contains("thread=stt-watch"));
+        assert!(line.contains("thread=watch"));
         assert!(line.contains("dropped_before=3"));
         assert!(line.contains("message=\"status=ready \\\"ok\\\"\""));
     }

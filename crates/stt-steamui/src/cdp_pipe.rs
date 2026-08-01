@@ -67,7 +67,7 @@ impl CdpPipeSession {
         // 起不来线程就没人收回复, 后续调用会全部超时 → 验活失败 → 回退端口模式.
         // 这条降级路径本来就有, 所以这里不必额外处理.
         let _ = std::thread::Builder::new()
-            .name("stt-cdp-pipe".into())
+            .name("cdp-pipe".into())
             .spawn(move || read_loop(&reader, &tx));
         Self {
             pipe,

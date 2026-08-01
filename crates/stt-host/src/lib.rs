@@ -1,8 +1,8 @@
-//! 宿主 DLL 入口 (`SteamTools.dll`).
+//! 宿主 DLL 入口 (`stbase.dll`).
 //!
 //! DllMain 只起工作线程, 真正初始化在线程里做.
 
-// crate 名与导出函数名都由产物 DLL 决定 (SteamTools.dll / DllMain), 不能蛇形.
+// crate 名与导出函数名都由产物 DLL 决定 (stbase.dll / DllMain), 不能蛇形.
 // 这里只能用 allow: crate 名的 non_snake_case 不被 expect 追踪, 写 expect 反而
 // 会报 unfulfilled_lint_expectations.
 #![allow(non_snake_case)]
@@ -335,7 +335,7 @@ fn spawn_community_snapshot_refresh(steam_root: &Path, state: &ConfigState) {
     let cache = stt_platform::data_dir(steam_root).join("cache");
     let timeouts = catalog_http_options(&host.catalog).timeouts;
     let spawn = std::thread::Builder::new()
-        .name("stt-community-cache".to_owned())
+        .name("community-cache".to_owned())
         .spawn(move || {
             let report = ensure_community_snapshots(&cache, timeouts);
             append_host_log(
@@ -730,7 +730,7 @@ fn spawn_catalog_worker(
     let note = Arc::clone(note);
 
     let spawn = std::thread::Builder::new()
-        .name("stt-catalog-worker".into())
+        .name("catalog-worker".into())
         .spawn(move || {
             while let Ok(job) = jobs_rx.recv() {
                 match add_from_config(&state, &root, job.app_id) {
@@ -979,7 +979,7 @@ fn spawn_store_cdp_bridge(
     let root = steam_root.to_path_buf();
     let state = state.clone();
     let _ = std::thread::Builder::new()
-        .name("stt-store-cdp".into())
+        .name("store-cdp".into())
         .spawn(move || {
             let note = Arc::new(Mutex::new(String::new()));
             let (catalog_jobs, catalog_feedback) = spawn_catalog_worker(&root, &state, &note);
@@ -1817,7 +1817,7 @@ fn start_store_accel(steam_root: &Path, config: &StoreAccelSection) {
     let root = steam_root.to_path_buf();
     let thread_stop = Arc::clone(&stop);
     let worker = std::thread::Builder::new()
-        .name("stt-store-accel".into())
+        .name("store-accel".into())
         .spawn(move || {
             let result = stt_store_accel::run(&root, thread_stop);
             clear_store_accel_runtime(generation);

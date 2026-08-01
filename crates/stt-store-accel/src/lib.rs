@@ -320,7 +320,7 @@ fn serve(
                 };
                 let state = Arc::clone(&state);
                 let spawn = thread::Builder::new()
-                    .name("stt-store-accel-conn".into())
+                    .name("store-accel-conn".into())
                     .spawn(move || {
                         let _permit = permit;
                         if let Err(error) = handle_connection(stream, &state) {
@@ -890,7 +890,7 @@ fn tunnel(mut client: TcpStream, upstream: &mut TcpStream) -> Result<()> {
     let mut client_from_upstream = client.try_clone()?;
     let mut upstream_for_client = upstream.try_clone()?;
     let downstream = thread::Builder::new()
-        .name("stt-store-accel-downstream".into())
+        .name("store-accel-downstream".into())
         .spawn(move || {
             let _ = io::copy(&mut upstream_for_client, &mut client_from_upstream);
             let _ = client_from_upstream.shutdown(Shutdown::Both);

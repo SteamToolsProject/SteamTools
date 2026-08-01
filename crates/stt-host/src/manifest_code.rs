@@ -28,7 +28,7 @@ pub(super) fn spawn_resolver_worker(steam_root: &Path, state: &ConfigState) {
     let root = steam_root.to_path_buf();
     let state = state.clone();
     let spawn = std::thread::Builder::new()
-        .name("stt-manifest-code-worker".into())
+        .name("manifest-code-worker".into())
         .spawn(move || {
             while let Ok(work) = receiver.recv() {
                 match resolve_once(&root, &state, work.request) {
