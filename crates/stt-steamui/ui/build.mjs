@@ -42,10 +42,12 @@ for (const forbidden of ["fetch(", "XMLHttpRequest", "WebSocket", "window.open",
 }
 
 // 归一化产物行尾: Windows checkout 可能把源文件转成 CRLF, esbuild
-// 会原样带进产物; 统一 LF 再比较/写回, 避免环境性误报.
-const normalized = source.replace(/\r\n?/gu, "\n").replace(/\s+$/u, "") + "\n";
-const previousNorm =
-  previous === null ? null : previous.replace(/\r\n?/gu, "\n").replace(/\s+$/u, "") + "\n";
+// 会把真实 CRLF 或字面 \r\n 转义带进产物; 统一 LF 再比较/写回,
+// 避免环境性误报.
+const normalizeEol = (text) =>
+  text.replace(/\\r\\n/gu, "\\n").replace(/\r\n?/gu, "\n").replace(/\s+$/u, "") + "\n";
+const normalized = normalizeEol(source);
+const previousNorm = previous === null ? null : normalizeEol(previous);
 if (verify && previousNorm !== null && previousNorm !== normalized) {
   // 定位首个差异, 便于区分环境性差异 (行尾/空白) 与真实产物漂移.
   let i = 0;
