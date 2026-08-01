@@ -10,9 +10,16 @@ mod cdp_pipe;
 mod cef_debug;
 mod config_panel;
 mod install;
+mod library_detour;
 mod library_ux;
 mod store_debug;
 mod store_inject;
+
+pub use library_detour::{
+    is_attached as library_detour_attached, library_detour_stats, register_ux,
+    try_install_library_detours, C_APP_OVERVIEW_CHANGE_REMOVED_APPID, C_STEAM_APP_APP_STATE_FLAGS,
+    C_STEAM_APP_OWNERSHIP_FLAGS, C_STEAM_APP_PURCHASED_TIME, E_APP_STATE_UNINSTALLED,
+};
 
 pub use cdp_bridge::{
     cdp_store_inject_js, poll_store_cdp, poll_store_cdp_default, run_store_cdp_loop,
