@@ -26,7 +26,7 @@ function PanelApp({ snapshot, onClose }: { snapshot: ConfigSnapshot; onClose: ()
         </div>
         <div className="stt-sidebar-label">配置</div>
         <SideNav page={page} onSelect={setPage} />
-        <div className="stt-sidebar-footer">桌面组件 · 本地运行</div>
+        <div className="stt-sidebar-footer">版本 v{snapshot.version || "?"} · 本地运行</div>
       </aside>
       <section className="stt-pane">
         <header className="stt-header">
