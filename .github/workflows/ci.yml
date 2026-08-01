@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache 共享编译缓存: 各 job 并行编译时互不重复.
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: 2G
+  RUSTC_WRAPPER: sccache
 
 # 同一 PR/分支的新 push 取消仍在跑的旧 run, 避免多次重复构建.
 concurrency:
@@ -15,41 +19,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
+  fmt:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      # shared-key 固定为 Cargo.lock, 让 PR 分支复用主分支缓存, 减少重复编译.
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: rust-${{ hashFiles('Cargo.lock') }}
-
+          components: rustfmt
       - name: Format check
         run: cargo fmt --all -- --check
 
+  clippy:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: mozilla/sccache-action@v0.0.6
+        with:
+          sccache-version: 0.9.0
       - name: Clippy (all targets, all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla/sccache-action@v0.0.6
+        with:
+          sccache-version: 0.9.0
       - name: Test (workspace, all features, serial)
         run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=1
 
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla/sccache-action@v0.0.6
+        with:
+          sccache-version: 0.9.0
       - name: Release build (product artifacts)
         run: cargo build -p stt-host -p stt-store-accel -p stt-loader-dwmapi -p stt-loader-xinput --release
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+  ui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: crates/stt-steamui/ui/package-lock.json
-
       - name: Config panel UI check
         working-directory: crates/stt-steamui/ui
         run: |
