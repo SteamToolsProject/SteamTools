@@ -57,6 +57,12 @@
 
 ## 使用
 
+### 一键安装（推荐）
+
+从 [Releases](https://github.com/SteamToolsProject/SteamTools/releases) 下载 `SteamTools-Setup-<版本>.exe` 并运行。安装器自动检测 Steam 根目录（读注册表）、复制 DLL，并注册卸载器（卸载时删除文件与 `steamtools/` 数据目录）。
+
+### 源码构建（手动）
+
 1. 构建（前置：Windows 10+、Rust stable MSVC 工具链）：
 
    ```powershell
@@ -76,6 +82,14 @@
 
 > [!NOTE]
 > 本地 WinHTTP 测试已知偶发 flaky，复跑即过，不影响构建结果。
+
+## 自动更新
+
+每次 Steam 启动时，宿主会检查 GitHub 是否有新版本（`/releases/latest` 302 跳转取最新 tag，无需 API key）。发现更新的 `stbase.dll` 后，下载并用同一 Release 的 `checksums.sha256` 做 SHA-256 校验，校验通过后换入——重启 Steam 生效。配置页「运行状态」页会显示当前状态（「已是最新版本」/「新版本已就绪，重启 Steam 生效」）。
+
+- 在 `steamtools.toml` 里写 `[update] enabled = false` 可关闭（默认开）
+- 自动更新只换宿主 `stbase.dll`；两个 loader 是薄转发壳，由安装器负责更新
+- 更新中断可自愈：旧文件保留为 `stbase.dll.old`，下次启动发现新文件缺失会自动回滚
 
 ## 配置（可选）
 
@@ -99,6 +113,9 @@ url = "opensteamtool"     # manifest request code 源: opensteamtool / steamrun 
 [store_accel]
 egress = "disabled"       # disabled / direct_dns / local_cdn / http_connect
 clash_fallback = "127.0.0.1:7890"   # 可选：仅允许 loopback，本地候选失败后最多回退一次
+
+[update]
+enabled = true            # 启动时自动检查更新（默认开）
 ```
 
 ## Steam 版本兼容

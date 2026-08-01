@@ -56,6 +56,12 @@ Main flow: click "Add to Library" on a store page → fetch metadata through the
 
 ## Usage
 
+### One-click install (recommended)
+
+Download `SteamTools-Setup-<version>.exe` from [Releases](https://github.com/SteamToolsProject/SteamTools/releases) and run it. The installer detects your Steam root (registry), copies the DLLs, and registers an uninstaller that removes files and the `steamtools/` data directory.
+
+### Manual (build from source)
+
 1. Build (requires Windows 10+, Rust stable MSVC toolchain):
 
    ```powershell
@@ -75,6 +81,14 @@ Main flow: click "Add to Library" on a store page → fetch metadata through the
 
 > [!NOTE]
 > A local WinHTTP test is known to be flaky; rerunning it passes. It does not affect the build.
+
+## Auto-update
+
+On every Steam launch, the host checks GitHub for a newer release (302 redirect to the latest tag, no API key needed). If a newer `stbase.dll` is found, it is downloaded, SHA-256 verified against `checksums.sha256` from the same release, and swapped in — the new version takes effect on the next Steam restart. The config panel's status page shows the current state ("已是最新版本" / "新版本已就绪, 重启 Steam 生效").
+
+- Toggle via `[update] enabled = false` in `steamtools.toml` (default on)
+- Only the host `stbase.dll` is auto-updated; the two loaders are thin forwarding shims and are updated by the installer instead
+- A failed or interrupted swap self-heals: the previous file is kept as `stbase.dll.old` and restored on the next launch if the new one is missing
 
 ## Configuration (optional)
 
@@ -98,6 +112,9 @@ url = "opensteamtool"     # manifest request code source: opensteamtool / steamr
 [store_accel]
 egress = "disabled"       # disabled / direct_dns / local_cdn / http_connect
 clash_fallback = "127.0.0.1:7890"   # optional; loopback only, at most one retry after local candidates fail
+
+[update]
+enabled = true            # auto-update on launch (default on)
 ```
 
 ## Steam version compatibility
