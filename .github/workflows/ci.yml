@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# 同一 PR/分支的新 push 取消仍在跑的旧 run, 避免多次重复构建.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     runs-on: windows-latest
@@ -20,8 +25,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # shared-key 固定为 Cargo.lock, 让 PR 分支复用主分支缓存, 减少重复编译.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-${{ hashFiles('Cargo.lock') }}
 
       - name: Format check
         run: cargo fmt --all -- --check
