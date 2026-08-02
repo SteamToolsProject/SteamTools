@@ -15,6 +15,7 @@ export interface ConfigSnapshot {
   catalog_modes: string[];
   catalog_url_template: string;
   catalog_status: string;
+  catalog_auto_dlc: boolean;
   manifest_url: string;
   manifest_sources: string[];
   lua_paths: string[];
@@ -33,6 +34,7 @@ export type ConfigIntent =
   | { kind: "set_log_level"; value: string }
   | { kind: "set_catalog_mode"; value: string }
   | { kind: "set_catalog_url_template"; value: string }
+  | { kind: "set_catalog_auto_dlc"; on: boolean }
   | { kind: "set_manifest_url"; value: string }
   | { kind: "add_lua_path"; value: string }
   | { kind: "remove_lua_path"; value: string }
@@ -64,6 +66,7 @@ export const EMPTY_SNAPSHOT: ConfigSnapshot = {
   catalog_modes: [],
   catalog_url_template: "",
   catalog_status: "Community 多源聚合",
+  catalog_auto_dlc: true,
   manifest_url: "opensteamtool",
   manifest_sources: [],
   lua_paths: [],

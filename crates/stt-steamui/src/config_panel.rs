@@ -818,6 +818,10 @@ fn parse_one(item: &Value) -> Option<ConfigIntent> {
         "set_log_level" => ConfigIntent::set_log_level(value),
         "set_catalog_mode" => ConfigIntent::set_catalog_mode(value),
         "set_catalog_url_template" => ConfigIntent::set_catalog_url_template(value),
+        "set_catalog_auto_dlc" => {
+            let on = item.get("on")?.as_bool()?;
+            Some(ConfigIntent::set_catalog_auto_dlc(on))
+        }
         "set_manifest_url" => ConfigIntent::set_manifest_url(value),
         "add_lua_path" => ConfigIntent::add_lua_path(value),
         "remove_lua_path" => ConfigIntent::remove_lua_path(value),
