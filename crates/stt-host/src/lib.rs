@@ -24,8 +24,8 @@ use host_log::{HostLogLevel, HostLogger};
 use stt_catalog::{
     ensure_community_snapshots, CaigamerCatalogProvider, CatalogError, CatalogLimits,
     CatalogProvider, CatalogProviderChain, CatalogTraceEntry, CatalogTraceOutcome,
-    CommunityCatalogProvider, CommunitySnapshotState, CustomHttpCatalogProvider,
-    MockCatalogProvider, ProviderErrorKind,
+    CatmisteamCatalogProvider, CommunityCatalogProvider, CommunitySnapshotState,
+    CustomHttpCatalogProvider, MockCatalogProvider, ProviderErrorKind,
 };
 use stt_config::{
     add_to_library, apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent,
@@ -78,11 +78,48 @@ fn configured_apps() -> Option<Arc<RwLock<HashSet<AppId>>>> {
     CONFIGURED_APPS.get().map(Arc::clone)
 }
 
+/// 对齐上游 OST `GetAllDepotIds` / `InitFakeLicense`:
+/// package0 与 CheckAppOwnership 要同时覆盖 **主 app + 全部 depot id**.
+///
+/// 只注入 app 时 Steam 认有 license, 但 depot 层 ownership/size 链不完整,
+/// 安装对话框会显示 0 B.
+fn package_ids_from_state(state: &ConfigState) -> Vec<AppId> {
+    state.with_rules(|rules| {
+        let mut ids = HashSet::new();
+        for app_id in rules.owned_iter() {
+            ids.insert(app_id);
+            for &depot_id in rules.app_depots(app_id) {
+                ids.insert(depot_id);
+            }
+        }
+        for (depot_id, _) in rules.depot_keys_iter() {
+            ids.insert(depot_id);
+        }
+        let mut out: Vec<AppId> = ids.into_iter().collect();
+        out.sort_unstable();
+        out
+    })
+}
+
+/// 单次入库要写入 package0 的 id: 主 app + 其 depot.
+fn package_ids_for_app(state: &ConfigState, app_id: AppId) -> Vec<AppId> {
+    state.with_rules(|rules| {
+        let mut ids = vec![app_id];
+        for &depot_id in rules.app_depots(app_id) {
+            if depot_id != app_id && !ids.contains(&depot_id) {
+                ids.push(depot_id);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    })
+}
+
 fn sync_configured_from_state(state: &ConfigState) {
     // 先收集 id, 再锁一次.
     // CONFIGURED_APPS 与 package runtime 共用同一把 Arc<RwLock<HashSet>>,
     // 若持写锁时再调 set_configured_apps 会 **自死锁** (RwLock 写锁不可重入).
-    let ids: Vec<AppId> = state.with_rules(|rules| rules.owned_iter().collect());
+    let ids = package_ids_from_state(state);
     if let Some(set) = configured_apps() {
         let mut g = set
             .write()
@@ -135,9 +172,14 @@ struct LibraryAddedResult {
 }
 
 /// 入库成功后: 入队 + notify; package 降级必须反馈为部分成功.
+///
+/// 对齐 OST: package0 同时注入主 app 与全部 depot id (否则安装体积 0B).
 fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) -> LibraryAddedResult {
     sync_download_runtime(state);
-    stt_steamclient::add_configured_app(app_id);
+    let inject_ids = package_ids_for_app(state, app_id);
+    for &id in &inject_ids {
+        stt_steamclient::add_configured_app(id);
+    }
     let Some(q) = license_queue() else {
         append_host_log(steam_root, "package=notify skip=no_license_queue");
         return LibraryAddedResult {
@@ -145,9 +187,23 @@ fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) -> Li
             detail: "license_queue_unavailable".to_owned(),
         };
     };
-    q.queue_addition(app_id);
+    for &id in &inject_ids {
+        q.queue_addition(id);
+    }
     let plan = stt_steamclient::notify_license_changed(&q);
-    append_host_log(steam_root, &plan.summary_line());
+    append_host_log(
+        steam_root,
+        &format!(
+            "{} package_ids={}",
+            plan.summary_line(),
+            inject_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
+    // 库 UI 只认主 app, 不把 depot 当库条目.
     state.with_rules(|rules| library_ux().sync_from_rules(rules));
     library_ux().on_rules_app_present(app_id);
     if plan.client_applied {
@@ -196,17 +252,23 @@ fn missing_log_suffix(missing: &MissingDownloadData) -> String {
 }
 
 /// 移除成功后.
+///
+/// 调用时 lua/rules 已不含该 app; 用全量 package id 集做差, 顺带清掉孤儿 depot.
 fn on_library_removed(steam_root: &Path, state: &ConfigState, app_id: AppId) {
     sync_download_runtime(state);
-    stt_steamclient::remove_configured_app(app_id);
+    sync_configured_from_state(state);
     state.with_rules(|rules| library_ux().sync_from_rules(rules));
     let Some(q) = license_queue() else {
         append_host_log(steam_root, "package=notify skip=no_license_queue");
         return;
     };
+    // 主 app 一定要出队; 其余用 reconcile 对齐 (含 depot).
     q.queue_removal(app_id);
+    let keep = package_ids_from_state(state);
+    q.reconcile_owned(keep.iter().copied());
     let plan = stt_steamclient::notify_license_changed(&q);
     append_host_log(steam_root, &plan.summary_line());
+    library_ux().queue_removal(app_id);
 }
 
 /// lua 全量重载后: 与 owned 做差再 notify.
@@ -227,8 +289,10 @@ fn on_rules_reloaded(
     let Some(q) = license_queue() else {
         return;
     };
+    // package0 对齐 app+depot; 库 UI 仍只跟 owned app.
+    let package_ids = package_ids_from_state(state);
     let owned: Vec<AppId> = state.with_rules(|r| r.owned_iter().collect());
-    q.reconcile_owned(owned.iter().copied());
+    q.reconcile_owned(package_ids.iter().copied());
     // 从配置消失的 app 走 UI 移除队列 (RunFrame drain 清 ownership).
     let before: std::collections::HashSet<AppId> =
         library_ux().owned_snapshot().into_iter().collect();
@@ -329,6 +393,7 @@ fn catalog_http_options(config: &CatalogSection) -> stt_platform::WinHttpRequest
     }
 }
 
+/// 内置社区聚合: 内部已含默认 CatalogEnricher 列表 (CatMisteam → CaiGamer 补全).
 fn community_provider(steam_root: &Path, config: &CatalogSection) -> CommunityCatalogProvider {
     let request_options = catalog_http_options(config);
     let options = stt_platform::WinHttpGetOptions {
@@ -338,6 +403,18 @@ fn community_provider(steam_root: &Path, config: &CatalogSection) -> CommunityCa
     CommunityCatalogProvider::new(stt_platform::data_dir(steam_root).join("cache"), options)
 }
 
+/// CatMisteam 完整源兜底: Community 整段失败时, 在 CaiGamer 之前试 lua 直下.
+/// 与 Community 内部的 CatMisteam CatalogEnricher 角色不同, 勿合并.
+fn catmisteam_provider(config: &CatalogSection) -> CatmisteamCatalogProvider {
+    let request_options = catalog_http_options(config);
+    CatmisteamCatalogProvider::new(stt_platform::WinHttpGetOptions {
+        timeouts: request_options.timeouts,
+        max_body_bytes: request_options.max_response_body_bytes,
+    })
+}
+
+/// 完整 CatalogProvider 兜底: 仅当前链上 Community / CatMisteam 等整段失败时使用.
+/// 与 Community 内部的 CaiGamer CatalogEnricher 角色不同, 勿合并.
 fn caigamer_provider(config: &CatalogSection) -> CaigamerCatalogProvider {
     let request_options = catalog_http_options(config);
     CaigamerCatalogProvider::new(stt_platform::WinHttpGetOptions {
@@ -449,6 +526,8 @@ fn community_snapshot_text(state: &CommunitySnapshotState) -> String {
     }
 }
 
+/// 完整源链: 用户主源 → Community 聚合 → CatMisteam → CaiGamer.
+/// Community 成功时内部 enricher 已补 key/token; 外层完整源只在整段失败时跑.
 fn with_community_fallback(
     provider: Box<dyn CatalogProvider>,
     steam_root: &Path,
@@ -457,6 +536,7 @@ fn with_community_fallback(
     Box::new(CatalogProviderChain::new(vec![
         provider,
         Box::new(community_provider(steam_root, config)),
+        Box::new(catmisteam_provider(config)),
         Box::new(caigamer_provider(config)),
     ]))
 }
@@ -501,6 +581,7 @@ fn build_catalog_provider(
         }
         CatalogMode::Community => Ok(Box::new(CatalogProviderChain::new(vec![
             Box::new(community_provider(steam_root, config)),
+            Box::new(catmisteam_provider(config)),
             Box::new(caigamer_provider(config)),
         ]))),
     }
@@ -819,7 +900,7 @@ fn spawn_catalog_worker(
                         append_host_log(
                             &root,
                             &format!(
-                                "catalog_add={} result={} source={} app_id={} provider={} trace={} lua={} epoch={} owned={} detail={}{missing_log}",
+                                "catalog_add={} result={} source={} app_id={} provider={} trace={} lua={} epoch={} owned={} manifest_files={} detail={}{missing_log}",
                                 if applied.result == CatalogJobResult::Success {
                                     "ok"
                                 } else {
@@ -833,6 +914,7 @@ fn spawn_catalog_worker(
                                 out.lua_path.display(),
                                 out.epoch,
                                 out.owned_count,
+                                out.manifest_files_written,
                                 applied.detail
                             ),
                         );
@@ -1419,14 +1501,15 @@ fn setup_package_layer(
 ) -> stt_steamclient::PackageInstallReport {
     let queue = Arc::new(LicenseQueue::new());
     let configured = Arc::new(RwLock::new(HashSet::new()));
-    let owned: Vec<AppId> = state.with_rules(|rules| rules.owned_iter().collect());
+    // OST InitFakeLicense: seed app + depot ids, 不只 owned 主 app.
+    let package_ids = package_ids_from_state(state);
     {
         let mut g = configured
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.extend(owned.iter().copied());
+        g.extend(package_ids.iter().copied());
     }
-    queue.seed_injected_from_owned(owned.iter().copied());
+    queue.seed_injected_from_owned(package_ids.iter().copied());
 
     let _ = LICENSE_QUEUE.set(Arc::clone(&queue));
     let _ = CONFIGURED_APPS.set(Arc::clone(&configured));
@@ -1668,7 +1751,11 @@ fn sync_download_runtime(state: &ConfigState) {
     stt_steamclient::replace_manifest_overrides(snapshot.manifests);
 
     #[cfg(feature = "download-key")]
-    let _ = stt_steamclient::replace_depot_keys(snapshot.keys);
+    {
+        let report = stt_steamclient::replace_depot_keys(snapshot.keys);
+        // accepted/rejected 不进常规日志 (热路径); snapshot 长度看 download_key_stats.
+        let _ = report;
+    }
 
     #[cfg(feature = "download-token")]
     let _ = stt_steamclient::replace_access_tokens(snapshot.tokens);
@@ -2238,7 +2325,7 @@ fn run_watch_loop(
     let mut package_rearm_ticks: u32 = 0;
     let mut package_attached_logged = stt_steamclient::is_attached();
     let mut last_package_hook_stats = ((0, 0), (0, None));
-    let mut last_library_stats = (0u64, 0u64, 0u64, 0u64);
+    let mut last_library_stats = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut library_rearm_ticks: u32 = 0;
     let mut library_attached_logged = stt_steamui::library_detour_attached();
     #[cfg(feature = "download-manifest")]
@@ -2288,12 +2375,12 @@ fn run_watch_loop(
 
         // 库 UX detour 统计: 有变化才写.
         let library_stats = stt_steamui::library_detour_stats();
-        if library_stats != last_library_stats && library_stats != (0, 0, 0, 0) {
+        if library_stats != last_library_stats && library_stats != (0, 0, 0, 0, 0) {
             append_host_log(
                 steam_root,
                 &format!(
-                    "library_ux_stats run_frame={} drained={} fill_in={} build_complete={}",
-                    library_stats.0, library_stats.1, library_stats.2, library_stats.3
+                    "library_ux_stats run_frame={} drained={} fill_in={} build_complete={} mark_changes={}",
+                    library_stats.0, library_stats.1, library_stats.2, library_stats.3, library_stats.4
                 ),
             );
             last_library_stats = library_stats;
@@ -2535,7 +2622,10 @@ fn run_watch_loop(
             if stats != last_key_stats {
                 append_host_log(
                     steam_root,
-                    &format!("download_key_stats calls={} served={}", stats.0, stats.1),
+                    &format!(
+                        "download_key_stats calls={} served={} path_hit_miss={} snapshot={}",
+                        stats.0, stats.1, stats.2, stats.3
+                    ),
                 );
                 last_key_stats = stats;
             }
@@ -3065,11 +3155,14 @@ end
         assert_eq!(snapshot.keys.get(&43).map(String::len), Some(64));
         assert_eq!(snapshot.tokens.get(&42), Some(&123));
         assert_eq!(snapshot.request_code_depots, HashSet::from([43]));
+        // OST 对齐: package0 注入主 app + depot.
         assert!(queue.injected_contains(42));
-        assert!(configured
+        assert!(queue.injected_contains(43));
+        let configured_ids = configured
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&42));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(configured_ids.contains(&42));
+        assert!(configured_ids.contains(&43));
 
         let note = note
             .lock()
@@ -3084,7 +3177,9 @@ end
             "{log}"
         );
         assert!(log.contains("provider=custom_http"), "{log}");
-        assert!(log.contains("package=notify mode=logic insert=1"), "{log}");
+        // insert=2: app 42 + depot 43.
+        assert!(log.contains("package=notify mode=logic insert=2"), "{log}");
+        assert!(log.contains("package_ids=42,43"), "{log}");
     }
 
     #[cfg(all(
