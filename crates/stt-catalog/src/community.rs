@@ -128,12 +128,17 @@ impl CommunityCatalogProvider {
         let mut trace =
             Vec::with_capacity(self.metadata_sources.len() + self.archive_sources.len() + 4);
         let mut manifest_blobs = Vec::new();
-        let metadata = self
-            .fetch_metadata(app_id, &mut trace)
-            .or_else(|| self.fetch_archive_metadata(app_id, &mut trace, &mut manifest_blobs));
-        let Some((mut bundle, source)) = metadata else {
-            return Err(CatalogError::ChainExhausted { trace });
-        };
+        // 优先 metadata (带 DLC 列表); 否则 archive (DLC 列表空, 上层可 store 兜底).
+        let (mut bundle, source, related_dlc_ids) =
+            if let Some((bundle, source, dlc_ids)) = self.fetch_metadata(app_id, &mut trace) {
+                (bundle, source, dlc_ids)
+            } else if let Some((bundle, source)) =
+                self.fetch_archive_metadata(app_id, &mut trace, &mut manifest_blobs)
+            {
+                (bundle, source, Vec::new())
+            } else {
+                return Err(CatalogError::ChainExhausted { trace });
+            };
 
         match self.enrich_depot_keys(&mut bundle) {
             Ok(_) => trace.push(hit_trace("community:key_snapshot")),
@@ -175,6 +180,7 @@ impl CommunityCatalogProvider {
             source: source.to_owned(),
             trace,
             manifest_blobs,
+            related_dlc_ids,
         })
     }
 
@@ -182,12 +188,12 @@ impl CommunityCatalogProvider {
         &self,
         app_id: AppId,
         trace: &mut Vec<CatalogTraceEntry>,
-    ) -> Option<(CatalogBundle, &'static str)> {
+    ) -> Option<(CatalogBundle, &'static str, Vec<AppId>)> {
         for source in &self.metadata_sources {
             match fetch_http_metadata(source, app_id, self.options) {
-                Ok(bundle) => {
+                Ok((bundle, dlc_ids)) => {
                     trace.push(hit_trace(source.id));
-                    return Some((bundle, source.id));
+                    return Some((bundle, source.id, dlc_ids));
                 }
                 Err(error) => trace.push(failed_trace(source.id, &error)),
             }
@@ -474,7 +480,7 @@ fn fetch_http_metadata(
     source: &HttpMetadataSource,
     app_id: AppId,
     options: WinHttpGetOptions,
-) -> CatalogResult<CatalogBundle> {
+) -> CatalogResult<(CatalogBundle, Vec<AppId>)> {
     let mut timeouts = options.timeouts;
     if let Some(cap) = source.timeout_cap_ms {
         timeouts.resolve_ms = timeouts.resolve_ms.min(cap);
@@ -510,7 +516,10 @@ fn fetch_http_metadata(
     parse_steamcmd_style_response(app_id, &response.body)
 }
 
-fn parse_steamcmd_style_response(app_id: AppId, body: &[u8]) -> CatalogResult<CatalogBundle> {
+fn parse_steamcmd_style_response(
+    app_id: AppId,
+    body: &[u8],
+) -> CatalogResult<(CatalogBundle, Vec<AppId>)> {
     let limit = CatalogLimits::default().max_wire_bytes;
     if body.len() > limit {
         return Err(CatalogError::PayloadTooLarge {
@@ -520,6 +529,7 @@ fn parse_steamcmd_style_response(app_id: AppId, body: &[u8]) -> CatalogResult<Ca
     }
 
     let root: Value = serde_json::from_slice(body)?;
+    let related_dlc_ids = crate::extract_dlc_ids(app_id, &root);
     let app_key = app_id.to_string();
     let app_data = root
         .get("data")
@@ -592,7 +602,8 @@ fn parse_steamcmd_style_response(app_id: AppId, body: &[u8]) -> CatalogResult<Ca
         ));
     }
     bundle.app_depots.insert(app_id, depot_ids);
-    validate_bundle(app_id, bundle)
+    let bundle = validate_bundle(app_id, bundle)?;
+    Ok((bundle, related_dlc_ids))
 }
 
 fn parse_json_nonzero_u64(value: &Value, field: String) -> CatalogResult<u64> {
@@ -1176,11 +1187,12 @@ mod tests {
 
     #[test]
     fn steamcmd_parser_extracts_public_manifest() {
-        let bundle = parse_steamcmd_style_response(42, &valid_body()).unwrap();
+        let (bundle, dlc) = parse_steamcmd_style_response(42, &valid_body()).unwrap();
 
         assert_eq!(bundle.app_depots[&42], vec![43]);
         assert_eq!(bundle.manifests[&43].manifest_gid, 99);
         assert_eq!(bundle.manifests[&43].size, 100);
+        assert!(dlc.is_empty());
     }
 
     #[test]
@@ -1225,7 +1237,7 @@ mod tests {
         // 1523211 是 depotfromapp (共享 depot), 不应要求它自己的 key/manifest.
         let body = br#"{"status":"success","data":{"42":{"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}},"44":{"depotfromapp":"1523210","manifests":{"public":{"gid":"88","download":"90"}}}}}}}"#;
 
-        let bundle = parse_steamcmd_style_response(42, body).unwrap();
+        let (bundle, _) = parse_steamcmd_style_response(42, body).unwrap();
 
         assert_eq!(bundle.app_depots[&42], vec![43]);
         assert!(!bundle.manifests.contains_key(&44));
@@ -1235,16 +1247,24 @@ mod tests {
     #[test]
     fn steamcmd_parser_records_missing_token_flag() {
         let body = br#"{"status":"success","data":{"42":{"_missing_token":false,"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}}}}}}"#;
-        let bundle = parse_steamcmd_style_response(42, body).unwrap();
+        let (bundle, _) = parse_steamcmd_style_response(42, body).unwrap();
         assert_eq!(bundle.requires_token, Some(false));
 
         let body = br#"{"status":"success","data":{"42":{"_missing_token":true,"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}}}}}}"#;
-        let bundle = parse_steamcmd_style_response(42, body).unwrap();
+        let (bundle, _) = parse_steamcmd_style_response(42, body).unwrap();
         assert_eq!(bundle.requires_token, Some(true));
 
         // 缺字段 = 未知 (None), 按需要处理.
-        let bundle = parse_steamcmd_style_response(42, &valid_body()).unwrap();
+        let (bundle, _) = parse_steamcmd_style_response(42, &valid_body()).unwrap();
         assert_eq!(bundle.requires_token, None);
+    }
+
+    #[test]
+    fn steamcmd_parser_extracts_related_dlc_ids() {
+        let body = br#"{"status":"success","data":{"42":{"common":{"listofdlc":"100,101"},"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}},"dlc":{"102":{}}}}}}"#;
+        let (bundle, dlc) = parse_steamcmd_style_response(42, body).unwrap();
+        assert_eq!(bundle.apps, vec![42]);
+        assert_eq!(dlc, vec![100, 101, 102]);
     }
 
     #[test]
@@ -1601,7 +1621,8 @@ mod tests {
             "cd".repeat(32)
         );
         // 路由: /info/ → metadata; /lua/ → catmisteam.
-        let server = FakeHttpServer::spawn_with(&[("info", body.to_vec()), ("lua", lua.into_bytes())]);
+        let server =
+            FakeHttpServer::spawn_with(&[("info", body.to_vec()), ("lua", lua.into_bytes())]);
         let catmisteam_url = server
             .template
             .replace("/info/{app_id}", "/lua/{app_id}.lua");
@@ -1615,7 +1636,10 @@ mod tests {
             1024,
             1024,
         )
-        .with_catmisteam(CatmisteamCatalogProvider::with_url(options(1024), catmisteam_url));
+        .with_catmisteam(CatmisteamCatalogProvider::with_url(
+            options(1024),
+            catmisteam_url,
+        ));
 
         let outcome = provider.fetch_with_trace(42).unwrap();
 

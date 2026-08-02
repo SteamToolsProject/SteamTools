@@ -11,9 +11,9 @@ use stt_core::{AppId, CatalogBundle, DepotId};
 use stt_platform::{winhttp_get, HttpError, WinHttpGetOptions};
 
 use crate::{
-    keys_parse::collect_lua_keys, validate_bundle, CatalogEnricher, CatalogError, CatalogFetchOutcome,
-    CatalogProvider, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, EnrichContext,
-    ProviderErrorKind,
+    keys_parse::collect_lua_keys, validate_bundle, CatalogEnricher, CatalogError,
+    CatalogFetchOutcome, CatalogProvider, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome,
+    EnrichContext, ProviderErrorKind,
 };
 
 const PROVIDER: &str = "community:catmisteam";
@@ -57,6 +57,7 @@ impl CatmisteamCatalogProvider {
                 outcome: CatalogTraceOutcome::Hit,
             }],
             manifest_blobs: Vec::new(),
+            related_dlc_ids: Vec::new(),
         })
     }
 
@@ -458,9 +459,8 @@ addappid(44,0,"abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
-            let template = Box::leak(
-                format!("http://127.0.0.1:{port}/lua/{{app_id}}.lua").into_boxed_str(),
-            );
+            let template =
+                Box::leak(format!("http://127.0.0.1:{port}/lua/{{app_id}}.lua").into_boxed_str());
             let thread = std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while Instant::now() < deadline {

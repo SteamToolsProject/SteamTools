@@ -415,13 +415,7 @@ mod tests {
                 .iter()
                 .map(|(source, _)| *source)
                 .collect::<Vec<_>>(),
-            [
-                "jsdmirror",
-                "ghfast",
-                "github_raw",
-                "sudama",
-                "catmisteam"
-            ]
+            ["jsdmirror", "ghfast", "github_raw", "sudama", "catmisteam"]
         );
     }
 

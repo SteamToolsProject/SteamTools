@@ -7,6 +7,7 @@ mod caigamer;
 mod catmisteam;
 mod chain;
 mod community;
+mod dlc;
 mod enrich;
 mod error;
 mod http;
@@ -20,6 +21,7 @@ pub use caigamer::CaigamerCatalogProvider;
 pub use catmisteam::CatmisteamCatalogProvider;
 pub use chain::CatalogProviderChain;
 pub use community::CommunityCatalogProvider;
+pub use dlc::{extract_dlc_ids, extract_dlc_ids_from_bytes, fetch_dlc_ids_store};
 pub use enrich::{CatalogEnricher, EnrichContext};
 pub use error::{
     CatalogError, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, ProviderErrorKind,
@@ -60,6 +62,8 @@ pub struct CatalogFetchOutcome {
     pub trace: Vec<CatalogTraceEntry>,
     /// 可选的原始 .manifest 字节 (archive 源); 默认空.
     pub manifest_blobs: Vec<ManifestBlob>,
+    /// 候选 DLC AppId (未验证可下载); 默认空.
+    pub related_dlc_ids: Vec<AppId>,
 }
 
 /// 按 AppId 获取完整入库元数据的运行时 provider.
@@ -86,6 +90,7 @@ pub trait CatalogProvider: Send + Sync {
                 outcome: CatalogTraceOutcome::Hit,
             }],
             manifest_blobs: Vec::new(),
+            related_dlc_ids: Vec::new(),
         })
     }
 }

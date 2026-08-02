@@ -89,6 +89,7 @@ impl CaigamerCatalogProvider {
                 outcome: CatalogTraceOutcome::Hit,
             }],
             manifest_blobs: Vec::new(),
+            related_dlc_ids: Vec::new(),
         })
     }
 
