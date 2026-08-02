@@ -83,7 +83,8 @@ fn resolve_once(
         executor: Arc::clone(executor),
         stage: ManifestCodeStage::LuaBasic,
     });
-    let http = HttpManifestProvider::for_source(&config);
+    // 配置首选 + 其余内置源回退 (opensteamtool 现网 403 时仍能走 wudrm).
+    let http = HttpManifestChain::for_config(&config);
     ManifestCodeResolverChain::new(
         lua_extended
             .as_ref()
@@ -156,6 +157,26 @@ enum HttpResponseFormat {
     SteamRunJson,
 }
 
+/// 内置 HTTP request-code 源 (与 OST ManifestClient::kProviders 对齐).
+const HTTP_SOURCES: &[(&str, &str, HttpResponseFormat)] = &[
+    (
+        "opensteamtool",
+        "https://manifest.opensteamtool.com/{manifest_gid}",
+        HttpResponseFormat::PlainDecimal,
+    ),
+    // OST 用明文 HTTP: 该站 HTTPS 证书主机名不匹配, WinHttp 严格校验会失败.
+    (
+        "wudrm",
+        "http://gmrc.wudrm.com/manifest/{manifest_gid}",
+        HttpResponseFormat::PlainDecimal,
+    ),
+    (
+        "steamrun",
+        "https://manifest.steam.run/api/manifest/{manifest_gid}",
+        HttpResponseFormat::SteamRunJson,
+    ),
+];
+
 struct HttpManifestProvider {
     id: String,
     url_template: String,
@@ -164,32 +185,17 @@ struct HttpManifestProvider {
 }
 
 impl HttpManifestProvider {
-    fn for_source(config: &ManifestSection) -> Self {
-        let (template, format) = match config.url.as_str() {
-            "opensteamtool" => (
-                "https://manifest.opensteamtool.com/{manifest_gid}",
-                HttpResponseFormat::PlainDecimal,
-            ),
-            "wudrm" => (
-                // 强制 HTTPS: 该 provider 必须自行终止 TLS, 不允许明文回落
-                "https://gmrc.wudrm.com/manifest/{manifest_gid}",
-                HttpResponseFormat::PlainDecimal,
-            ),
-            "steamrun" => (
-                "https://manifest.steam.run/api/manifest/{manifest_gid}",
-                HttpResponseFormat::SteamRunJson,
-            ),
-            _ => ("", HttpResponseFormat::PlainDecimal),
-        };
-        Self {
-            id: config.url.clone(),
+    fn from_named(id: &str, config: &ManifestSection) -> Option<Self> {
+        let (name, template, format) = HTTP_SOURCES.iter().copied().find(|(n, _, _)| *n == id)?;
+        Some(Self {
+            id: name.to_owned(),
             url_template: template.to_owned(),
             format,
             options: stt_platform::WinHttpGetOptions {
                 timeouts: timeouts(config),
                 max_body_bytes: MAX_HTTP_RESPONSE_BYTES,
             },
-        }
+        })
     }
 
     #[cfg(test)]
@@ -206,14 +212,8 @@ impl HttpManifestProvider {
             options,
         }
     }
-}
 
-impl ManifestCodeProvider for HttpManifestProvider {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn resolve(&self, request: ManifestCodeRequest) -> ManifestCodeProviderResult {
+    fn try_fetch(&self, request: ManifestCodeRequest) -> ManifestCodeProviderResult {
         if self.url_template.is_empty() {
             return Err(ManifestCodeFailureKind::Unavailable);
         }
@@ -225,6 +225,64 @@ impl ManifestCodeProvider for HttpManifestProvider {
             return Err(ManifestCodeFailureKind::Rejected);
         }
         parse_http_response(self.format, &response.body).map(Some)
+    }
+}
+
+/// 配置首选源优先, 失败再试其余内置 HTTP 源 (不改 ManifestCodeResolverChain 契约).
+/// hit_index 记录最近命中, 供 id()/source 日志显示真实源名.
+struct HttpManifestChain {
+    providers: Vec<HttpManifestProvider>,
+    hit_index: std::sync::atomic::AtomicUsize,
+}
+
+impl HttpManifestChain {
+    fn for_config(config: &ManifestSection) -> Self {
+        let preferred = config.url.as_str();
+        let mut providers = Vec::with_capacity(HTTP_SOURCES.len());
+        if let Some(first) = HttpManifestProvider::from_named(preferred, config) {
+            providers.push(first);
+        }
+        for (name, _, _) in HTTP_SOURCES {
+            if *name == preferred {
+                continue;
+            }
+            if let Some(provider) = HttpManifestProvider::from_named(name, config) {
+                providers.push(provider);
+            }
+        }
+        Self {
+            providers,
+            hit_index: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ManifestCodeProvider for HttpManifestChain {
+    fn id(&self) -> &str {
+        let index = self
+            .hit_index
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(self.providers.len().saturating_sub(1));
+        self.providers
+            .get(index)
+            .map(|provider| provider.id.as_str())
+            .unwrap_or("http")
+    }
+
+    fn resolve(&self, request: ManifestCodeRequest) -> ManifestCodeProviderResult {
+        let mut last_error = ManifestCodeFailureKind::Unavailable;
+        for (index, provider) in self.providers.iter().enumerate() {
+            match provider.try_fetch(request) {
+                Ok(Some(code)) => {
+                    self.hit_index
+                        .store(index, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Some(code));
+                }
+                Ok(None) => {}
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
     }
 }
 
@@ -247,6 +305,8 @@ fn parse_http_response(
 }
 
 fn parse_decimal(body: &[u8]) -> Result<u64, ManifestCodeFailureKind> {
+    // 允许首尾空白 (部分源带 \n).
+    let body = trim_ascii(body);
     if body.is_empty() || !body.iter().all(u8::is_ascii_digit) {
         return Err(ManifestCodeFailureKind::InvalidResponse);
     }
@@ -255,6 +315,18 @@ fn parse_decimal(body: &[u8]) -> Result<u64, ManifestCodeFailureKind> {
         .ok()
         .filter(|code| *code != 0)
         .ok_or(ManifestCodeFailureKind::InvalidResponse)
+}
+
+fn trim_ascii(body: &[u8]) -> &[u8] {
+    let start = body
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let end = body
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &body[start..end]
 }
 
 fn map_http_error(error: stt_platform::HttpError) -> ManifestCodeFailureKind {
@@ -367,7 +439,11 @@ mod tests {
             parse_http_response(HttpResponseFormat::SteamRunJson, br#"{"content":"456"}"#),
             Ok(456)
         );
-        assert!(parse_http_response(HttpResponseFormat::PlainDecimal, b"123\n").is_err());
+        // 部分源 body 带尾部换行, trim 后仍应解析成功.
+        assert_eq!(
+            parse_http_response(HttpResponseFormat::PlainDecimal, b"123\n"),
+            Ok(123)
+        );
         assert!(
             parse_http_response(HttpResponseFormat::SteamRunJson, br#"{"content":456}"#).is_err()
         );
@@ -397,7 +473,7 @@ mod tests {
             },
         );
 
-        assert_eq!(provider.resolve(request()), Ok(Some(123)));
+        assert_eq!(provider.try_fetch(request()), Ok(Some(123)));
         server.join().unwrap();
     }
 

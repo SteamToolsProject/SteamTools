@@ -24,6 +24,9 @@ const TARGET_JOB_NAME: &[u8] = b"ContentServerDirectory.GetManifestRequestCode#1
 const ERESULT_OK: u64 = 1;
 const MAX_JOBS: usize = 64;
 const JOB_TTL: Duration = Duration::from_secs(15);
+/// 对齐 OST Hooks_NetPacket_Manifest: recv 上最多等 HTTP 12s 再透传.
+const RECV_WAIT: Duration = Duration::from_secs(12);
+const RECV_POLL: Duration = Duration::from_millis(50);
 
 static JOBS: OnceLock<Mutex<ManifestCodeJobTable>> = OnceLock::new();
 static WORKER: OnceLock<SyncSender<ManifestCodeResolveWork>> = OnceLock::new();
@@ -196,11 +199,26 @@ impl ManifestCodeJobTable {
         before - self.entries.len()
     }
 
+    /// 仅在已完成时取走 code; pending 保留条目 (等 HTTP, 对齐 OST wait).
+    /// 过期则删除并返回 None.
     fn take_ready(&mut self, job_id: u64, now: Instant) -> Option<u64> {
-        let entry = self.entries.remove(&job_id)?;
-        (!self.is_expired(entry, now))
-            .then_some(entry.request_code)
-            .flatten()
+        let entry = *self.entries.get(&job_id)?;
+        if self.is_expired(entry, now) {
+            self.entries.remove(&job_id);
+            return None;
+        }
+        let code = entry.request_code?;
+        self.entries.remove(&job_id);
+        Some(code)
+    }
+
+    /// true = 无此 job / 已完成 / 已过期 — recv 可停止等待.
+    fn settled(&self, job_id: u64, now: Instant) -> bool {
+        match self.entries.get(&job_id) {
+            None => true,
+            Some(entry) if self.is_expired(*entry, now) => true,
+            Some(entry) => entry.request_code.is_some(),
+        }
     }
 
     fn is_expired(&self, entry: JobEntry, now: Instant) -> bool {
@@ -386,6 +404,10 @@ pub fn rewrite_manifest_code_runtime_response(
     opcode: u32,
     packet: &[u8],
 ) -> ManifestCodeResponseRewrite {
+    // OST: recv 上 wait_for HTTP future 最多 12s. 我们用轮询等 worker complete.
+    if let Some(job_id) = peek_manifest_code_response_job(opcode, packet) {
+        wait_for_manifest_code_job(job_id, RECV_WAIT);
+    }
     let mut jobs = runtime_jobs()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -394,6 +416,34 @@ pub fn rewrite_manifest_code_runtime_response(
         PATCHED.fetch_add(1, Ordering::Relaxed);
     }
     rewrite
+}
+
+/// 从响应帧抽出 jobid_target (不改包); 非目标 EMsg 返回 None.
+fn peek_manifest_code_response_job(opcode: u32, packet: &[u8]) -> Option<u64> {
+    let frame = unpack_frame(opcode, packet, SERVICE_METHOD_RESPONSE)?;
+    let header = parse_service_header(frame.header)?;
+    if header.target_job_name != Some(TARGET_JOB_NAME) {
+        return None;
+    }
+    header.job_id_target.and_then(valid_job_id)
+}
+
+fn wait_for_manifest_code_job(job_id: u64, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    loop {
+        {
+            let jobs = runtime_jobs()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if jobs.settled(job_id, Instant::now()) {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(RECV_POLL);
+    }
 }
 
 /// 只识别目标 EMsg 151, 不修改发送帧.
@@ -770,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_or_expired_result_preserves_steam_response() {
+    fn pending_result_keeps_job_and_preserves_steam_response() {
         let now = Instant::now();
         let mut jobs = ManifestCodeJobTable::new(2, Duration::from_secs(5)).unwrap();
         let _ = jobs.register(40, now);
@@ -780,12 +830,19 @@ mod tests {
             &field_varint(1, 5),
         );
 
+        // pending: 透传 Steam 响应, 但 **保留** job 等 HTTP (对齐 OST wait).
         assert_eq!(
             rewrite_manifest_code_response_frame(2, &packet, &mut jobs, now),
             ManifestCodeResponseRewrite::Passthrough
         );
-        assert!(jobs.is_empty());
+        assert_eq!(jobs.len(), 1);
+        assert!(!jobs.settled(40, now));
+    }
 
+    #[test]
+    fn expired_result_drops_job_without_rewrite() {
+        let now = Instant::now();
+        let mut jobs = ManifestCodeJobTable::new(2, Duration::from_secs(5)).unwrap();
         let ManifestCodeRegister::Registered(ticket) = jobs.register(40, now) else {
             unreachable!();
         };
@@ -793,6 +850,7 @@ mod tests {
             jobs.complete(ticket, 99, now + Duration::from_secs(5)),
             ManifestCodeCompletion::UnknownOrStale
         );
+        assert!(jobs.settled(40, now + Duration::from_secs(5)) || jobs.is_empty());
     }
 
     #[test]
