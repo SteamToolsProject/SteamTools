@@ -9,11 +9,11 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
     WinHttpSetOption, WinHttpSetTimeouts, ERROR_WINHTTP_TIMEOUT, URL_COMPONENTS,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTP,
-    WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_OPEN_REQUEST_FLAGS,
-    WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, WINHTTP_OPTION_REDIRECT_POLICY,
-    WINHTTP_OPTION_REDIRECT_POLICY_NEVER, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION,
-    WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_ACCESS_TYPE, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_NO_PROXY,
+    WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTP, WINHTTP_INTERNET_SCHEME_HTTPS,
+    WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 
 const MAX_URL_CHARS: usize = 2048;
@@ -202,7 +202,7 @@ pub fn winhttp_request(
         let session = InternetHandle::new(
             WinHttpOpen(
                 w!("SteamTools/0.1"),
-                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                session_access_type(&parsed.host),
                 PCWSTR::null(),
                 PCWSTR::null(),
                 0,
@@ -288,6 +288,16 @@ pub fn winhttp_request(
             body,
             location,
         })
+    }
+}
+
+fn session_access_type(host: &[u16]) -> WINHTTP_ACCESS_TYPE {
+    let host = String::from_utf16_lossy(host.strip_suffix(&[0]).unwrap_or(host));
+    if matches!(host.as_str(), "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost") {
+        // 回环请求不应进入系统代理自动发现, 否则本地 provider 会受外部网络状态影响.
+        WINHTTP_ACCESS_TYPE_NO_PROXY
+    } else {
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
     }
 }
 
@@ -547,6 +557,19 @@ mod tests {
                 limit: 2
             }
         ));
+    }
+
+    #[test]
+    fn loopback_requests_bypass_automatic_proxy() {
+        for host in ["127.0.0.1", "::1", "localhost"] {
+            let mut host = host.encode_utf16().collect::<Vec<_>>();
+            host.push(0);
+            assert_eq!(session_access_type(&host), WINHTTP_ACCESS_TYPE_NO_PROXY);
+        }
+        assert_eq!(
+            session_access_type(&"example.com\0".encode_utf16().collect::<Vec<_>>()),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+        );
     }
 
     #[test]

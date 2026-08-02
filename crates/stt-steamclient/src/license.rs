@@ -53,6 +53,10 @@ impl LicenseQueue {
     pub fn queue_addition(&self, app_id: AppId) {
         let mut g = self.lock();
         g.pending_remove.retain(|&id| id != app_id);
+        // 已注入的 app 再入队会重复追加 AppIdVec, 导致 Steam license 处理异常 (库清空).
+        if g.injected.contains(&app_id) {
+            return;
+        }
         if !g.pending_add.contains(&app_id) {
             g.pending_add.push_back(app_id);
         }
@@ -181,9 +185,8 @@ impl LicenseQueue {
         let mut ui_actions = Vec::new();
 
         for id in &additions {
-            if added_ids.insert(*id) {
+            if added_ids.insert(*id) && g.injected.insert(*id) {
                 insert_ids.push(*id);
-                g.injected.insert(*id);
                 ui_actions.push(UiLicenseAction::CancelRemoval(*id));
             }
         }
@@ -308,11 +311,12 @@ mod tests {
         q.seed_injected_from_owned([3]);
         q.queue_removal(3);
         q.queue_addition(3);
-        // queue_addition 会清掉 pending_remove
+        // queue_addition 会清 pending_remove
         assert_eq!(q.pending_remove_len(), 0);
         let plan = q.plan_notify(PACKAGE_STATUS_AVAILABLE, true);
         assert!(plan.remove_ids.is_empty());
-        assert!(plan.insert_ids.contains(&3));
+        // 3 已在 injected: 加回不重复注入, 防 AppIdVec 重复追加 (刷新清单后库清空 bug).
+        assert!(plan.insert_ids.is_empty());
     }
 
     #[test]

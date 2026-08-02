@@ -464,6 +464,49 @@ mod tests {
     }
 
     #[test]
+    fn each_data_gate_disables_only_its_own_capability() {
+        let cases = [
+            DownloadDataAvailability {
+                manifest: false,
+                ..all_data()
+            },
+            DownloadDataAvailability {
+                key: false,
+                ..all_data()
+            },
+            DownloadDataAvailability {
+                token: false,
+                ..all_data()
+            },
+            DownloadDataAvailability {
+                request_code: false,
+                ..all_data()
+            },
+        ];
+
+        for (disabled, data) in cases.into_iter().enumerate() {
+            let report = plan_download_kit(
+                &enabled_tools(),
+                &complete_patterns(),
+                "steamclient",
+                all_features(),
+                DownloadRuntimeSwitches::default(),
+                data,
+            );
+            for (index, status) in statuses(&report).into_iter().enumerate() {
+                assert_eq!(
+                    status,
+                    if index == disabled {
+                        DownloadCapabilityStatus::DataMissing
+                    } else {
+                        DownloadCapabilityStatus::LogicOnly
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn complete_prerequisites_stop_at_logic_only() {
         let report = plan_download_kit(
             &enabled_tools(),
