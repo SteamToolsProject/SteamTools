@@ -270,21 +270,7 @@ pub fn library_menu_inject_js(app_id: u32, point: Option<(i32, i32)>) -> String 
     else{{root.style.top="auto";root.style.bottom="8px";}}
   }}
   function sink(kind){{
-    var msg={{kind:kind}},sent=false,w=null;
-    try{{w=window.opener;}}catch(x){{}}
-    try{{
-      if(w&&w!==window){{
-        (w.__SteamToolsIntents=w.__SteamToolsIntents||[]).push(msg);
-        sent=true;
-      }}
-    }}catch(x2){{}}
-    if(!sent){{
-      (window.__SteamToolsMenuActions=window.__SteamToolsMenuActions||[]).push(msg);
-      setTimeout(function(){{
-        try{{d.dispatchEvent(new KeyboardEvent("keydown",{{key:"Escape",bubbles:true}}));}}catch(x3){{}}
-      }},0);
-    }}
-    if(sent){{setTimeout(function(){{try{{window.close();}}catch(x3){{}}}},0);}}
+    (window.__SteamToolsMenuActions=window.__SteamToolsMenuActions||[]).push({{kind:kind}});
   }}
   function add(label,kind){{
     var row=sample.cloneNode(false);
@@ -319,14 +305,13 @@ pub fn library_menu_inject_js(app_id: u32, point: Option<(i32, i32)>) -> String 
     )
 }
 
-/// 菜单 popup 没有 opener 时, 宿主从这里取回动作并关掉 popup.
+/// 菜单动作留在当前 target, 宿主取回后再发 Escape 收起菜单.
 pub const LIBRARY_MENU_DRAIN_JS: &str = r##"
 (function(){
-  var q=window.__SteamToolsMenuActions||[];
+  var d=document,q=window.__SteamToolsMenuActions||[];
   window.__SteamToolsMenuActions=[];
-  var alive=!!document.querySelector("[data-stt-menu-group]")
-    &&document.visibilityState!=="hidden";
-  if(q.length){setTimeout(function(){try{window.close();}catch(x){}},0);}
+  var alive=!!d.querySelector("[data-stt-menu-group]")
+    &&d.visibilityState!=="hidden";
   return {q:q,alive:alive};
 })()
 "##;
@@ -409,7 +394,7 @@ pub fn snapshot_json(snapshot: &ConfigSnapshot) -> Option<String> {
 
 /// 能在某个页面里求值的东西 (ws 会话或管道会话); 面板逻辑因此只写一份.
 pub(crate) trait EvalTarget {
-    fn eval(&mut self, js: &str) -> Result<Value, String>;
+    fn eval(&mut self, phase: &str, js: &str) -> Result<Value, String>;
 }
 
 /// 宿主这侧的面板后端.
@@ -596,9 +581,9 @@ pub(crate) fn panel_step(
     role: ViewRole,
 ) -> Result<PanelStepOutcome, String> {
     if !role.enabled {
-        let _ = target.eval(LIBRARY_MENU_TEARDOWN_JS);
+        let _ = target.eval("library_menu_teardown", LIBRARY_MENU_TEARDOWN_JS);
         state.last_managed.remove(key);
-        let res = target.eval(NAV_TEARDOWN_JS)?;
+        let res = target.eval("nav_teardown", NAV_TEARDOWN_JS)?;
         state.forget(key);
         state.open = false;
         return Ok(PanelStepOutcome {
@@ -611,7 +596,7 @@ pub(crate) fn panel_step(
             asked_why: String::new(),
         });
     }
-    let tick = parse_panel_tick(&target.eval(&nav_tick_js(role.hosts_entry))?);
+    let tick = parse_panel_tick(&target.eval("nav_tick", &nav_tick_js(role.hosts_entry))?);
     if let Some(app_id) = tick.menu_app_id {
         state.note_menu_context(key, app_id, tick.menu_point);
     }
@@ -625,12 +610,12 @@ pub(crate) fn panel_step(
     // 库在客户端外壳里, 右键菜单只装那儿; 装一次, 之后每轮只推一次"哪些是我们的".
     if role.hosts_entry && tick.mounted() {
         if !tick.menu_armed {
-            target.eval(LIBRARY_MENU_JS)?;
+            target.eval("library_menu_install", LIBRARY_MENU_JS)?;
         }
         {
             let js = managed_apps_js(&bridge.managed_apps());
             if state.last_managed.get(key) != Some(&js) {
-                target.eval(&js)?;
+                target.eval("managed_apps_update", &js)?;
                 state.last_managed.insert(key.to_owned(), js);
             }
         }
@@ -658,7 +643,7 @@ pub(crate) fn panel_step(
     if !state.open {
         // 关掉了 —— 收干净.
         if tick.has {
-            target.eval(PANEL_CLOSE_JS)?;
+            target.eval("panel_close", PANEL_CLOSE_JS)?;
         }
         state.forget(key);
         return Ok(PanelStepOutcome {
@@ -684,7 +669,7 @@ pub(crate) fn panel_step(
     if owner != Some(key) {
         // 找到了另一个可见视图, 面板需要迁过去 —— 当前文档只负责收干净.
         if tick.has {
-            target.eval(PANEL_CLOSE_JS)?;
+            target.eval("panel_close", PANEL_CLOSE_JS)?;
         }
         state.forget(key);
         return Ok(PanelStepOutcome {
@@ -697,12 +682,12 @@ pub(crate) fn panel_step(
 
     let opened = !tick.has;
     if opened {
-        target.eval(PANEL_JS)?;
+        target.eval("panel_create", PANEL_JS)?;
     }
     if let Some(json) = bridge.snapshot().as_ref().and_then(snapshot_json) {
         // 面板刚开或者内容真的变了才推, 否则 600ms 一轮白跑.
         if opened || state.last_json.get(key) != Some(&json) {
-            target.eval(&panel_update_js(&json))?;
+            target.eval("panel_snapshot_update", &panel_update_js(&json))?;
             state.last_json.insert(key.to_owned(), json);
         }
     }
@@ -945,6 +930,14 @@ mod tests {
         assert_eq!(parse_panel_tick(&json!({"menu_app":0})).menu_app_id, None);
     }
 
+    #[test]
+    fn menu_drain_does_not_fake_keyboard_events_in_the_page() {
+        assert!(LIBRARY_MENU_DRAIN_JS.contains("window.__SteamToolsMenuActions=[]"));
+        assert!(LIBRARY_MENU_DRAIN_JS.contains("return {q:q,alive:alive}"));
+        assert!(!LIBRARY_MENU_DRAIN_JS.contains("KeyboardEvent"));
+        assert!(!LIBRARY_MENU_DRAIN_JS.contains("window.close"));
+    }
+
     /// already 是常态, 不能当成"刚挂上"再打一行日志.
     #[test]
     fn already_is_mounted_but_not_news() {
@@ -1174,7 +1167,7 @@ mod tests {
     }
 
     impl EvalTarget for FakePage {
-        fn eval(&mut self, js: &str) -> Result<Value, String> {
+        fn eval(&mut self, _phase: &str, js: &str) -> Result<Value, String> {
             // tick 脚本带一段前缀 (挂不挂入口的开关), 所以按包含判断.
             if js.ends_with(NAV_TICK_JS) {
                 self.seen.push("tick");
@@ -1434,15 +1427,19 @@ mod tests {
     }
 
     #[test]
-    fn native_menu_injection_clones_existing_items_and_keeps_a_fallback_queue() {
+    fn native_menu_actions_stay_on_the_active_target_until_the_host_drains_them() {
         let js = library_menu_inject_js(42, None);
 
         assert!(js.contains("[role=\"menuitem\"]"));
         assert!(js.contains("sample.cloneNode(false)"));
         assert!(js.contains("parent.querySelector"));
         assert!(js.contains("fitPopup(popupRoot(parent))"));
-        assert!(js.contains("window.opener"));
         assert!(js.contains("__SteamToolsMenuActions"));
+        assert!(!js.contains("window.opener"));
+        assert!(!js.contains("window.close()"));
+        assert!(!LIBRARY_MENU_DRAIN_JS.contains("window.close()"));
+        assert!(!LIBRARY_MENU_DRAIN_JS.contains("KeyboardEvent"));
+        assert!(LIBRARY_MENU_DRAIN_JS.contains("return {q:q,alive:alive}"));
         assert!(js.contains("刷新清单"));
         assert!(js.contains("移除入库"));
         assert!(!js.contains("打开 SteamTools"));

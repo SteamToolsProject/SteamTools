@@ -18,6 +18,7 @@ pub const LIBRARY_UX_HOOK_SYMBOLS: &[&str] = &[
     "FillInAppOverview",
     "BuildCompleteAppOverviewChange",
     "CSteamUIAppControllerRunFrame",
+    "MarkAppChange",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -582,7 +582,13 @@ pub(crate) fn poll_panel_cdp(
             enabled,
             hosts_entry: hosts_nav_entry(&t.url, &t.title),
         };
-        match panel_step(&t.key, &mut ws, bridge, state, role) {
+        let mut page = WsEval {
+            ws: &mut ws,
+            target_id: &t.key,
+            url: &t.url,
+            on_log,
+        };
+        match panel_step(&t.key, &mut page, bridge, state, role) {
             Ok(out) => log_panel_step(&out, &t.title, on_log),
             Err(e) => on_log(format!(
                 "config_ui=page_err title={} {e}",
@@ -602,6 +608,47 @@ pub(crate) fn poll_panel_cdp(
     poll_library_menu_cdp(menu_targets, bridge, state, on_log);
 }
 
+struct WsEval<'a> {
+    ws: &'a mut WsClient,
+    target_id: &'a str,
+    url: &'a str,
+    on_log: &'a mut dyn FnMut(String),
+}
+
+impl EvalTarget for WsEval<'_> {
+    fn eval(&mut self, phase: &str, js: &str) -> Result<Value, String> {
+        let started = Instant::now();
+        let result = self.ws.eval_value(js);
+        let id = self.ws.next_id;
+        if let Err(error) = &result {
+            (self.on_log)(format!(
+                "config_ui=eval transport=ws target={} url={} phase={phase} id={id} elapsed_ms={} class={} error={error}",
+                self.target_id,
+                sanitize_panel_url(self.url),
+                started.elapsed().as_millis(),
+                ws_error_class(error),
+            ));
+        }
+        result
+    }
+}
+
+fn sanitize_panel_url(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
+}
+
+fn ws_error_class(error: &str) -> &'static str {
+    if error.starts_with("cdp error") {
+        "cdp_error"
+    } else if error.starts_with("js error") {
+        "js_exception"
+    } else if error.contains("timed out") {
+        "reply_timeout"
+    } else {
+        "ws_error"
+    }
+}
+
 fn poll_library_menu_cdp(
     targets: &[PageTarget],
     bridge: &mut dyn PanelBridge,
@@ -616,18 +663,28 @@ fn poll_library_menu_cdp(
             state.clear_active_menu();
             return;
         };
-        match WsClient::connect(&target.ws, Duration::from_millis(1500))
-            .and_then(|mut page| page.eval(LIBRARY_MENU_DRAIN_JS))
-        {
-            Ok(value) => {
-                let (alive, dropped) = apply_library_menu_drain(&value, app_id, bridge, state);
-                if dropped > 0 {
-                    on_log(format!("config_ui=library_menu dropped_actions={dropped}"));
+        match WsClient::connect(&target.ws, Duration::from_millis(1500)) {
+            Ok(mut page) => match page.eval("library_menu_drain", LIBRARY_MENU_DRAIN_JS) {
+                Ok(value) => {
+                    let has_actions = value
+                        .get("q")
+                        .and_then(Value::as_array)
+                        .is_some_and(|actions| !actions.is_empty());
+                    let (alive, dropped) = apply_library_menu_drain(&value, app_id, bridge, state);
+                    if dropped > 0 {
+                        on_log(format!("config_ui=library_menu dropped_actions={dropped}"));
+                    }
+                    if has_actions {
+                        if let Err(e) = dispatch_escape(&mut page) {
+                            on_log(format!("config_ui=library_menu escape_err {e}"));
+                        }
+                    }
+                    if !alive {
+                        state.clear_active_menu();
+                    }
                 }
-                if !alive {
-                    state.clear_active_menu();
-                }
-            }
+                Err(_) => state.clear_active_menu(),
+            },
             Err(_) => state.clear_active_menu(),
         }
     }
@@ -639,27 +696,54 @@ fn poll_library_menu_cdp(
         return;
     };
     if let Some(target) = targets.iter().find(|target| target.key == source_key) {
-        let result = WsClient::connect(&target.ws, Duration::from_millis(1500))
-            .and_then(|mut page| page.eval(&library_menu_inject_js(app_id, point)));
-        if let Ok(value) = result {
-            let status = value.get("s").and_then(Value::as_str).unwrap_or("invalid");
-            if matches!(status, "injected" | "already") {
-                state.activate_menu(&target.key, app_id);
+        let result =
+            WsClient::connect(&target.ws, Duration::from_millis(1500)).and_then(|mut page| {
+                page.eval(
+                    "library_menu_install",
+                    &library_menu_inject_js(app_id, point),
+                )
+            });
+        match result {
+            Ok(value) => {
+                let status = value.get("s").and_then(Value::as_str).unwrap_or("invalid");
+                if matches!(status, "injected" | "already") {
+                    state.activate_menu(&target.key, app_id);
+                    on_log(format!(
+                        "config_ui=library_menu {status} app_id={app_id} target=source"
+                    ));
+                    return;
+                }
                 on_log(format!(
-                    "config_ui=library_menu {status} app_id={app_id} target=source"
+                    "config_ui=library_menu inject_miss source state={status} point={point:?}"
                 ));
-                return;
             }
+            Err(e) => on_log(format!("config_ui=library_menu inject_err source {e}")),
         }
+    } else {
+        on_log(format!(
+            "config_ui=library_menu inject_miss source_key_not_found key={source_key}"
+        ));
     }
     for target in targets
         .iter()
         .filter(|target| is_popup_menu_target(&target.url, &target.title))
     {
-        let result = WsClient::connect(&target.ws, Duration::from_millis(1500))
-            .and_then(|mut page| page.eval(&library_menu_inject_js(app_id, None)));
-        let Ok(value) = result else {
-            continue;
+        let result =
+            WsClient::connect(&target.ws, Duration::from_millis(1500)).and_then(|mut page| {
+                page.eval(
+                    "library_menu_install",
+                    &library_menu_inject_js(app_id, None),
+                )
+            });
+        let value = match result {
+            Ok(value) => value,
+            Err(e) => {
+                on_log(format!(
+                    "config_ui=library_menu inject_err popup title={} {e}",
+                    clip(&target.title, 32)
+                ));
+                continue;
+            }
         };
         let status = value.get("s").and_then(Value::as_str).unwrap_or("invalid");
         if matches!(status, "injected" | "already") {
@@ -708,6 +792,23 @@ pub(crate) fn log_panel_step(
     if out.tick.dropped > 0 {
         on_log(format!("config_ui=dropped_intents n={}", out.tick.dropped));
     }
+}
+
+fn dispatch_escape(ws: &mut WsClient) -> Result<(), String> {
+    for event_type in ["keyDown", "keyUp"] {
+        ws.call("Input.dispatchKeyEvent", Some(escape_key_event(event_type)))?;
+    }
+    Ok(())
+}
+
+fn escape_key_event(event_type: &str) -> Value {
+    json!({
+        "type": event_type,
+        "key": "Escape",
+        "code": "Escape",
+        "windowsVirtualKeyCode": 27,
+        "nativeVirtualKeyCode": 27,
+    })
 }
 
 /// 目标列表里的一页.
@@ -1108,6 +1209,9 @@ struct WsClient {
     next_id: u64,
 }
 
+/// 单次 CDP 调用的总时限, 与 pipe 路径的 evaluate 上限一致.
+const WS_CALL_TIMEOUT: Duration = Duration::from_millis(2500);
+
 impl WsClient {
     fn connect(url: &str, timeout: Duration) -> Result<Self, String> {
         let url = url
@@ -1173,8 +1277,34 @@ impl WsClient {
             msg["params"] = p;
         }
         self.send_text(&msg.to_string())?;
+        // 总时限兜底: 把单次读超时收紧到 deadline 内, 这样阻塞的 read
+        // 也会在总时限附近返回, 再经下方 deadline 检查转成明确超时分类 —
+        // 任何丢回复场景都只让这一轮失败, 不把轮询线程永久挂住.
+        let deadline = std::time::Instant::now() + WS_CALL_TIMEOUT;
+        self.stream
+            .set_read_timeout(Some(WS_CALL_TIMEOUT))
+            .map_err(|e| e.to_string())?;
         loop {
-            let raw = self.recv_text()?;
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "reply timeout after {}ms for {method}",
+                    WS_CALL_TIMEOUT.as_millis()
+                ));
+            }
+            let raw = match self.recv_text() {
+                Ok(raw) => raw,
+                Err(e) => {
+                    // 读超时先到 (read timeout == deadline): 归为总时限超时,
+                    // 让上层能按 reply 超时分类, 而不是一堆底层 io 文案.
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "reply timeout after {}ms for {method}",
+                            WS_CALL_TIMEOUT.as_millis()
+                        ));
+                    }
+                    return Err(e);
+                }
+            };
             let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
             if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
                 if let Some(err) = v.get("error") {
@@ -1313,7 +1443,7 @@ impl WsClient {
 }
 
 impl EvalTarget for WsClient {
-    fn eval(&mut self, js: &str) -> Result<Value, String> {
+    fn eval(&mut self, _phase: &str, js: &str) -> Result<Value, String> {
         self.eval_value(js)
     }
 }
@@ -1416,6 +1546,20 @@ mod tests {
     fn evaluate_carries_a_user_gesture() {
         let js = include_str!("cdp_bridge.rs");
         assert_eq!(js.matches("\"userGesture\": true").count(), 1);
+    }
+
+    #[test]
+    fn escape_key_events_use_cdp_input_fields() {
+        let down = escape_key_event("keyDown");
+        let up = escape_key_event("keyUp");
+        for event in [&down, &up] {
+            assert_eq!(event["key"], "Escape");
+            assert_eq!(event["code"], "Escape");
+            assert_eq!(event["windowsVirtualKeyCode"], 27);
+            assert_eq!(event["nativeVirtualKeyCode"], 27);
+        }
+        assert_eq!(down["type"], "keyDown");
+        assert_eq!(up["type"], "keyUp");
     }
 
     /// already/off 是常态, 记进日志就是每 600ms 刷一行.
@@ -1591,5 +1735,49 @@ mod tests {
         assert!(!looks_like_steamui_target(
             "https://store.steampowered.com/app/570/"
         ));
+    }
+
+    /// 服务端握手后不回任何消息时, call 必须在总时限内失败,
+    /// 不能把轮询线程永久挂住 (实机: 外部客户端抢隐式会话后 reply 永不到).
+    #[test]
+    fn ws_call_bounds_reply_wait_with_deadline() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 1];
+            while req.len() < 8192 && !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                if sock.read(&mut tmp).unwrap() == 0 {
+                    break;
+                }
+                req.push(tmp[0]);
+            }
+            // 101 握手完成, 之后保持连接但永不回复.
+            sock.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Upgrade: websocket\r\n\
+                  Connection: Upgrade\r\n\
+                  Sec-WebSocket-Accept: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n\
+                  \r\n",
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(4));
+        });
+
+        let ws_url = format!("ws://{addr}/devtools/page/probe");
+        // 读超时给得比总时限长: 只有 deadline 分支能拦住这次等待.
+        let mut client = WsClient::connect(&ws_url, Duration::from_secs(10)).unwrap();
+        let start = std::time::Instant::now();
+        let err = client.call("Runtime.evaluate", None).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.contains("reply timeout"), "预期超时分类, 实际: {err}");
+        assert!(
+            elapsed >= Duration::from_millis(2500) && elapsed < Duration::from_secs(6),
+            "超时边界不对: {elapsed:?}"
+        );
+        server.join().unwrap();
     }
 }

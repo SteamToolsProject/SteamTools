@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use stt_platform::DevToolsPipe;
@@ -32,9 +32,15 @@ use crate::config_panel::{
 /// 比 ws 版的 1.5s 宽松一点: 管道没有连接建立开销, 但 CEF 忙时回得慢,
 /// 卡死风险由读线程隔离, 不会拖住轮询线程之外的东西.
 const CALL_TIMEOUT: Duration = Duration::from_millis(2500);
+const REPLY_QUEUE_CAPACITY: usize = 64;
+const MAX_PARKED_REPLIES: usize = 256;
 
-/// 通道满时被丢弃的 CDP 帧数 (事件流, 丢帧可接受, 计数供诊断).
-static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
+#[derive(Default)]
+struct PipeFrameCounters {
+    dropped_events: AtomicU64,
+    dropped_replies: AtomicU64,
+    parked_overflows: AtomicU64,
+}
 
 /// 一个 CDP 目标 (页面 / iframe).
 #[derive(Debug, Clone)]
@@ -50,7 +56,8 @@ pub struct CdpPipeSession {
     pipe: Arc<DevToolsPipe>,
     rx: mpsc::Receiver<Value>,
     next_id: u64,
-    /// 已收到但当前调用不认领的消息 (事件等); 留着免得丢掉别人的回复.
+    counters: Arc<PipeFrameCounters>,
+    /// 已收到但当前调用不认领的 reply.
     parked: VecDeque<Value>,
 }
 
@@ -61,18 +68,20 @@ impl CdpPipeSession {
     /// 否则 CEF 一不吭声就会把整条轮询线程钉死.
     pub fn new(pipe: DevToolsPipe) -> Self {
         let pipe = Arc::new(pipe);
-        // 事件流, 满时丢帧可接受: 有界通道封顶读线程积压.
-        let (tx, rx) = mpsc::sync_channel(64);
+        let (tx, rx) = mpsc::sync_channel(REPLY_QUEUE_CAPACITY);
         let reader = Arc::clone(&pipe);
+        let counters = Arc::new(PipeFrameCounters::default());
+        let reader_counters = Arc::clone(&counters);
         // 起不来线程就没人收回复, 后续调用会全部超时 → 验活失败 → 回退端口模式.
         // 这条降级路径本来就有, 所以这里不必额外处理.
         let _ = std::thread::Builder::new()
             .name("cdp-pipe".into())
-            .spawn(move || read_loop(&reader, &tx));
+            .spawn(move || read_loop(&reader, &tx, &reader_counters));
         Self {
             pipe,
             rx,
             next_id: 0,
+            counters,
             parked: VecDeque::new(),
         }
     }
@@ -84,6 +93,9 @@ impl CdpPipeSession {
         params: Option<Value>,
         session: Option<&str>,
     ) -> Result<Value, String> {
+        if self.counters.dropped_replies.load(Ordering::Relaxed) != 0 {
+            return Err(format!("pipe reply_loss: {method}"));
+        }
         self.next_id += 1;
         let id = self.next_id;
         let mut msg = json!({"id": id, "method": method});
@@ -111,13 +123,19 @@ impl CdpPipeSession {
                 .rx
                 .recv_timeout(left)
                 .map_err(|_| format!("pipe timeout: {method}"))?;
+            if self.counters.dropped_replies.load(Ordering::Relaxed) != 0 {
+                return Err(format!("pipe reply_loss: {method}"));
+            }
             if v.get("id").and_then(Value::as_u64) == Some(id) {
                 return unwrap_reply(&v);
             }
-            // 不是给我们的 (事件, 或别的 id): 存着别丢.
-            if self.parked.len() < 256 {
-                self.parked.push_back(v);
+            if self.parked.len() == MAX_PARKED_REPLIES {
+                self.counters
+                    .parked_overflows
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(format!("pipe parked_overflow: {method}"));
             }
+            self.parked.push_back(v);
         }
     }
 
@@ -347,11 +365,26 @@ fn push_store_feedback_pipe(
 struct PipeEval<'a> {
     session: &'a mut CdpPipeSession,
     sid: &'a str,
+    target_id: &'a str,
+    url: &'a str,
+    on_log: &'a mut dyn FnMut(String),
 }
 
 impl EvalTarget for PipeEval<'_> {
-    fn eval(&mut self, js: &str) -> Result<Value, String> {
-        self.session.eval_value(self.sid, js)
+    fn eval(&mut self, phase: &str, js: &str) -> Result<Value, String> {
+        let started = Instant::now();
+        let result = self.session.eval_value(self.sid, js);
+        let id = self.session.next_id;
+        if let Err(error) = &result {
+            (self.on_log)(format!(
+                "config_ui=eval transport=pipe target={} url={} phase={phase} id={id} elapsed_ms={} class={} error={error}",
+                self.target_id,
+                sanitize_url(self.url),
+                started.elapsed().as_millis(),
+                pipe_error_class(error),
+            ));
+        }
+        result
     }
 }
 
@@ -383,7 +416,13 @@ pub(crate) fn poll_panel_pipe(
             hosts_entry: hosts_nav_entry(&t.url, &t.title),
         };
         let stepped = {
-            let mut page = PipeEval { session, sid: &sid };
+            let mut page = PipeEval {
+                session,
+                sid: &sid,
+                target_id: &t.target_id,
+                url: &t.url,
+                on_log,
+            };
             panel_step(&t.target_id, &mut page, bridge, state, role)
         };
         session.detach(&sid);
@@ -417,20 +456,31 @@ fn poll_library_menu_pipe(
             state.clear_active_menu();
             return;
         };
-        let result = session.attach(&target.target_id).and_then(|sid| {
-            let value = session.eval_value(&sid, LIBRARY_MENU_DRAIN_JS);
-            session.detach(&sid);
-            value
-        });
-        match result {
-            Ok(value) => {
-                let (alive, dropped) = apply_library_menu_drain(&value, app_id, bridge, state);
-                if dropped > 0 {
-                    on_log(format!("config_ui=library_menu dropped_actions={dropped}"));
+        match session.attach(&target.target_id) {
+            Ok(sid) => {
+                match session.eval_value(&sid, LIBRARY_MENU_DRAIN_JS) {
+                    Ok(value) => {
+                        let has_actions = value
+                            .get("q")
+                            .and_then(Value::as_array)
+                            .is_some_and(|actions| !actions.is_empty());
+                        let (alive, dropped) =
+                            apply_library_menu_drain(&value, app_id, bridge, state);
+                        if dropped > 0 {
+                            on_log(format!("config_ui=library_menu dropped_actions={dropped}"));
+                        }
+                        if has_actions {
+                            if let Err(e) = dispatch_escape(session, &sid) {
+                                on_log(format!("config_ui=library_menu escape_err {e}"));
+                            }
+                        }
+                        if !alive {
+                            state.clear_active_menu();
+                        }
+                    }
+                    Err(_) => state.clear_active_menu(),
                 }
-                if !alive {
-                    state.clear_active_menu();
-                }
+                session.detach(&sid);
             }
             Err(_) => state.clear_active_menu(),
         }
@@ -487,6 +537,47 @@ fn poll_library_menu_pipe(
             ));
         }
     }
+}
+
+fn dispatch_escape(session: &mut CdpPipeSession, sid: &str) -> Result<(), String> {
+    for event_type in ["keyDown", "keyUp"] {
+        session.call(
+            "Input.dispatchKeyEvent",
+            Some(escape_key_event(event_type)),
+            Some(sid),
+        )?;
+    }
+    Ok(())
+}
+
+fn sanitize_url(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
+}
+
+fn pipe_error_class(error: &str) -> &'static str {
+    if error.starts_with("pipe reply_loss") {
+        "reply_loss"
+    } else if error.starts_with("pipe parked_overflow") {
+        "parked_overflow"
+    } else if error.starts_with("pipe timeout") {
+        "reply_timeout"
+    } else if error.starts_with("cdp error") {
+        "cdp_error"
+    } else if error.starts_with("js error") {
+        "js_exception"
+    } else {
+        "pipe_error"
+    }
+}
+
+fn escape_key_event(event_type: &str) -> Value {
+    json!({
+        "type": event_type,
+        "key": "Escape",
+        "code": "Escape",
+        "windowsVirtualKeyCode": 27,
+        "nativeVirtualKeyCode": 27,
+    })
 }
 
 /// 等 detour 把管道交出来 (webhelper 得先被拉起来).
@@ -626,8 +717,12 @@ fn str_field(v: &Value, key: &str) -> String {
         .to_owned()
 }
 
-/// 读线程: 按 `\0` 切帧, 解析成 JSON 丢给主逻辑.
-fn read_loop(pipe: &DevToolsPipe, tx: &mpsc::SyncSender<Value>) {
+/// 读线程: 按 `\0` 切帧, 解析后先区分 event 与 reply.
+fn read_loop(
+    pipe: &DevToolsPipe,
+    reply_tx: &mpsc::SyncSender<Value>,
+    counters: &PipeFrameCounters,
+) {
     let mut acc: Vec<u8> = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     loop {
@@ -642,19 +737,34 @@ fn read_loop(pipe: &DevToolsPipe, tx: &mpsc::SyncSender<Value>) {
             let Ok(v) = serde_json::from_slice::<Value>(&frame[..i]) else {
                 continue; // 坏帧丢掉, 不拖累后面的
             };
-            match tx.try_send(v) {
-                Ok(()) => {}
-                // 满时丢新帧可接受 (事件流), 不能阻塞读线程.
-                Err(mpsc::TrySendError::Full(_)) => {
-                    DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => return, // 会话没了
+            if !dispatch_frame(v, reply_tx, counters) {
+                return;
             }
         }
         // 防御: 对端一直不发 \0 就别无限涨.
         if acc.len() > 64 * 1024 * 1024 {
             return;
         }
+    }
+}
+
+/// 返回 false 表示会话已关闭, 读线程应停止.
+fn dispatch_frame(
+    frame: Value,
+    reply_tx: &mpsc::SyncSender<Value>,
+    counters: &PipeFrameCounters,
+) -> bool {
+    if frame.get("id").is_none() {
+        counters.dropped_events.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    match reply_tx.try_send(frame) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(_)) => {
+            counters.dropped_replies.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -682,15 +792,72 @@ mod tests {
     }
 
     #[test]
-    fn bounded_channel_full_drops_without_blocking() {
-        // 有界通道: 满时 try_send 立即返回 Full, 不阻塞读线程; 接收侧照常工作.
-        let (tx, rx) = mpsc::sync_channel::<u32>(4);
-        for i in 0..8 {
-            let r = tx.try_send(i);
-            assert!(r.is_ok() || matches!(r, Err(mpsc::TrySendError::Full(_))));
+    fn escape_key_events_use_cdp_input_fields() {
+        let down = escape_key_event("keyDown");
+        let up = escape_key_event("keyUp");
+        for event in [&down, &up] {
+            assert_eq!(event["key"], "Escape");
+            assert_eq!(event["code"], "Escape");
+            assert_eq!(event["windowsVirtualKeyCode"], 27);
+            assert_eq!(event["nativeVirtualKeyCode"], 27);
         }
-        // 只送出容量内的帧, 多出的被丢; 接收侧 API 与普通 channel 一致.
-        assert_eq!(rx.recv_timeout(Duration::from_millis(100)).unwrap(), 0);
-        assert_eq!(rx.try_iter().count(), 3);
+        assert_eq!(down["type"], "keyDown");
+        assert_eq!(up["type"], "keyUp");
+    }
+
+    #[test]
+    fn event_flood_keeps_reply_deliverable() {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let counters = PipeFrameCounters::default();
+
+        for _ in 0..128 {
+            assert!(dispatch_frame(
+                json!({"method": "Runtime.executionContextCreated"}),
+                &reply_tx,
+                &counters,
+            ));
+        }
+        assert!(dispatch_frame(
+            json!({"id": 7, "result": {}}),
+            &reply_tx,
+            &counters
+        ));
+
+        assert_eq!(counters.dropped_events.load(Ordering::Relaxed), 128);
+        assert_eq!(
+            reply_rx.recv_timeout(Duration::from_millis(100)).unwrap()["id"],
+            7
+        );
+    }
+
+    #[test]
+    fn reply_overflow_is_counted_for_explicit_degradation() {
+        let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
+        let counters = PipeFrameCounters::default();
+
+        assert!(dispatch_frame(
+            json!({"id": 1, "result": {}}),
+            &reply_tx,
+            &counters
+        ));
+        assert!(dispatch_frame(
+            json!({"id": 2, "result": {}}),
+            &reply_tx,
+            &counters
+        ));
+
+        assert_eq!(counters.dropped_replies.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn diagnostics_strip_url_query_and_classify_reply_loss() {
+        assert_eq!(
+            sanitize_url("https://store.test/path?secret=value"),
+            "https://store.test/path"
+        );
+        assert_eq!(
+            pipe_error_class("pipe reply_loss: Runtime.evaluate"),
+            "reply_loss"
+        );
     }
 }

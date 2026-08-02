@@ -47,6 +47,7 @@ struct LibraryHooks {
     run_frame: InlineHook,
     fill_in: InlineHook,
     build_complete: InlineHook,
+    mark_change: InlineHook,
 }
 
 // InlineHook 仅含本进程地址; attach/detach 由 HOOKS 锁串行.
@@ -58,6 +59,7 @@ static RUN_FRAME_HITS: AtomicU64 = AtomicU64::new(0);
 static DRAINED: AtomicU64 = AtomicU64::new(0);
 static FILL_IN_HITS: AtomicU64 = AtomicU64::new(0);
 static BUILD_COMPLETE_HITS: AtomicU64 = AtomicU64::new(0);
+static MARK_CHANGE_HITS: AtomicU64 = AtomicU64::new(0);
 
 static UX: std::sync::OnceLock<&'static LibraryUx> = std::sync::OnceLock::new();
 
@@ -70,13 +72,14 @@ fn ux() -> Option<&'static LibraryUx> {
     UX.get().copied()
 }
 
-/// 供 host.log / 工具中心统计.
-pub fn library_detour_stats() -> (u64, u64, u64, u64) {
+/// 供 host.log / 工具中心统计: (run_frame, drained, fill_in, build_complete, mark_change).
+pub fn library_detour_stats() -> (u64, u64, u64, u64, u64) {
     (
         RUN_FRAME_HITS.load(Ordering::Relaxed),
         DRAINED.load(Ordering::Relaxed),
         FILL_IN_HITS.load(Ordering::Relaxed),
         BUILD_COMPLETE_HITS.load(Ordering::Relaxed),
+        MARK_CHANGE_HITS.load(Ordering::Relaxed),
     )
 }
 
@@ -210,6 +213,11 @@ pub fn try_install_library_detours(
             Ok(h) => h,
             Err(e) => return report.with_detail(format!("BuildComplete hook new: {e}")),
         };
+    let mut mark_change =
+        match unsafe { InlineHook::new(mark_change_addr, hk_mark_app_change as *const c_void) } {
+            Ok(h) => h,
+            Err(e) => return report.with_detail(format!("MarkAppChange hook new: {e}")),
+        };
 
     // # Safety
     // 逐个 attach; 失败时回滚已挂的.
@@ -225,15 +233,24 @@ pub fn try_install_library_detours(
         let _ = unsafe { fill_in.detach() };
         return report.with_detail(format!("BuildComplete attach failed: {e}"));
     }
+    if let Err(e) = unsafe { mark_change.attach() } {
+        let _ = unsafe { run_frame.detach() };
+        let _ = unsafe { fill_in.detach() };
+        let _ = unsafe { build_complete.detach() };
+        return report.with_detail(format!("MarkAppChange attach failed: {e}"));
+    }
 
     *slot = Some(LibraryHooks {
         run_frame,
         fill_in,
         build_complete,
+        mark_change,
     });
     ATTACHED.store(true, Ordering::SeqCst);
     report.status = LibraryUxInstallStatus::HooksAttached;
-    report.with_detail("attached RunFrame+FillInAppOverview+BuildCompleteAppOverviewChange")
+    report.with_detail(
+        "attached RunFrame+FillInAppOverview+BuildCompleteAppOverviewChange+MarkAppChange",
+    )
 }
 
 /// 卸补丁 → 调原入口 → 再挂上. 持 HOOKS 锁, 避免并发补丁竞态.
@@ -249,12 +266,13 @@ unsafe fn call_while_unhooked<R>(f: impl FnOnce() -> R) -> Option<R> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(hooks) = slot.as_mut() {
         // 逐个卸补丁 (只卸仍挂着的); 任一失败立即 fail-closed, 不再调原函数.
-        let mut detached: Vec<&mut InlineHook> = Vec::with_capacity(3);
+        let mut detached: Vec<&mut InlineHook> = Vec::with_capacity(4);
         let mut detach_failed = false;
         for h in [
             &mut hooks.run_frame,
             &mut hooks.fill_in,
             &mut hooks.build_complete,
+            &mut hooks.mark_change,
         ] {
             if !h.is_installed() {
                 continue;
@@ -290,6 +308,34 @@ fn reattach_detached(detached: &mut [&mut InlineHook]) {
 }
 
 /// # Safety
+/// MarkAppChange detour: 首次调用捕获 this (CUpdateManager*), 供移除 drain 通知 UI.
+///
+/// # Safety
+/// 签名与 steamui MarkAppChange 一致 (fastcall: rcx=this, rdx=app_id, r8=flags).
+unsafe extern "C" fn hk_mark_app_change(
+    source: *mut c_void,
+    app_id: u32,
+    flags: u64,
+) -> *mut c_void {
+    MARK_CHANGE_HITS.fetch_add(1, Ordering::Relaxed);
+    if !source.is_null() {
+        APP_CHANGE_SOURCE.store(source, Ordering::SeqCst);
+    }
+    let target = FN_MARK_APP_CHANGE.load(Ordering::SeqCst);
+    if target.is_null() {
+        return std::ptr::null_mut();
+    }
+    // # Safety
+    // 卸补丁后 target 即原入口; 补丁已摘, 不会再进本 detour.
+    unsafe {
+        call_while_unhooked(|| {
+            let f: MarkAppChangeFn = std::mem::transmute(target);
+            f(source, app_id, flags)
+        })
+        .unwrap_or(std::ptr::null_mut())
+    }
+}
+
 /// 作为 CSteamUIAppController::RunFrame detour; this 是 controller.
 unsafe extern "C" fn hk_run_frame(controller: *mut c_void) -> *mut c_void {
     RUN_FRAME_HITS.fetch_add(1, Ordering::Relaxed);
@@ -354,12 +400,14 @@ fn drain_removals(ux: &LibraryUx, controller: *mut c_void, pending: &[AppId]) {
             }
         }
         // # Safety
-        // source 首次调用时捕获 (对标 CAPTURE_THIS).
+        // source 由 MarkAppChange detour 捕获 (对标 CAPTURE_THIS); 调用前卸补丁.
         let source = APP_CHANGE_SOURCE.load(Ordering::Relaxed);
         if !source.is_null() {
             unsafe {
-                let f: MarkAppChangeFn = std::mem::transmute(mark);
-                f(source, app_id, E_APP_CHANGE_FLAGS_APP_INFO_OR_CONFIG);
+                call_while_unhooked(|| {
+                    let f: MarkAppChangeFn = std::mem::transmute(mark);
+                    f(source, app_id, E_APP_CHANGE_FLAGS_APP_INFO_OR_CONFIG)
+                });
             }
         }
     }
