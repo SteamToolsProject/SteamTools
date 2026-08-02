@@ -10,8 +10,9 @@ use stt_core::{AppId, CatalogBundle, DepotId, ManifestOverride};
 use stt_platform::{winhttp_get, HttpError, WinHttpGetOptions};
 
 use crate::{
-    community::collect_vdf_keys, validate_bundle, CatalogError, CatalogFetchOutcome,
-    CatalogProvider, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, ProviderErrorKind,
+    keys_parse::collect_vdf_keys, validate_bundle, CatalogEnricher, CatalogError,
+    CatalogFetchOutcome, CatalogProvider, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome,
+    EnrichContext, ProviderErrorKind,
 };
 
 const PROVIDER: &str = "community:caigamer";
@@ -50,36 +51,7 @@ impl CaigamerCatalogProvider {
     }
 
     fn fetch_outcome(&self, app_id: AppId) -> CatalogResult<CatalogFetchOutcome> {
-        let url = self
-            .url_template
-            .replacen("{app_id}", &app_id.to_string(), 1);
-        let response = winhttp_get(&url, self.options).map_err(map_http_error)?;
-        if !(200..300).contains(&response.status) {
-            let kind = if response.status == 404 {
-                ProviderErrorKind::NotFound
-            } else {
-                ProviderErrorKind::Rejected
-            };
-            return Err(provider_error(
-                format!("HTTP status {}", response.status),
-                kind,
-            ));
-        }
-
-        let decrypted = rc4(RC4_KEY, &response.body);
-        if decrypted.len() > MAX_DECRYPTED_BYTES {
-            return Err(CatalogError::PayloadTooLarge {
-                actual: decrypted.len(),
-                limit: MAX_DECRYPTED_BYTES,
-            });
-        }
-        let text = std::str::from_utf8(&decrypted).map_err(|_| {
-            provider_error(
-                "decrypted response is not UTF-8",
-                ProviderErrorKind::Rejected,
-            )
-        })?;
-        let fields = parse_python_string_dict(text)?;
+        let fields = self.fetch_fields(app_id)?;
         let key_text = fields
             .get("Key")
             .ok_or_else(|| provider_error("missing Key field", ProviderErrorKind::NotFound))?;
@@ -116,8 +88,73 @@ impl CaigamerCatalogProvider {
                 provider: PROVIDER.to_owned(),
                 outcome: CatalogTraceOutcome::Hit,
             }],
+            manifest_blobs: Vec::new(),
         })
     }
+
+    /// 请求 + RC4 解密 + Python dict 解析 (fetch_outcome 与补全接口共用).
+    fn fetch_fields(
+        &self,
+        app_id: AppId,
+    ) -> CatalogResult<std::collections::HashMap<String, String>> {
+        let url = self
+            .url_template
+            .replacen("{app_id}", &app_id.to_string(), 1);
+        let response = winhttp_get(&url, self.options).map_err(map_http_error)?;
+        if !(200..300).contains(&response.status) {
+            let kind = if response.status == 404 {
+                ProviderErrorKind::NotFound
+            } else {
+                ProviderErrorKind::Rejected
+            };
+            return Err(provider_error(
+                format!("HTTP status {}", response.status),
+                kind,
+            ));
+        }
+
+        let decrypted = rc4(RC4_KEY, &response.body);
+        if decrypted.len() > MAX_DECRYPTED_BYTES {
+            return Err(CatalogError::PayloadTooLarge {
+                actual: decrypted.len(),
+                limit: MAX_DECRYPTED_BYTES,
+            });
+        }
+        let text = std::str::from_utf8(&decrypted).map_err(|_| {
+            provider_error(
+                "decrypted response is not UTF-8",
+                ProviderErrorKind::Rejected,
+            )
+        })?;
+        parse_python_string_dict(text)
+    }
+
+    /// 补全用: 一次请求拿全部 depot keys (不过滤 declared, 覆盖共享 depot)
+    /// 与 config 里的 app_token (0 视为未收录).
+    pub(crate) fn fetch_for_enrich(&self, app_id: AppId) -> CatalogResult<CaigamerEnrich> {
+        let fields = self.fetch_fields(app_id)?;
+        let mut depot_keys = HashMap::new();
+        if let Some(key_text) = fields.get("Key") {
+            collect_vdf_keys(PROVIDER, key_text, &mut depot_keys)?;
+        }
+        let access_token = fields
+            .get("config")
+            .and_then(|config| find_access_token(config).ok().flatten())
+            .filter(|&token| token != 0);
+        Ok(CaigamerEnrich {
+            depot_keys,
+            access_token,
+        })
+    }
+}
+
+/// 一次 caigamer 请求取回的补全数据 (key 全量 + token).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CaigamerEnrich {
+    /// 全部 Key 字段解析出的 depot keys, 不过滤 declared.
+    pub depot_keys: HashMap<DepotId, String>,
+    /// config 字段里的 app_token; 0 或缺失为 None.
+    pub access_token: Option<u64>,
 }
 
 impl CatalogProvider for CaigamerCatalogProvider {
@@ -131,6 +168,103 @@ impl CatalogProvider for CaigamerCatalogProvider {
 
     fn fetch_with_trace(&self, app_id: AppId) -> CatalogResult<CatalogFetchOutcome> {
         self.fetch_outcome(app_id)
+    }
+}
+
+/// Community 成功路径上的 best-effort 补全 (不覆盖已有 key).
+impl CatalogEnricher for CaigamerCatalogProvider {
+    fn id(&self) -> &str {
+        PROVIDER
+    }
+
+    fn enrich(&self, ctx: &mut EnrichContext<'_>) {
+        let missing_keys: Vec<DepotId> = ctx
+            .bundle
+            .app_depots
+            .values()
+            .flatten()
+            .copied()
+            .filter(|depot_id| !ctx.bundle.depot_keys.contains_key(depot_id))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        // 与 missing_download_data 对齐: requires_token=false 不补;
+        // token 0 视为未收录 (上游用 0 占位).
+        let need_token = ctx.bundle.requires_token != Some(false)
+            && ctx
+                .bundle
+                .access_tokens
+                .get(&ctx.app_id)
+                .copied()
+                .unwrap_or(0)
+                == 0;
+        if missing_keys.is_empty() && !need_token {
+            return;
+        }
+        let enrich = match self.fetch_for_enrich(ctx.app_id) {
+            Ok(enrich) => enrich,
+            Err(error) => {
+                let kind = classify_provider_err(&error);
+                if !missing_keys.is_empty() {
+                    ctx.trace.push(CatalogTraceEntry {
+                        provider: "community:caigamer_key".to_owned(),
+                        outcome: CatalogTraceOutcome::Failed(kind),
+                    });
+                }
+                if need_token {
+                    ctx.trace.push(CatalogTraceEntry {
+                        provider: "community:caigamer_token".to_owned(),
+                        outcome: CatalogTraceOutcome::Failed(kind),
+                    });
+                }
+                return;
+            }
+        };
+        if !missing_keys.is_empty() {
+            let mut filled = 0;
+            for depot_id in &missing_keys {
+                if let Some(key) = enrich.depot_keys.get(depot_id) {
+                    if !ctx.bundle.depot_keys.contains_key(depot_id) {
+                        ctx.bundle.depot_keys.insert(*depot_id, key.clone());
+                        filled += 1;
+                    }
+                }
+            }
+            if filled > 0 {
+                ctx.trace.push(CatalogTraceEntry {
+                    provider: "community:caigamer_key".to_owned(),
+                    outcome: CatalogTraceOutcome::Hit,
+                });
+            } else {
+                ctx.trace.push(CatalogTraceEntry {
+                    provider: "community:caigamer_key".to_owned(),
+                    outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
+                });
+            }
+        }
+        if need_token {
+            match enrich.access_token {
+                Some(token) => {
+                    ctx.bundle.access_tokens.insert(ctx.app_id, token);
+                    ctx.trace.push(CatalogTraceEntry {
+                        provider: "community:caigamer_token".to_owned(),
+                        outcome: CatalogTraceOutcome::Hit,
+                    });
+                }
+                None => ctx.trace.push(CatalogTraceEntry {
+                    provider: "community:caigamer_token".to_owned(),
+                    outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
+                }),
+            }
+        }
+    }
+}
+
+fn classify_provider_err(error: &CatalogError) -> ProviderErrorKind {
+    match error {
+        CatalogError::Provider { kind, .. } => *kind,
+        CatalogError::RequestedAppMissing(_) => ProviderErrorKind::NotFound,
+        _ => ProviderErrorKind::Rejected,
     }
 }
 

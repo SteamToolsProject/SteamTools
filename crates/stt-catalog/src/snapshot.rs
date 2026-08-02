@@ -15,6 +15,8 @@ const MAX_TOKEN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_KEY_ENTRIES: usize = 500_000;
 const MAX_TOKEN_ENTRIES: usize = 100_000;
 
+/// key 源: 前两项双镜像对账; 之后单源回退 (github_raw → sudama → catmisteam).
+/// catmisteam 体量更小 (调研 ~17.5 万), 只作末位回退, 可能有个别独有条目.
 const KEY_SOURCES: &[(&str, &str)] = &[
     (
         "jsdmirror",
@@ -29,10 +31,26 @@ const KEY_SOURCES: &[(&str, &str)] = &[
         "https://raw.githubusercontent.com/AQiaoYo/ManifestHub/main/depotkeys.json",
     ),
     ("sudama", "https://api.993499094.xyz/depotkeys.json"),
+    ("catmisteam", "https://catmisteam.com/depotkeys.json"),
 ];
 
-const TOKEN_SOURCES: &[(&str, &str)] =
-    &[("sudama", "https://api.993499094.xyz/appaccesstokens.json")];
+/// token 源: sudama 优先 (8173 条最全); ManifestHub 家族 (5090 条) 是 sudama
+/// 的子集 (实测 0 独有), 只作 sudama 不可达时的 GitHub 回退.
+const TOKEN_SOURCES: &[(&str, &str)] = &[
+    ("sudama", "https://api.993499094.xyz/appaccesstokens.json"),
+    (
+        "manifesthub_jsdmirror",
+        "https://cdn.jsdmirror.com/gh/steamtools-games/ManifestHub3@main/appaccesstokens.json",
+    ),
+    (
+        "manifesthub_ghfast",
+        "https://ghfast.top/https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/appaccesstokens.json",
+    ),
+    (
+        "manifesthub_raw",
+        "https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/appaccesstokens.json",
+    ),
+];
 
 /// 单份 Community 快照的准备状态.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,7 +415,30 @@ mod tests {
                 .iter()
                 .map(|(source, _)| *source)
                 .collect::<Vec<_>>(),
-            ["jsdmirror", "ghfast", "github_raw", "sudama"]
+            [
+                "jsdmirror",
+                "ghfast",
+                "github_raw",
+                "sudama",
+                "catmisteam"
+            ]
+        );
+    }
+
+    /// sudama 最全 (8173), 必须排最前; ManifestHub 家族只作回退.
+    #[test]
+    fn token_snapshot_sudama_takes_priority_over_manifesthub_fallback() {
+        assert_eq!(
+            TOKEN_SOURCES
+                .iter()
+                .map(|(source, _)| *source)
+                .collect::<Vec<_>>(),
+            [
+                "sudama",
+                "manifesthub_jsdmirror",
+                "manifesthub_ghfast",
+                "manifesthub_raw"
+            ]
         );
     }
 

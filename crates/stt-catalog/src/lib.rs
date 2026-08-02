@@ -4,18 +4,23 @@
 //! [`validate_bundle`], 才能交给配置层持久化.
 
 mod caigamer;
+mod catmisteam;
 mod chain;
 mod community;
+mod enrich;
 mod error;
 mod http;
+mod keys_parse;
 mod mock;
 mod snapshot;
 mod validate;
 mod wire;
 
 pub use caigamer::CaigamerCatalogProvider;
+pub use catmisteam::CatmisteamCatalogProvider;
 pub use chain::CatalogProviderChain;
 pub use community::CommunityCatalogProvider;
+pub use enrich::{CatalogEnricher, EnrichContext};
 pub use error::{
     CatalogError, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, ProviderErrorKind,
 };
@@ -36,12 +41,25 @@ pub(crate) fn http_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// 一份原始 depot manifest 文件 (不进 CatalogBundle / lua).
+///
+/// Fluent 系工具把这些字节写到 `depotcache/{depot}_{gid}.manifest`, 让 Steam
+/// 不依赖在线 request-code 也能读到清单. key 用 (depot, gid) 对齐文件名契约.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestBlob {
+    pub depot_id: stt_core::DepotId,
+    pub manifest_gid: u64,
+    pub bytes: Vec<u8>,
+}
+
 /// Catalog 获取结果及 provider chain 诊断.
 #[derive(Debug, Clone)]
 pub struct CatalogFetchOutcome {
     pub bundle: CatalogBundle,
     pub source: String,
     pub trace: Vec<CatalogTraceEntry>,
+    /// 可选的原始 .manifest 字节 (archive 源); 默认空.
+    pub manifest_blobs: Vec<ManifestBlob>,
 }
 
 /// 按 AppId 获取完整入库元数据的运行时 provider.
@@ -67,6 +85,7 @@ pub trait CatalogProvider: Send + Sync {
                 provider: self.id().to_owned(),
                 outcome: CatalogTraceOutcome::Hit,
             }],
+            manifest_blobs: Vec::new(),
         })
     }
 }

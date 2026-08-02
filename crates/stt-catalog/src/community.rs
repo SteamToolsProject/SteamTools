@@ -14,8 +14,9 @@ use stt_platform::{
 use zip::ZipArchive;
 
 use crate::{
-    caigamer::CaigamerCatalogProvider, validate_bundle, CatalogError, CatalogFetchOutcome,
-    CatalogLimits, CatalogProvider, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome,
+    caigamer::CaigamerCatalogProvider, catmisteam::CatmisteamCatalogProvider, keys_parse,
+    validate_bundle, CatalogEnricher, CatalogError, CatalogFetchOutcome, CatalogLimits,
+    CatalogProvider, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, EnrichContext,
     ProviderErrorKind,
 };
 
@@ -28,8 +29,6 @@ const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ARCHIVE_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE_NAME_BYTES: usize = 4096;
-const MAX_VDF_DEPTH: usize = 16;
-const MAX_VDF_NODES: usize = 8192;
 
 #[derive(Debug, Clone)]
 struct HttpMetadataSource {
@@ -56,6 +55,8 @@ impl ArchiveSource {
 struct ArchiveCatalogData {
     depot_keys: HashMap<DepotId, String>,
     manifests: HashMap<DepotId, ManifestOverride>,
+    /// 原始 .manifest 文件字节, key = (depot_id, manifest_gid).
+    manifest_blobs: HashMap<(DepotId, u64), Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,14 +86,16 @@ impl HttpMetadataSource {
 }
 
 /// 内置社区源. 元数据、key 和 token 分能力获取后统一校验.
-#[derive(Debug, Clone)]
+///
+/// 补全走 [`CatalogEnricher`] 有序列表 (默认 CatMisteam → CaiGamer);
+/// 完整源失败时 host 链上另有独立的 CatMisteam / CaiGamer `CatalogProvider` 兜底.
 pub struct CommunityCatalogProvider {
     cache_dir: PathBuf,
     options: WinHttpGetOptions,
     metadata_sources: Vec<HttpMetadataSource>,
     archive_sources: Vec<ArchiveSource>,
-    /// access token 缺失时的补充源 (CaiGames appinfo 内含 app_token).
-    caigamer: Option<CaigamerCatalogProvider>,
+    /// 成功拿到 metadata 后按序补全; 私有源可 push 到此列表.
+    enrichers: Vec<Box<dyn CatalogEnricher>>,
     max_snapshot_bytes: usize,
     max_archive_bytes: usize,
 }
@@ -105,18 +108,29 @@ impl CommunityCatalogProvider {
             options,
             metadata_sources: built_in_metadata_sources(),
             archive_sources: built_in_archive_sources(),
-            caigamer: Some(CaigamerCatalogProvider::new(options)),
+            // 默认补全: 无加密的 CatMisteam 先试, 再 CaiGamer (RC4).
+            // URL/解析都在各自模块, 这里只装配.
+            enrichers: vec![
+                Box::new(CatmisteamCatalogProvider::new(options)),
+                Box::new(CaigamerCatalogProvider::new(options)),
+            ],
             max_snapshot_bytes: MAX_SNAPSHOT_BYTES,
             max_archive_bytes: MAX_ARCHIVE_BYTES,
         }
     }
 
+    /// 追加补全器 (例如私有解密 key 源). 排在默认列表之后.
+    pub fn push_enricher(&mut self, enricher: Box<dyn CatalogEnricher>) {
+        self.enrichers.push(enricher);
+    }
+
     fn fetch_outcome(&self, app_id: AppId) -> CatalogResult<CatalogFetchOutcome> {
         let mut trace =
             Vec::with_capacity(self.metadata_sources.len() + self.archive_sources.len() + 4);
+        let mut manifest_blobs = Vec::new();
         let metadata = self
             .fetch_metadata(app_id, &mut trace)
-            .or_else(|| self.fetch_archive_metadata(app_id, &mut trace));
+            .or_else(|| self.fetch_archive_metadata(app_id, &mut trace, &mut manifest_blobs));
         let Some((mut bundle, source)) = metadata else {
             return Err(CatalogError::ChainExhausted { trace });
         };
@@ -126,17 +140,12 @@ impl CommunityCatalogProvider {
             Err(error) => trace.push(failed_trace("community:key_snapshot", &error)),
         }
         if !missing_depot_keys(&bundle).is_empty() {
-            self.enrich_archive_keys(app_id, &mut bundle, &mut trace);
+            self.enrich_archive_keys(app_id, &mut bundle, &mut trace, &mut manifest_blobs);
         }
-        let missing = missing_depot_keys(&bundle);
-        if !missing.is_empty() {
-            trace.push(CatalogTraceEntry {
-                provider: "community:key_completeness".to_owned(),
-                outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
-            });
-            return Err(CatalogError::ChainExhausted { trace });
+        // 元数据链命中时 archive 可能还没被拉过; 尽力补 .manifest 字节 (Fluent 路径).
+        if manifest_blobs.is_empty() && !bundle.manifests.is_empty() {
+            self.enrich_manifest_blobs(app_id, &bundle, &mut trace, &mut manifest_blobs);
         }
-
         match self.enrich_access_token(app_id, &mut bundle) {
             Ok(true) => trace.push(hit_trace("community:token_snapshot")),
             Ok(false) => {
@@ -144,11 +153,20 @@ impl CommunityCatalogProvider {
                     provider: "community:token_snapshot".to_owned(),
                     outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
                 });
-                // 快照没 token 不代表没有: CaiGames 的 appinfo 内含 app_token,
-                // 元数据命中但 token 缺失时用它补一次 (入库不阻塞, 补不上就提示).
-                self.enrich_token_from_caigamer(app_id, &mut bundle, &mut trace);
             }
             Err(error) => trace.push(failed_trace("community:token_snapshot", &error)),
+        }
+        // 可插拔补全 (默认 CatMisteam → CaiGamer; 私有源经 push_enricher 追加).
+        {
+            let mut ctx = EnrichContext {
+                app_id,
+                bundle: &mut bundle,
+                manifest_blobs: &mut manifest_blobs,
+                trace: &mut trace,
+            };
+            for enricher in &self.enrichers {
+                enricher.enrich(&mut ctx);
+            }
         }
 
         let bundle = validate_bundle(app_id, bundle)?;
@@ -156,6 +174,7 @@ impl CommunityCatalogProvider {
             bundle,
             source: source.to_owned(),
             trace,
+            manifest_blobs,
         })
     }
 
@@ -180,6 +199,7 @@ impl CommunityCatalogProvider {
         &self,
         app_id: AppId,
         trace: &mut Vec<CatalogTraceEntry>,
+        manifest_blobs: &mut Vec<crate::ManifestBlob>,
     ) -> Option<(CatalogBundle, &'static str)> {
         for source in &self.archive_sources {
             match self.fetch_archive(source, app_id) {
@@ -194,6 +214,7 @@ impl CommunityCatalogProvider {
                     };
                     match validate_bundle(app_id, bundle) {
                         Ok(bundle) => {
+                            append_manifest_blobs(manifest_blobs, data.manifest_blobs);
                             trace.push(hit_trace(source.id));
                             return Some((bundle, source.id));
                         }
@@ -233,6 +254,7 @@ impl CommunityCatalogProvider {
         app_id: AppId,
         bundle: &mut CatalogBundle,
         trace: &mut Vec<CatalogTraceEntry>,
+        manifest_blobs: &mut Vec<crate::ManifestBlob>,
     ) {
         for source in &self.archive_sources {
             let data = match self.fetch_archive(source, app_id) {
@@ -242,6 +264,8 @@ impl CommunityCatalogProvider {
                     continue;
                 }
             };
+            // 顺手收下 ZIP 里的 .manifest 字节 (与 key 共用一次下载).
+            merge_matching_manifest_blobs(bundle, &data.manifest_blobs, manifest_blobs);
             match merge_archive_keys(bundle, data.depot_keys) {
                 Ok(0) => trace.push(CatalogTraceEntry {
                     provider: source.id.to_owned(),
@@ -254,6 +278,52 @@ impl CommunityCatalogProvider {
                 }
             }
             if missing_depot_keys(bundle).is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// 只为补 .manifest 字节拉 archive (元数据已从 steamcmd 等拿到时).
+    fn enrich_manifest_blobs(
+        &self,
+        app_id: AppId,
+        bundle: &CatalogBundle,
+        trace: &mut Vec<CatalogTraceEntry>,
+        manifest_blobs: &mut Vec<crate::ManifestBlob>,
+    ) {
+        let needed = declared_depot_ids(bundle);
+        if needed.is_empty() {
+            return;
+        }
+        for source in &self.archive_sources {
+            let data = match self.fetch_archive(source, app_id) {
+                Ok(data) => data,
+                Err(error) => {
+                    trace.push(failed_trace(
+                        &format!("{}:manifest_blob", source.id),
+                        &error,
+                    ));
+                    continue;
+                }
+            };
+            let before = manifest_blobs.len();
+            merge_matching_manifest_blobs(bundle, &data.manifest_blobs, manifest_blobs);
+            if manifest_blobs.len() > before {
+                trace.push(hit_trace(&format!("{}:manifest_blob", source.id)));
+            } else {
+                trace.push(CatalogTraceEntry {
+                    provider: format!("{}:manifest_blob", source.id),
+                    outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
+                });
+            }
+            // 已声明的 depot 都有 blob 就停.
+            if needed.iter().all(|depot| {
+                bundle.manifests.get(depot).is_some_and(|over| {
+                    manifest_blobs.iter().any(|blob| {
+                        blob.depot_id == *depot && blob.manifest_gid == over.manifest_gid
+                    })
+                })
+            }) {
                 return;
             }
         }
@@ -308,36 +378,6 @@ impl CommunityCatalogProvider {
         Ok(true)
     }
 
-    /// token 快照缺失时用 CaiGames appinfo 补 access token.
-    ///
-    /// CaiGames 的 `GetAppinfo/{app_id}` 返回里带 `config` 字段, 内含 `app_token`.
-    /// 快照链覆盖不全的游戏 (冷门/新游戏) 常能从这里补上. 补不上不算错误,
-    /// 只记 trace, 入库照常进行 (缺 token 由上层弹窗提示).
-    fn enrich_token_from_caigamer(
-        &self,
-        app_id: AppId,
-        bundle: &mut CatalogBundle,
-        trace: &mut Vec<CatalogTraceEntry>,
-    ) {
-        let Some(caigamer) = &self.caigamer else {
-            return;
-        };
-        match caigamer.fetch_with_trace(app_id) {
-            Ok(outcome) => match outcome.bundle.access_tokens.get(&app_id) {
-                // app_token 为 0 表示 CaiGames 也未收录, 不补.
-                Some(&token) if token != 0 => {
-                    bundle.access_tokens.insert(app_id, token);
-                    trace.push(hit_trace("community:caigamer_token"));
-                }
-                _ => trace.push(CatalogTraceEntry {
-                    provider: "community:caigamer_token".to_owned(),
-                    outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
-                }),
-            },
-            Err(error) => trace.push(failed_trace("community:caigamer_token", &error)),
-        }
-    }
-
     #[cfg(test)]
     fn with_test_sources(
         cache_dir: PathBuf,
@@ -352,7 +392,7 @@ impl CommunityCatalogProvider {
             options,
             metadata_sources,
             archive_sources,
-            caigamer: None,
+            enrichers: Vec::new(),
             max_snapshot_bytes,
             max_archive_bytes,
         }
@@ -360,7 +400,13 @@ impl CommunityCatalogProvider {
 
     #[cfg(test)]
     fn with_caigamer(mut self, caigamer: CaigamerCatalogProvider) -> Self {
-        self.caigamer = Some(caigamer);
+        self.enrichers.push(Box::new(caigamer));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_catmisteam(mut self, catmisteam: CatmisteamCatalogProvider) -> Self {
+        self.enrichers.push(Box::new(catmisteam));
         self
     }
 }
@@ -490,6 +536,9 @@ fn parse_steamcmd_style_response(app_id: AppId, body: &[u8]) -> CatalogResult<Ca
         apps: vec![app_id],
         ..CatalogBundle::default()
     };
+    // SteamDB 的 `_missing_token` 标记该 app 下载是否需要 access token;
+    // false = 不缺 (不需要 token), 上层不应报缺 token.
+    bundle.requires_token = app_data.get("_missing_token").and_then(Value::as_bool);
     let mut depot_ids = Vec::new();
     for (depot_text, depot_value) in depots {
         if !depot_text.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -503,6 +552,10 @@ fn parse_steamcmd_style_response(app_id: AppId, body: &[u8]) -> CatalogResult<Ca
                 })?;
         if depot_id == 0 {
             return Err(CatalogError::ZeroDepotId);
+        }
+        // 共享 depot (depotfromapp): manifest/key 属于源 app, 不该由本 app 单独要求.
+        if depot_value.get("depotfromapp").is_some() {
+            continue;
         }
         let Some(public) = depot_value
             .get("manifests")
@@ -652,7 +705,7 @@ fn parse_archive(
                 limit: usize::try_from(limits.max_extracted_bytes).unwrap_or(usize::MAX),
             });
         }
-        let name = file.name();
+        let name = file.name().to_owned();
         if name.len() > limits.max_name_bytes {
             return Err(provider_error(
                 provider,
@@ -660,28 +713,24 @@ fn parse_archive(
                 "ZIP entry name is too long",
             ));
         }
-        let file_name = name.rsplit(['/', '\\']).next().unwrap_or(name);
-        if let Some((depot_id, manifest)) = parse_manifest_file_name(file_name)? {
-            if let Some(existing) = result.manifests.get(&depot_id) {
-                if existing != &manifest {
-                    return Err(CatalogError::ConflictingDepot(depot_id));
-                }
-            } else {
-                result.manifests.insert(depot_id, manifest);
-            }
-        }
-
+        let file_name = name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(name.as_str())
+            .to_owned();
         let lower_name = file_name.to_ascii_lowercase();
-        let kind = if matches!(lower_name.as_str(), "key.vdf" | "config.vdf") {
+        let is_manifest = lower_name.ends_with(".manifest");
+        let key_kind = if matches!(lower_name.as_str(), "key.vdf" | "config.vdf") {
             Some("vdf")
         } else if lower_name.ends_with(".lua") {
             Some("lua")
         } else {
             None
         };
-        let Some(kind) = kind else {
+        // 只读我们关心的条目, 避免把整个 ZIP 解进内存.
+        if !is_manifest && key_kind.is_none() {
             continue;
-        };
+        }
         if file.size() > limits.max_entry_bytes {
             return Err(CatalogError::PayloadTooLarge {
                 actual: usize::try_from(file.size()).unwrap_or(usize::MAX),
@@ -707,6 +756,27 @@ fn parse_archive(
                 limit: usize::try_from(limits.max_entry_bytes).unwrap_or(usize::MAX),
             });
         }
+
+        if is_manifest {
+            if let Some((depot_id, manifest)) = parse_manifest_file_name(&file_name)? {
+                if let Some(existing) = result.manifests.get(&depot_id) {
+                    if existing != &manifest {
+                        return Err(CatalogError::ConflictingDepot(depot_id));
+                    }
+                } else {
+                    result.manifests.insert(depot_id, manifest.clone());
+                }
+                // 空文件没意义, 跳过; 非空字节按 (depot, gid) 去重保留首份.
+                if !content.is_empty() {
+                    result
+                        .manifest_blobs
+                        .entry((depot_id, manifest.manifest_gid))
+                        .or_insert(content);
+                }
+            }
+            continue;
+        }
+
         let text = std::str::from_utf8(&content).map_err(|_| {
             provider_error(
                 provider,
@@ -714,13 +784,66 @@ fn parse_archive(
                 "key metadata is not UTF-8",
             )
         })?;
-        if kind == "vdf" {
-            collect_vdf_keys(provider, text, &mut result.depot_keys)?;
+        if key_kind == Some("vdf") {
+            keys_parse::collect_vdf_keys(provider, text, &mut result.depot_keys)?;
         } else {
-            collect_lua_keys(text, &mut result.depot_keys)?;
+            keys_parse::collect_lua_keys(text, &mut result.depot_keys)?;
         }
     }
     Ok(result)
+}
+
+fn append_manifest_blobs(
+    out: &mut Vec<crate::ManifestBlob>,
+    blobs: HashMap<(DepotId, u64), Vec<u8>>,
+) {
+    for ((depot_id, manifest_gid), bytes) in blobs {
+        if bytes.is_empty() {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|b| b.depot_id == depot_id && b.manifest_gid == manifest_gid)
+        {
+            continue;
+        }
+        out.push(crate::ManifestBlob {
+            depot_id,
+            manifest_gid,
+            bytes,
+        });
+    }
+}
+
+/// 只保留 bundle 里声明的 (depot, gid) 对应 blob.
+fn merge_matching_manifest_blobs(
+    bundle: &CatalogBundle,
+    blobs: &HashMap<(DepotId, u64), Vec<u8>>,
+    out: &mut Vec<crate::ManifestBlob>,
+) {
+    for ((depot_id, manifest_gid), bytes) in blobs {
+        if bytes.is_empty() {
+            continue;
+        }
+        let Some(over) = bundle.manifests.get(depot_id) else {
+            continue;
+        };
+        // archive 的 gid 常落后 steamcmd public; 只收与当前 bundle 一致的.
+        if over.manifest_gid != *manifest_gid {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|b| b.depot_id == *depot_id && b.manifest_gid == *manifest_gid)
+        {
+            continue;
+        }
+        out.push(crate::ManifestBlob {
+            depot_id: *depot_id,
+            manifest_gid: *manifest_gid,
+            bytes: bytes.clone(),
+        });
+    }
 }
 
 fn parse_manifest_file_name(file_name: &str) -> CatalogResult<Option<(DepotId, ManifestOverride)>> {
@@ -754,164 +877,6 @@ fn parse_manifest_file_name(file_name: &str) -> CatalogResult<Option<(DepotId, M
             size: 0,
         },
     )))
-}
-
-pub(crate) fn collect_vdf_keys(
-    provider: &'static str,
-    text: &str,
-    keys: &mut HashMap<DepotId, String>,
-) -> CatalogResult<()> {
-    let parsed = keyvalues_parser::parse(text).map_err(|_| {
-        provider_error(
-            provider,
-            ProviderErrorKind::Rejected,
-            "invalid VDF key metadata",
-        )
-    })?;
-    let mut nodes = 0;
-    visit_vdf_pair(
-        provider,
-        parsed.key.as_ref(),
-        &parsed.value,
-        0,
-        &mut nodes,
-        keys,
-    )
-}
-
-fn visit_vdf_pair(
-    provider: &'static str,
-    key: &str,
-    value: &keyvalues_parser::Value<'_>,
-    depth: usize,
-    nodes: &mut usize,
-    keys: &mut HashMap<DepotId, String>,
-) -> CatalogResult<()> {
-    *nodes = nodes.saturating_add(1);
-    if *nodes > MAX_VDF_NODES || depth > MAX_VDF_DEPTH {
-        return Err(provider_error(
-            provider,
-            ProviderErrorKind::Rejected,
-            "VDF structure exceeds limits",
-        ));
-    }
-    let Some(object) = value.get_obj() else {
-        return Ok(());
-    };
-    if key.eq_ignore_ascii_case("depots") {
-        collect_depots_object(object, keys)?;
-    }
-    for (child_key, child_values) in object.iter() {
-        for child_value in child_values {
-            visit_vdf_pair(
-                provider,
-                child_key.as_ref(),
-                child_value,
-                depth + 1,
-                nodes,
-                keys,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_depots_object(
-    object: &keyvalues_parser::Obj<'_>,
-    keys: &mut HashMap<DepotId, String>,
-) -> CatalogResult<()> {
-    for (depot_text, values) in object.iter() {
-        let Ok(depot_id) = depot_text.parse::<DepotId>() else {
-            continue;
-        };
-        if depot_id == 0 {
-            return Err(CatalogError::ZeroDepotId);
-        }
-        for value in values {
-            let Some(depot) = value.get_obj() else {
-                continue;
-            };
-            for (name, candidates) in depot.iter() {
-                if !name.eq_ignore_ascii_case("DecryptionKey") {
-                    continue;
-                }
-                for candidate in candidates {
-                    if let Some(key) = candidate.get_str() {
-                        insert_archive_key(keys, depot_id, key)?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn collect_lua_keys(text: &str, keys: &mut HashMap<DepotId, String>) -> CatalogResult<()> {
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with("--") {
-            continue;
-        }
-        let Some(arguments) = line.strip_prefix("addappid(") else {
-            continue;
-        };
-        let Some(arguments) = arguments.split_once(')').map(|(arguments, _)| arguments) else {
-            continue;
-        };
-        let mut arguments = arguments.split(',').map(str::trim);
-        let Some(depot_text) = arguments.next() else {
-            continue;
-        };
-        let Some(_) = arguments.next() else {
-            continue;
-        };
-        let Some(key_text) = arguments.next() else {
-            continue;
-        };
-        if arguments.next().is_some() {
-            continue;
-        }
-        let Ok(depot_id) = depot_text.parse::<DepotId>() else {
-            continue;
-        };
-        let key = key_text
-            .strip_prefix('"')
-            .and_then(|key| key.strip_suffix('"'))
-            .or_else(|| {
-                key_text
-                    .strip_prefix('\'')
-                    .and_then(|key| key.strip_suffix('\''))
-            });
-        if let Some(key) = key {
-            insert_archive_key(keys, depot_id, key)?;
-        }
-    }
-    Ok(())
-}
-
-fn insert_archive_key(
-    keys: &mut HashMap<DepotId, String>,
-    depot_id: DepotId,
-    key: &str,
-) -> CatalogResult<()> {
-    if depot_id == 0 {
-        return Err(CatalogError::ZeroDepotId);
-    }
-    // 非 64 hex 的 key 是上游数据格式问题 (如 CaiGames 主 depot 的超长 key),
-    // 跳过该 depot 而不是让整份 archive 解析失败.
-    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Ok(());
-    }
-    match keys.get(&depot_id) {
-        Some(existing) if !existing.eq_ignore_ascii_case(key) => {
-            Err(CatalogError::ConflictingDepot(depot_id))
-        }
-        Some(_) => Ok(()),
-        None => {
-            keys.insert(depot_id, key.to_owned());
-            Ok(())
-        }
-    }
 }
 
 fn read_selected_strings(
@@ -1043,7 +1008,7 @@ fn hit_trace(provider: &str) -> CatalogTraceEntry {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
@@ -1085,7 +1050,7 @@ mod tests {
             Self::spawn_with(&[("info", body)])
         }
 
-        /// 按 URL 路径段分发响应: 每个连接 accept 一次, 顺序处理直到超时.
+        /// 按 URL 路径段分发响应: 每个连接 accept 一次, 收齐声明路由后退出.
         /// 用于 metadata + caigamer 补源等多请求场景.
         fn spawn_with(routes: &[(&str, Vec<u8>)]) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1099,7 +1064,8 @@ mod tests {
                 .collect();
             let thread = std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline {
+                let mut served = 0;
+                while served < routes.len() && Instant::now() < deadline {
                     let mut stream = match listener.accept() {
                         Ok((stream, _)) => stream,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1131,8 +1097,12 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
-                    let _ = stream.write_all(headers.as_bytes());
-                    let _ = stream.write_all(&body);
+                    if stream.write_all(headers.as_bytes()).is_ok()
+                        && stream.write_all(&body).is_ok()
+                    {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        served += 1;
+                    }
                 }
             });
             Self {
@@ -1251,9 +1221,35 @@ mod tests {
     }
 
     #[test]
+    fn steamcmd_parser_skips_depotfromapp_shared_depot() {
+        // 1523211 是 depotfromapp (共享 depot), 不应要求它自己的 key/manifest.
+        let body = br#"{"status":"success","data":{"42":{"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}},"44":{"depotfromapp":"1523210","manifests":{"public":{"gid":"88","download":"90"}}}}}}}"#;
+
+        let bundle = parse_steamcmd_style_response(42, body).unwrap();
+
+        assert_eq!(bundle.app_depots[&42], vec![43]);
+        assert!(!bundle.manifests.contains_key(&44));
+    }
+
+    /// `_missing_token: false` → requires_token = Some(false), 上层不再报缺 token.
+    #[test]
+    fn steamcmd_parser_records_missing_token_flag() {
+        let body = br#"{"status":"success","data":{"42":{"_missing_token":false,"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}}}}}}"#;
+        let bundle = parse_steamcmd_style_response(42, body).unwrap();
+        assert_eq!(bundle.requires_token, Some(false));
+
+        let body = br#"{"status":"success","data":{"42":{"_missing_token":true,"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}}}}}}"#;
+        let bundle = parse_steamcmd_style_response(42, body).unwrap();
+        assert_eq!(bundle.requires_token, Some(true));
+
+        // 缺字段 = 未知 (None), 按需要处理.
+        let bundle = parse_steamcmd_style_response(42, &valid_body()).unwrap();
+        assert_eq!(bundle.requires_token, None);
+    }
+
+    #[test]
     fn steamcmd_parser_rejects_invalid_gid() {
         let body = br#"{"data":{"42":{"depots":{"43":{"manifests":{"public":{"gid":"bad"}}}}}}}"#;
-
         let error = parse_steamcmd_style_response(42, body).unwrap_err();
 
         assert!(matches!(error, CatalogError::InvalidDecimalU64 { .. }));
@@ -1280,6 +1276,41 @@ mod tests {
         let data = parse_archive("community:test", &archive, ArchiveLimits::default()).unwrap();
 
         assert_eq!(data.depot_keys[&43], key);
+        assert_eq!(data.manifests[&43].manifest_gid, 99);
+        // Fluent 路径需要原始字节落盘 depotcache.
+        assert_eq!(
+            data.manifest_blobs.get(&(43, 99)).map(Vec::as_slice),
+            Some(b"manifest".as_slice())
+        );
+    }
+
+    #[test]
+    fn archive_parser_keeps_manifest_blob_bytes() {
+        let archive = zip_bytes(&[("nested/43_99.manifest", b"raw-manifest-bytes")]);
+
+        let data = parse_archive("community:test", &archive, ArchiveLimits::default()).unwrap();
+
+        assert_eq!(data.manifests[&43].manifest_gid, 99);
+        assert_eq!(
+            data.manifest_blobs[&(43, 99)].as_slice(),
+            b"raw-manifest-bytes"
+        );
+    }
+
+    #[test]
+    fn archive_parser_keeps_manifest_when_key_is_overlong() {
+        let vdf = format!(
+            "\"depots\"\n{{\n\"43\"\n{{\n\"DecryptionKey\" \"{}\"\n}}\n}}",
+            "ab".repeat(64)
+        );
+        let archive = zip_bytes(&[
+            ("nested/config.vdf", vdf.as_bytes()),
+            ("nested/43_99.manifest", b"manifest"),
+        ]);
+
+        let data = parse_archive("community:test", &archive, ArchiveLimits::default()).unwrap();
+
+        assert!(data.depot_keys.is_empty());
         assert_eq!(data.manifests[&43].manifest_gid, 99);
     }
 
@@ -1398,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn community_fetch_fails_when_required_key_is_missing() {
+    fn community_fetch_returns_manifest_when_required_key_is_missing() {
         let _guard = crate::http_test_guard();
         let dir = TestDir::new();
         std::fs::write(dir.0.join(DEPOT_KEYS_FILE), "{}").unwrap();
@@ -1413,9 +1444,10 @@ mod tests {
             1024,
         );
 
-        let error = provider.fetch(42).unwrap_err();
+        let outcome = provider.fetch_with_trace(42).unwrap();
 
-        assert!(matches!(error, CatalogError::ChainExhausted { .. }));
+        assert!(outcome.bundle.manifests.contains_key(&43));
+        assert!(outcome.bundle.depot_keys.is_empty());
     }
 
     #[test]
@@ -1545,6 +1577,110 @@ mod tests {
                 .iter()
                 .any(|entry| entry.provider == "community:caigamer_token"
                     && entry.outcome == CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound)),
+            "{:?}",
+            outcome.trace
+        );
+    }
+
+    /// CatMisteam 补 key: 快照缺 depot 时, lua 直下补上 (只补缺, 排在 CaiGamer 之前).
+    #[test]
+    fn community_fills_missing_depot_key_from_catmisteam() {
+        let _guard = crate::http_test_guard();
+        let dir = TestDir::new();
+        let body = br#"{"status":"success","data":{"42":{"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}},"44":{"manifests":{"public":{"gid":"88","download":"90"}}}}}}}"#;
+        std::fs::write(
+            dir.0.join(DEPOT_KEYS_FILE),
+            format!(r#"{{"43":"{}"}}"#, "ab".repeat(32)),
+        )
+        .unwrap();
+        std::fs::write(dir.0.join(APP_TOKENS_FILE), "{}").unwrap();
+
+        let key44 = "ef".repeat(32);
+        let lua = format!(
+            "addappid(42)\naddappid(43,0,\"{}\")\naddappid(44,0,\"{key44}\")\n",
+            "cd".repeat(32)
+        );
+        // 路由: /info/ → metadata; /lua/ → catmisteam.
+        let server = FakeHttpServer::spawn_with(&[("info", body.to_vec()), ("lua", lua.into_bytes())]);
+        let catmisteam_url = server
+            .template
+            .replace("/info/{app_id}", "/lua/{app_id}.lua");
+        let catmisteam_url: &'static str = Box::leak(catmisteam_url.into_boxed_str());
+
+        let provider = CommunityCatalogProvider::with_test_sources(
+            dir.0.clone(),
+            options(1024),
+            vec![server.source()],
+            Vec::new(),
+            1024,
+            1024,
+        )
+        .with_catmisteam(CatmisteamCatalogProvider::with_url(options(1024), catmisteam_url));
+
+        let outcome = provider.fetch_with_trace(42).unwrap();
+
+        assert_eq!(outcome.bundle.depot_keys[&44], key44);
+        assert_eq!(outcome.bundle.depot_keys[&43], "ab".repeat(32));
+        assert!(
+            outcome
+                .trace
+                .iter()
+                .any(|entry| entry.provider == "community:catmisteam_key"),
+            "{:?}",
+            outcome.trace
+        );
+    }
+
+    /// CaiGames 补 key: 快照缺某 depot 的 key 时, caigamer 的 Key 字段补上 (只补缺, 不覆盖).
+    #[test]
+    fn community_fills_missing_depot_key_from_caigamer() {
+        let _guard = crate::http_test_guard();
+        let dir = TestDir::new();
+        // metadata 声明 depot 43 + 44; 快照只给 43 的 key, 44 缺失.
+        let body = br#"{"status":"success","data":{"42":{"depots":{"43":{"manifests":{"public":{"gid":"99","download":"100"}}},"44":{"manifests":{"public":{"gid":"88","download":"90"}}}}}}}"#;
+        std::fs::write(
+            dir.0.join(DEPOT_KEYS_FILE),
+            format!(r#"{{"43":"{}"}}"#, "ab".repeat(32)),
+        )
+        .unwrap();
+        std::fs::write(dir.0.join(APP_TOKENS_FILE), "{}").unwrap();
+
+        // caigamer Key 含 43 + 44; 43 与快照不同 (旧数据), 44 应被补上.
+        let appinfo_vdf = r#""appinfo" { "depots" { "43" { "manifests" { "public" { "gid" "99" "size" "100" } } } "44" { "manifests" { "public" { "gid" "88" "size" "90" } } } } }"#;
+        let key_vdf = format!(
+            "\"depots\"\n{{\n\"43\"\n{{\n\"DecryptionKey\" \"{}\"\n}}\n\"44\"\n{{\n\"DecryptionKey\" \"{}\"\n}}\n}}",
+            "cd".repeat(32),
+            "ef".repeat(32)
+        );
+        let plain = format!(
+            "{{'Key': '{}', 'appinfo': '{}', 'config': '{{\"appid\": 42, \"app_token\": 0}}'}}",
+            key_vdf, appinfo_vdf
+        );
+        let encrypted = crate::caigamer::rc4(crate::caigamer::RC4_KEY, plain.as_bytes());
+        let server =
+            FakeHttpServer::spawn_with(&[("info", body.to_vec()), ("GetAppinfo", encrypted)]);
+
+        let provider = CommunityCatalogProvider::with_test_sources(
+            dir.0.clone(),
+            options(1024),
+            vec![server.source()],
+            Vec::new(),
+            1024,
+            1024,
+        )
+        .with_caigamer(server.caigamer_source());
+
+        let outcome = provider.fetch_with_trace(42).unwrap();
+
+        // 44 由 caigamer 补上.
+        assert_eq!(outcome.bundle.depot_keys[&44], "ef".repeat(32));
+        // 43 保持快照值, 不被 caigamer 旧数据覆盖.
+        assert_eq!(outcome.bundle.depot_keys[&43], "ab".repeat(32));
+        assert!(
+            outcome
+                .trace
+                .iter()
+                .any(|entry| entry.provider == "community:caigamer_key"),
             "{:?}",
             outcome.trace
         );
