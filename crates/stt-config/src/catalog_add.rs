@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use stt_catalog::{validate_bundle, CatalogProvider, CatalogTraceEntry};
 use stt_core::{AppId, CatalogBundle, DepotId};
+use stt_platform::WinHttpGetOptions;
 
+use crate::catalog_dlc::{expand_dlcs, DlcExpandOptions, DlcExpandReport};
 use crate::error::{ConfigError, Result};
 use crate::lua_load::default_lua_dir;
 use crate::tools::ToolId;
@@ -24,6 +26,10 @@ pub struct AddToLibraryOutcome {
     pub missing: MissingDownloadData,
     /// 写入 depotcache 的原始 .manifest 文件数 (0 = 源没给字节, 不失败).
     pub manifest_files_written: usize,
+    /// 本次并入的 DLC (仅解锁 / 可下载); 关 auto_dlc 时为空.
+    pub dlc: DlcExpandReport,
+    /// 最终 bundle 里全部 owned app (主 + DLC), 供 package0 注入.
+    pub owned_apps: Vec<AppId>,
 }
 
 /// 下载数据缺失情况 (Steam 拿不到就下不了, 应该提示用户).
@@ -248,12 +254,31 @@ fn now_unix() -> u32 {
         .unwrap_or(0)
 }
 
-/// 工具开启时: fetch → 写 lua → 合并进 ConfigState.
+/// 工具开启时: fetch → (可选 DLC 扩展) → 写 lua → 合并进 ConfigState.
 pub fn add_to_library(
     state: &ConfigState,
     steam_root: &Path,
     provider: &dyn CatalogProvider,
     app_id: AppId,
+) -> Result<AddToLibraryOutcome> {
+    add_to_library_with_dlc(
+        state,
+        steam_root,
+        provider,
+        app_id,
+        DlcExpandOptions::disabled(),
+        WinHttpGetOptions::default(),
+    )
+}
+
+/// 同 [`add_to_library`], 带 DLC 扩展选项.
+pub fn add_to_library_with_dlc(
+    state: &ConfigState,
+    steam_root: &Path,
+    provider: &dyn CatalogProvider,
+    app_id: AppId,
+    dlc_opts: DlcExpandOptions,
+    http: WinHttpGetOptions,
 ) -> Result<AddToLibraryOutcome> {
     if !state.tools().is_enabled(ToolId::CatalogAdd) {
         return Err(ConfigError::Invalid("catalog_add tool is disabled".into()));
@@ -261,23 +286,40 @@ pub fn add_to_library(
 
     let fetched = provider.fetch_with_trace(app_id)?;
     let mut bundle = validate_bundle(app_id, fetched.bundle)?;
-    bundle.purchase_times.entry(app_id).or_insert_with(now_unix);
+    let purchase = now_unix();
+    bundle.purchase_times.entry(app_id).or_insert(purchase);
+
+    let dlc = expand_dlcs(
+        app_id,
+        &mut bundle,
+        &fetched.related_dlc_ids,
+        provider,
+        dlc_opts,
+        http,
+    );
+    // 扩展后可能多了 apps/depots, 再校验一次.
+    let bundle = validate_bundle(app_id, bundle)?;
 
     let lua_path = write_catalog_lua(steam_root, app_id, &bundle)?;
     // Fluent 路径: 有原始 .manifest 就写 depotcache; 没有也不挡入库.
     let manifest_files_written =
         write_manifest_blobs(steam_root, &fetched.manifest_blobs).unwrap_or(0);
 
-    state.with_rules_mut(|rules| {
-        rules.apply_catalog_bundle(&bundle);
-    });
+    // 以磁盘 lua 为准重载, 避免 DLC 列表缩小时 merge 残留旧 owned.
+    #[cfg(feature = "lua")]
+    {
+        let _ = state.reload_lua_dirs(steam_root);
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        state.with_rules_mut(|rules| {
+            rules.apply_catalog_bundle(&bundle);
+        });
+    }
 
-    // 再读一遍刚写的 lua, 与扫盘语义对齐 (可选但有助于发现写坏的脚本).
-    let text = std::fs::read_to_string(&lua_path).map_err(|source| ConfigError::Io {
-        path: lua_path.clone(),
-        source,
-    })?;
-    state.apply_lua(&text)?;
+    let mut owned_apps: Vec<AppId> = bundle.apps.iter().copied().filter(|&id| id != 0).collect();
+    owned_apps.sort_unstable();
+    owned_apps.dedup();
 
     Ok(AddToLibraryOutcome {
         app_id,
@@ -288,6 +330,8 @@ pub fn add_to_library(
         owned_count: state.owned_count(),
         missing: missing_download_data(app_id, &bundle),
         manifest_files_written,
+        dlc,
+        owned_apps,
     })
 }
 

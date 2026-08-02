@@ -288,6 +288,15 @@ pub struct CatalogSection {
     pub timeout_recv_ms: u32,
     #[serde(default = "default_catalog_response_limit")]
     pub max_response_bytes: usize,
+    /// 主游戏入库后自动添加 DLC (默认开, 对齐 Fluent).
+    #[serde(default = "default_auto_dlc")]
+    pub auto_dlc: bool,
+    /// 单次最多处理的 DLC 数.
+    #[serde(default = "default_max_dlc")]
+    pub max_dlc: u32,
+    /// DLC 扩展总预算 (含列表兜底 HTTP), 毫秒.
+    #[serde(default = "default_dlc_timeout_ms")]
+    pub dlc_timeout_ms: u32,
 }
 
 impl Default for CatalogSection {
@@ -300,12 +309,27 @@ impl Default for CatalogSection {
             timeout_send_ms: default_timeout_10s(),
             timeout_recv_ms: default_timeout_10s(),
             max_response_bytes: default_catalog_response_limit(),
+            auto_dlc: default_auto_dlc(),
+            max_dlc: default_max_dlc(),
+            dlc_timeout_ms: default_dlc_timeout_ms(),
         }
     }
 }
 
 fn default_catalog_response_limit() -> usize {
     stt_catalog::CatalogLimits::default().max_wire_bytes
+}
+
+fn default_auto_dlc() -> bool {
+    true
+}
+
+fn default_max_dlc() -> u32 {
+    64
+}
+
+fn default_dlc_timeout_ms() -> u32 {
+    15_000
 }
 
 impl CatalogSection {
@@ -317,6 +341,7 @@ impl CatalogSection {
             self.timeout_connect_ms,
             self.timeout_send_ms,
             self.timeout_recv_ms,
+            self.dlc_timeout_ms,
         ];
         if timeouts
             .into_iter()
@@ -330,6 +355,12 @@ impl CatalogSection {
         if self.max_response_bytes == 0 || self.max_response_bytes > max_wire_bytes {
             return Err(ConfigError::Invalid(format!(
                 "catalog.max_response_bytes must be within 1..={max_wire_bytes}"
+            )));
+        }
+        let max_apps = stt_catalog::CatalogLimits::default().max_apps as u32;
+        if self.max_dlc == 0 || self.max_dlc > max_apps {
+            return Err(ConfigError::Invalid(format!(
+                "catalog.max_dlc must be within 1..={max_apps}"
             )));
         }
         if self.mode == CatalogMode::CustomHttp {

@@ -38,6 +38,7 @@ pub enum ConfigIntent {
     SetLogLevel(String),
     SetCatalogMode(CatalogMode),
     SetCatalogUrlTemplate(String),
+    SetCatalogAutoDlc(bool),
     SetManifestUrl(String),
     AddLuaPath(String),
     RemoveLuaPath(String),
@@ -73,6 +74,10 @@ impl ConfigIntent {
         stt_catalog::validate_url_template_remote(template)
             .is_ok()
             .then(|| Self::SetCatalogUrlTemplate(template.to_owned()))
+    }
+
+    pub fn set_catalog_auto_dlc(on: bool) -> Self {
+        Self::SetCatalogAutoDlc(on)
     }
 
     pub fn add_lua_path(path: &str) -> Option<Self> {
@@ -118,6 +123,10 @@ impl ConfigIntent {
             Self::SetCatalogUrlTemplate(template) => {
                 host.catalog.url_template = template.clone();
                 Ok("catalog.url_template 已更新".into())
+            }
+            Self::SetCatalogAutoDlc(on) => {
+                host.catalog.auto_dlc = *on;
+                Ok(format!("catalog.auto_dlc={on}"))
             }
             Self::SetManifestUrl(source) => {
                 host.manifest.url = source.clone();
@@ -217,6 +226,10 @@ pub fn save_host_change(
         ConfigIntent::SetCatalogUrlTemplate(template) => {
             let table = table_at(&mut doc, &["catalog"])?;
             table["url_template"] = toml_edit::value(template.as_str());
+        }
+        ConfigIntent::SetCatalogAutoDlc(on) => {
+            let table = table_at(&mut doc, &["catalog"])?;
+            table["auto_dlc"] = toml_edit::value(*on);
         }
         ConfigIntent::SetManifestUrl(source) => {
             let table = table_at(&mut doc, &["manifest"])?;

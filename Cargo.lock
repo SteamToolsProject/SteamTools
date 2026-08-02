@@ -622,6 +622,7 @@ dependencies = [
  "serde",
  "stt-catalog",
  "stt-core",
+ "stt-platform",
  "tempfile",
  "thiserror",
  "toml",

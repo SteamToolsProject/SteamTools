@@ -2,6 +2,7 @@
 
 mod appinfo;
 mod catalog_add;
+mod catalog_dlc;
 mod error;
 mod host_toml;
 mod intent;
@@ -26,9 +27,11 @@ pub use appinfo::app_names;
 #[cfg(feature = "lua")]
 pub use catalog_add::remove_from_library;
 pub use catalog_add::{
-    add_to_library, catalog_lua_path, format_catalog_lua, manifest_file_name, write_catalog_lua,
-    write_manifest_blobs, AddToLibraryOutcome, MissingDownloadData,
+    add_to_library, add_to_library_with_dlc, catalog_lua_path, format_catalog_lua,
+    manifest_file_name, write_catalog_lua, write_manifest_blobs, AddToLibraryOutcome,
+    MissingDownloadData,
 };
+pub use catalog_dlc::{DlcExpandOptions, DlcExpandReport};
 pub use error::{ConfigError, Result};
 pub use host_toml::{
     CatalogMode, CatalogSection, HostConfig, LogSection, LuaSection, ManifestSection,

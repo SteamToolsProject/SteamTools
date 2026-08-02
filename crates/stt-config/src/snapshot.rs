@@ -51,6 +51,8 @@ pub struct ConfigSnapshot {
     pub catalog_modes: &'static [&'static str],
     pub catalog_url_template: String,
     pub catalog_status: String,
+    /// 主游戏入库后是否自动添加 DLC.
+    pub catalog_auto_dlc: bool,
     pub manifest_url: String,
     pub manifest_sources: &'static [&'static str],
     /// 额外 lua 目录 (默认目录不在其中, 单独给).
@@ -123,6 +125,7 @@ impl ConfigSnapshot {
                 crate::CatalogMode::Community => "Community (多源聚合)".to_owned(),
                 crate::CatalogMode::Mock => "Mock (开发模式)".to_owned(),
             },
+            catalog_auto_dlc: host.catalog.auto_dlc,
             manifest_url: host.manifest.url,
             manifest_sources: MANIFEST_SOURCES,
             lua_paths: host.lua.paths,
@@ -253,6 +256,17 @@ mod tests {
         assert_eq!(snap.manifest_url, "wudrm");
         assert_eq!(snap.catalog_mode, "mock");
         assert!(snap.catalog_status.contains("开发模式"));
+        assert!(snap.catalog_auto_dlc, "auto_dlc 默认开");
         assert_eq!(snap.note, "saved");
+    }
+
+    #[test]
+    fn snapshot_reflects_auto_dlc_off() {
+        let state = ConfigState::new();
+        state.apply_host(
+            HostConfig::parse_str("[catalog]\nmode = \"mock\"\nauto_dlc = false\n").unwrap(),
+        );
+        let snap = ConfigSnapshot::from_state(&state, Path::new("C:/steam"), "pipe", "");
+        assert!(!snap.catalog_auto_dlc);
     }
 }
