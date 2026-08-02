@@ -98,6 +98,17 @@ impl LicenseQueue {
         }
     }
 
+    /// 用 package0 AppIdVec 的真实内容重置逻辑 injected 集.
+    ///
+    /// Steam 原生「卸载」会重建/清空 package0, 但我们的逻辑集仍以为 id 在里面;
+    /// 之后 reconcile 以为无差 → 库里其它入库游戏一起消失, 直到刷新清单重注入.
+    /// notify 前先 resync, 再 reconcile, 才能把被 wipe 的 id 重新入 pending_add.
+    pub fn resync_injected(&self, present: impl IntoIterator<Item = AppId>) {
+        let mut g = self.lock();
+        g.injected.clear();
+        g.injected.extend(present);
+    }
+
     /// package0 可用时标记假 license 已就绪 (实机 GetPackageInfo 成功后调用).
     pub fn mark_fake_license_ready(&self, package_status: u32) -> bool {
         if package_status != PACKAGE_STATUS_AVAILABLE {
@@ -355,6 +366,53 @@ mod tests {
         assert!(q.injected_contains(2));
         assert!(q.injected_contains(3));
         assert!(!q.injected_contains(1));
+    }
+
+    #[test]
+    fn resync_then_queue_addition_reheals_wiped_apps() {
+        // 模拟: 逻辑以为 1/2/3 都在; Steam 卸载把 AppIdVec 清空.
+        // notify 路径: resync(present=[]) 后对 configured 逐个 queue_addition.
+        let q = LicenseQueue::new();
+        q.seed_injected_from_owned([1, 2, 3]);
+        q.resync_injected([]);
+        for id in [1u32, 2, 3] {
+            q.queue_addition(id);
+        }
+        assert_eq!(q.pending_add_len(), 3);
+        assert_eq!(q.pending_remove_len(), 0);
+        let plan = q.plan_notify_logic_only();
+        assert_eq!(plan.insert_ids.len(), 3);
+        assert!(plan.remove_ids.is_empty());
+        assert!(q.injected_contains(1));
+        assert!(q.injected_contains(2));
+        assert!(q.injected_contains(3));
+    }
+
+    #[test]
+    fn resync_keeps_present_ids_from_being_readded() {
+        let q = LicenseQueue::new();
+        q.seed_injected_from_owned([1, 2, 3]);
+        // 卸载只清了 2、3; 1 仍在向量里.
+        q.resync_injected([1]);
+        for id in [1u32, 2, 3] {
+            q.queue_addition(id);
+        }
+        assert_eq!(q.pending_add_len(), 2);
+        let plan = q.plan_notify_logic_only();
+        assert!(!plan.insert_ids.contains(&1));
+        assert!(plan.insert_ids.contains(&2));
+        assert!(plan.insert_ids.contains(&3));
+    }
+
+    #[test]
+    fn resync_without_heal_does_not_invent_pending() {
+        let q = LicenseQueue::new();
+        q.seed_injected_from_owned([1, 2]);
+        q.resync_injected([1]);
+        assert!(q.injected_contains(1));
+        assert!(!q.injected_contains(2));
+        assert_eq!(q.pending_add_len(), 0);
+        assert_eq!(q.pending_remove_len(), 0);
     }
 
     #[test]

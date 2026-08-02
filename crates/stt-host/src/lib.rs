@@ -2426,13 +2426,22 @@ fn run_watch_loop(
                 );
             }
         }
+        // package0 周期 sync: 启动补注入 + Steam 原生卸载后的 wipe 自愈.
+        // notify 内部会 resync AppIdVec 真值再 reconcile configured.
         if package_rearm_ticks.is_multiple_of(8) && stt_steamclient::is_attached() {
-            if let Some(queue) = license_queue().filter(|queue| !queue.is_fake_license_ready()) {
+            if let Some(queue) = license_queue() {
+                let was_ready = queue.is_fake_license_ready();
                 let plan = stt_steamclient::notify_license_changed(&queue);
-                if queue.is_fake_license_ready() {
+                if !was_ready && queue.is_fake_license_ready() {
                     append_host_log(
                         steam_root,
                         &format!("package=startup_sync {}", plan.summary_line()),
+                    );
+                } else if plan.should_mark_license_changed && !plan.insert_ids.is_empty() {
+                    // 常见于: 卸载某游戏后 Steam 清了 package0, 我们把仍入库的 id 补回.
+                    append_host_log(
+                        steam_root,
+                        &format!("package=heal_sync {}", plan.summary_line()),
                     );
                 }
             }

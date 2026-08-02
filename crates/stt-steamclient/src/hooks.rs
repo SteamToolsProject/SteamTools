@@ -517,6 +517,31 @@ fn ensure_injected_package() -> *mut c_void {
     }
 }
 
+/// 读 package0 AppIdVec 当前内容 (上限防异常 size).
+///
+/// # Safety
+/// `pkg` 须为有效 PackageInfo*.
+unsafe fn read_app_id_vec(pkg: *mut c_void) -> Vec<AppId> {
+    const MAX_IDS: usize = 65_536;
+    if pkg.is_null() {
+        return Vec::new();
+    }
+    let size = read_u32(pkg as *mut u8, package_info::APP_ID_VEC_SIZE) as usize;
+    let mem = read_usize(pkg as *mut u8, package_info::APP_ID_VEC_MEMORY) as *const u32;
+    if mem.is_null() || size == 0 {
+        return Vec::new();
+    }
+    let n = size.min(MAX_IDS);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let id = *mem.add(i);
+        if id != 0 {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// # Safety
 /// `pkg` 须为有效 PackageInfo*; Grow 已 resolve; 调用后 AppIdVec 可写.
 unsafe fn append_app_ids(pkg: *mut c_void, apps: &[AppId]) -> bool {
@@ -524,10 +549,22 @@ unsafe fn append_app_ids(pkg: *mut c_void, apps: &[AppId]) -> bool {
     if grow.is_null() || pkg.is_null() || apps.is_empty() {
         return false;
     }
+    // 跳过已在向量里 / 本次重复的 id, 保序 (重复条目会让 Steam license 处理异常).
+    let mut seen: HashSet<AppId> = read_app_id_vec(pkg).into_iter().collect();
+    let mut to_add = Vec::with_capacity(apps.len());
+    for &id in apps {
+        if id == 0 || !seen.insert(id) {
+            continue;
+        }
+        to_add.push(id);
+    }
+    if to_add.is_empty() {
+        return true;
+    }
     let vec_ptr = (pkg as *mut u8).add(package_info::APP_ID_VEC_MEMORY) as *mut c_void;
     let old_size = read_u32(pkg as *mut u8, package_info::APP_ID_VEC_SIZE) as usize;
     let f: CUtlMemoryGrowFn = std::mem::transmute(grow);
-    let grown = f(vec_ptr, apps.len() as i32);
+    let grown = f(vec_ptr, to_add.len() as i32);
     // 写前校验: grow 返回值必须非空, 且重读的 size/capacity 足以覆盖 old + apps.
     // Grow 之后重新读指针与容量 (可能 realloc).
     let new_size = read_u32(pkg as *mut u8, package_info::APP_ID_VEC_SIZE) as usize;
@@ -536,12 +573,12 @@ unsafe fn append_app_ids(pkg: *mut c_void, apps: &[AppId]) -> bool {
         package_info::APP_ID_VEC_MEMORY + utl_vector::ALLOCATION_COUNT,
     ) as usize;
     let mem = read_usize(pkg as *mut u8, package_info::APP_ID_VEC_MEMORY) as *mut u32;
-    let need = old_size + apps.len();
+    let need = old_size + to_add.len();
     if grown.is_null() || mem.is_null() || new_size < need || capacity < need {
         APPEND_FAILURES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    for (i, &id) in apps.iter().enumerate() {
+    for (i, &id) in to_add.iter().enumerate() {
         *mem.add(old_size + i) = id;
     }
     // CUtlMemoryGrow 只扩 capacity 并增加 size 字段 (对标上游对 vector 的 grow).
@@ -549,6 +586,8 @@ unsafe fn append_app_ids(pkg: *mut c_void, apps: &[AppId]) -> bool {
     true
 }
 
+/// 幂等删除: 找不到也算成功 (Steam 卸载可能已清空 AppIdVec).
+///
 /// # Safety
 /// `pkg` 须为有效 PackageInfo*.
 unsafe fn remove_app_id(pkg: *mut c_void, app_id: AppId) -> bool {
@@ -558,7 +597,8 @@ unsafe fn remove_app_id(pkg: *mut c_void, app_id: AppId) -> bool {
     let size = read_u32(pkg as *mut u8, package_info::APP_ID_VEC_SIZE) as usize;
     let mem = read_usize(pkg as *mut u8, package_info::APP_ID_VEC_MEMORY) as *mut u32;
     if mem.is_null() || size == 0 {
-        return false;
+        // 向量空 = 目标已不在, 对 remove 语义成功.
+        return true;
     }
     for i in 0..size {
         if *mem.add(i) == app_id {
@@ -573,7 +613,8 @@ unsafe fn remove_app_id(pkg: *mut c_void, app_id: AppId) -> bool {
             return true;
         }
     }
-    false
+    // 未找到: 可能已被 wipe / 先前删过 — 仍成功, 否则 all() 会挡住后续 insert.
+    true
 }
 
 fn mark_license_and_process() -> bool {
@@ -595,6 +636,10 @@ fn mark_license_and_process() -> bool {
 }
 
 /// 配置变更后的 notify: 有 hook 则改 PackageInfo; 否则纯逻辑.
+///
+/// 每次 client 路径都会先把逻辑 injected **resync 到 AppIdVec 真值**,
+/// 再按 configured 做 reconcile: 这样 Steam 原生卸载 wipe 向量后,
+/// 仍在配置里的入库 id 会重新入队补回, 而不是整库「消失到刷新清单」。
 pub fn notify_license_changed(queue: &LicenseQueue) -> LicenseNotifyPlan {
     if !is_attached() {
         let plan = queue.plan_notify_logic_only();
@@ -624,10 +669,34 @@ pub fn notify_license_changed(queue: &LicenseQueue) -> LicenseNotifyPlan {
         return plan;
     }
 
+    // 1) 内存真值 → 逻辑 injected (发现 Steam 卸载后的 wipe)
+    // # Safety
+    // Status 已 Available; pkg 有效.
+    let present = unsafe { read_app_id_vec(pkg) };
+    queue.resync_injected(present.iter().copied());
+
+    // 2) 只补回「配置仍要、但向量里没有」的 id.
+    //    不能 full reconcile_owned(present→desired): package0 可能含 Steam 原生条目,
+    //    差集 remove 会误删它们. 显式 queue_removal (移除入库) 仍走 pending.
+    if let Some(rt) = RUNTIME.get() {
+        let desired: Vec<AppId> = rt
+            .configured
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        for id in desired {
+            // queue_addition: 已在 injected(=present) 则跳过; 被 wipe 的会入 pending_add.
+            queue.queue_addition(id);
+        }
+    }
+
     let mut plan = queue.plan_notify(status, true);
     if plan.should_mark_license_changed {
         // # Safety
         // Status==Available 且 plan 给出要写的 id 列表.
+        // remove 幂等 (wipe 后找不到也算成功), 不挡后续 insert 补回.
         let memory_applied = unsafe {
             let removed = plan.remove_ids.iter().all(|id| remove_app_id(pkg, *id));
             let inserted = plan.insert_ids.is_empty() || append_app_ids(pkg, &plan.insert_ids);
@@ -746,6 +815,44 @@ mod tests {
         );
         let ok = unsafe { append_app_ids(pkg, &[1001, 1002]) };
         assert!(ok);
+        assert_eq!(store[0], 1001);
+        assert_eq!(store[1], 1002);
+        FN_GROW.store(std::ptr::null_mut(), Ordering::SeqCst);
+    }
+
+    #[test]
+    fn remove_app_id_is_idempotent_on_empty_or_missing() {
+        let mut buf = [0u8; 0x58];
+        let pkg = buf.as_mut_ptr() as *mut c_void;
+        // 空向量 / 找不到: 都算成功, 不挡后续 insert 补回.
+        assert!(unsafe { remove_app_id(pkg, 42) });
+        assert!(!unsafe { remove_app_id(std::ptr::null_mut(), 42) });
+    }
+
+    #[test]
+    fn append_app_ids_skips_already_present() {
+        let mut store = [0u32; 8];
+        store[0] = 1001;
+        let mut buf = [0u8; 0x58];
+        unsafe {
+            std::ptr::write_unaligned(
+                buf.as_mut_ptr().add(package_info::APP_ID_VEC_MEMORY) as *mut *mut u32,
+                store.as_mut_ptr(),
+            );
+            // size=1, capacity=8
+            std::ptr::write_unaligned(
+                buf.as_mut_ptr().add(package_info::APP_ID_VEC_SIZE) as *mut u32,
+                1,
+            );
+            std::ptr::write_unaligned(buf.as_mut_ptr().add(0x48) as *mut u32, store.len() as u32);
+        }
+        let pkg = buf.as_mut_ptr() as *mut c_void;
+        FN_GROW.store(
+            mock_grow_ok as *const c_void as *mut c_void,
+            Ordering::SeqCst,
+        );
+        // 1001 已在, 只应追加 1002.
+        assert!(unsafe { append_app_ids(pkg, &[1001, 1002, 1001]) });
         assert_eq!(store[0], 1001);
         assert_eq!(store[1], 1002);
         FN_GROW.store(std::ptr::null_mut(), Ordering::SeqCst);
