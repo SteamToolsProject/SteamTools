@@ -20,6 +20,8 @@ pub struct CatalogBundle {
     pub access_tokens: HashMap<AppId, u64>,
     pub manifests: HashMap<DepotId, ManifestOverride>,
     pub purchase_times: HashMap<AppId, u32>,
+    /// 该 app 是否需要 access token 才能下载; None = 未知 (按需要处理).
+    pub requires_token: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]

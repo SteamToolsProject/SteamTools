@@ -137,7 +137,7 @@ fn eval_lua_to_bundle_inner(
                         depot_id,
                         ManifestOverride {
                             manifest_gid: gid,
-                            // 上游忽略 size; 这里可选 size 方便测试.
+                            // size 写入 hook 快照; 0 = 保留 Steam 原值 (假 license 时常为 0 → UI 0B).
                             size: size.unwrap_or(0),
                         },
                     );

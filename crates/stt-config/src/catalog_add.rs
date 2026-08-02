@@ -22,6 +22,8 @@ pub struct AddToLibraryOutcome {
     pub owned_count: usize,
     /// 入库成功后仍缺的下载数据 (有清单但缺 key/token), 空 = 齐全.
     pub missing: MissingDownloadData,
+    /// 写入 depotcache 的原始 .manifest 文件数 (0 = 源没给字节, 不失败).
+    pub manifest_files_written: usize,
 }
 
 /// 下载数据缺失情况 (Steam 拿不到就下不了, 应该提示用户).
@@ -74,10 +76,14 @@ pub fn missing_download_data(app_id: AppId, bundle: &CatalogBundle) -> MissingDo
         .into_iter()
         .flatten()
         .any(|depot_id| bundle.manifests.contains_key(depot_id));
+    // 源明确说不需要 token (steamcmd `_missing_token: false`) 时不报缺 token.
+    let need_token = bundle.requires_token != Some(false);
     MissingDownloadData {
         depot_keys,
         // token 为 0 等于没有 (上游用 0 表示未收录).
-        access_token: has_manifest && bundle.access_tokens.get(&app_id).copied().unwrap_or(0) == 0,
+        access_token: has_manifest
+            && need_token
+            && bundle.access_tokens.get(&app_id).copied().unwrap_or(0) == 0,
     }
 }
 
@@ -111,10 +117,20 @@ pub fn format_catalog_lua(app_id: AppId, bundle: &CatalogBundle) -> String {
     let mut manifests: Vec<_> = bundle.manifests.iter().collect();
     manifests.sort_unstable_by_key(|(depot_id, _)| **depot_id);
     for (&depot, over) in manifests {
-        out.push_str(&format!(
-            "setmanifestid({depot}, \"{}\")\n",
-            over.manifest_gid
-        ));
+        // 第三参 size 必须写出: 否则 hook 侧 size=0, 安装对话框显示 0B
+        // (OpenSteamTool: setManifestid(depot, gid, size); size 默认 0 会保留原值,
+        // 但假 license 路径原值常是 0, 必须把 steamcmd download/size 灌进去).
+        if over.size != 0 {
+            out.push_str(&format!(
+                "setmanifestid({depot}, \"{}\", {})\n",
+                over.manifest_gid, over.size
+            ));
+        } else {
+            out.push_str(&format!(
+                "setmanifestid({depot}, \"{}\")\n",
+                over.manifest_gid
+            ));
+        }
     }
     let mut app_depots: Vec<_> = bundle.app_depots.iter().collect();
     app_depots.sort_unstable_by_key(|(id, _)| **id);
@@ -156,6 +172,74 @@ pub fn write_catalog_lua(
     Ok(path)
 }
 
+/// 原始 .manifest 文件名: `{depot}_{gid}.manifest` (Fluent / Steam 约定).
+pub fn manifest_file_name(depot_id: DepotId, manifest_gid: u64) -> String {
+    format!("{depot_id}_{manifest_gid}.manifest")
+}
+
+/// 把 archive 给的原始 .manifest 写到两个 depotcache 目录.
+///
+/// 对齐 Fluent-Install:
+/// - `<Steam>/depotcache/{depot}_{gid}.manifest`
+/// - `<Steam>/config/depotcache/{depot}_{gid}.manifest`
+///
+/// 缺 blob 不报错 (request-code hook 仍可在线拉); 单文件写失败计入 0 次成功.
+pub fn write_manifest_blobs(
+    steam_root: &Path,
+    blobs: &[stt_catalog::ManifestBlob],
+) -> Result<usize> {
+    if blobs.is_empty() {
+        return Ok(0);
+    }
+    let primary = steam_root.join("depotcache");
+    let secondary = steam_root.join("config").join("depotcache");
+    for dir in [&primary, &secondary] {
+        std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+    }
+    let mut written = 0usize;
+    for blob in blobs {
+        if blob.bytes.is_empty() || blob.depot_id == 0 || blob.manifest_gid == 0 {
+            continue;
+        }
+        let name = manifest_file_name(blob.depot_id, blob.manifest_gid);
+        let mut ok_any = false;
+        for dir in [&primary, &secondary] {
+            let path = dir.join(&name);
+            match write_atomic_bytes(&path, &blob.bytes) {
+                Ok(()) => ok_any = true,
+                Err(_) => {
+                    // 单个目录失败不阻断另一目录 / 其它 depot.
+                }
+            }
+        }
+        if ok_any {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::ffi::OsString;
+    let mut name: OsString = path.file_name().unwrap_or_default().to_owned();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    std::fs::write(&tmp, bytes).map_err(|source| ConfigError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, path).map_err(|source| {
+        let _ = std::fs::remove_file(&tmp);
+        ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
 fn now_unix() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -180,6 +264,9 @@ pub fn add_to_library(
     bundle.purchase_times.entry(app_id).or_insert_with(now_unix);
 
     let lua_path = write_catalog_lua(steam_root, app_id, &bundle)?;
+    // Fluent 路径: 有原始 .manifest 就写 depotcache; 没有也不挡入库.
+    let manifest_files_written =
+        write_manifest_blobs(steam_root, &fetched.manifest_blobs).unwrap_or(0);
 
     state.with_rules_mut(|rules| {
         rules.apply_catalog_bundle(&bundle);
@@ -200,6 +287,7 @@ pub fn add_to_library(
         epoch: state.rules_epoch(),
         owned_count: state.owned_count(),
         missing: missing_download_data(app_id, &bundle),
+        manifest_files_written,
     })
 }
 
@@ -263,13 +351,32 @@ mod tests {
             11,
             stt_core::ManifestOverride {
                 manifest_gid: 99,
-                size: 0,
+                size: 12345,
             },
         );
         let s = format_catalog_lua(10, &b);
         assert!(s.contains("addappid(11, 0,"));
         assert!(s.contains("setappdepots(10, {11})"));
+        assert!(
+            s.contains("setmanifestid(11, \"99\", 12345)\n"),
+            "size 必须写入, 否则安装对话框 0B: {s}"
+        );
+    }
+
+    #[test]
+    fn format_lua_omits_zero_size_third_arg() {
+        let mut b = CatalogBundle::default();
+        b.apps.push(10);
+        b.manifests.insert(
+            11,
+            stt_core::ManifestOverride {
+                manifest_gid: 99,
+                size: 0,
+            },
+        );
+        let s = format_catalog_lua(10, &b);
         assert!(s.contains("setmanifestid(11, \"99\")\n"));
+        assert!(!s.contains("setmanifestid(11, \"99\", 0)"));
     }
 
     /// 默认工具开关下跑一次入库 (tempdir 需与结果同生命周期).
@@ -460,6 +567,103 @@ mod tests {
         assert!(missing.depot_keys.is_empty());
         assert!(missing.access_token);
         assert_eq!(missing.describe(), "访问令牌");
+    }
+
+    #[test]
+    fn missing_download_data_skips_token_when_source_marks_it_unneeded() {
+        let mut b = CatalogBundle::default();
+        b.apps.push(42);
+        b.app_depots.insert(42, vec![11]);
+        b.depot_keys.insert(11, "a".repeat(64));
+        b.manifests.insert(
+            11,
+            stt_core::ManifestOverride {
+                manifest_gid: 99,
+                size: 0,
+            },
+        );
+        b.requires_token = Some(false);
+
+        assert!(missing_download_data(42, &b).is_empty());
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn add_to_library_persists_manifest_when_download_key_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = ConfigState::new();
+        let bundle = CatalogBundle {
+            apps: vec![42],
+            app_depots: std::collections::HashMap::from([(42, vec![11])]),
+            manifests: std::collections::HashMap::from([(
+                11,
+                stt_core::ManifestOverride {
+                    manifest_gid: 99,
+                    size: 0,
+                },
+            )]),
+            requires_token: Some(false),
+            ..CatalogBundle::default()
+        };
+        let provider = MockCatalogProvider::new().with_fixture(42, bundle);
+
+        let outcome = add_to_library(&state, root.path(), &provider, 42).unwrap();
+
+        assert_eq!(outcome.missing.depot_keys, vec![11]);
+        assert!(outcome.lua_path.exists());
+        assert!(std::fs::read_to_string(outcome.lua_path)
+            .unwrap()
+            .contains("setmanifestid(11, \"99\")\n"));
+        // Mock 不给 blob → 0 文件, 仍算入库成功.
+        assert_eq!(outcome.manifest_files_written, 0);
+    }
+
+    #[test]
+    fn write_manifest_blobs_writes_both_depotcache_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = vec![stt_catalog::ManifestBlob {
+            depot_id: 43,
+            manifest_gid: 99,
+            bytes: b"raw-manifest".to_vec(),
+        }];
+
+        let written = write_manifest_blobs(root.path(), &blobs).unwrap();
+
+        assert_eq!(written, 1);
+        let name = manifest_file_name(43, 99);
+        let primary = root.path().join("depotcache").join(&name);
+        let secondary = root.path().join("config").join("depotcache").join(&name);
+        assert_eq!(std::fs::read(primary).unwrap(), b"raw-manifest");
+        assert_eq!(std::fs::read(secondary).unwrap(), b"raw-manifest");
+    }
+
+    #[test]
+    fn write_manifest_blobs_skips_empty_and_zero_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = vec![
+            stt_catalog::ManifestBlob {
+                depot_id: 0,
+                manifest_gid: 99,
+                bytes: b"x".to_vec(),
+            },
+            stt_catalog::ManifestBlob {
+                depot_id: 43,
+                manifest_gid: 0,
+                bytes: b"x".to_vec(),
+            },
+            stt_catalog::ManifestBlob {
+                depot_id: 43,
+                manifest_gid: 99,
+                bytes: Vec::new(),
+            },
+        ];
+
+        assert_eq!(write_manifest_blobs(root.path(), &blobs).unwrap(), 0);
+        assert!(!root
+            .path()
+            .join("depotcache")
+            .join("43_99.manifest")
+            .exists());
     }
 
     #[test]

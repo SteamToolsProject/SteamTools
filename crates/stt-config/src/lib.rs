@@ -26,8 +26,8 @@ pub use appinfo::app_names;
 #[cfg(feature = "lua")]
 pub use catalog_add::remove_from_library;
 pub use catalog_add::{
-    add_to_library, catalog_lua_path, format_catalog_lua, write_catalog_lua, AddToLibraryOutcome,
-    MissingDownloadData,
+    add_to_library, catalog_lua_path, format_catalog_lua, manifest_file_name, write_catalog_lua,
+    write_manifest_blobs, AddToLibraryOutcome, MissingDownloadData,
 };
 pub use error::{ConfigError, Result};
 pub use host_toml::{
