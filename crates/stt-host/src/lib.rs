@@ -28,10 +28,10 @@ use stt_catalog::{
     CustomHttpCatalogProvider, MockCatalogProvider, ProviderErrorKind,
 };
 use stt_config::{
-    add_to_library, apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent,
-    ConfigSnapshot, ConfigState, HostConfig, LuaCatalogProvider, LuaHttpClient, LuaHttpErrorKind,
-    LuaHttpMethod, LuaHttpRequest, LuaHttpResponse, MissingDownloadData, StoreAccelEgress,
-    StoreAccelSection, ToolId,
+    apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent, ConfigSnapshot,
+    ConfigState, HostConfig, LuaCatalogProvider, LuaHttpClient, LuaHttpErrorKind, LuaHttpMethod,
+    LuaHttpRequest, LuaHttpResponse, MissingDownloadData, StoreAccelEgress, StoreAccelSection,
+    ToolId,
 };
 use stt_core::{AppId, AppRules};
 use stt_steamclient::{LicenseQueue, UiLicenseAction};
@@ -174,9 +174,27 @@ struct LibraryAddedResult {
 /// 入库成功后: 入队 + notify; package 降级必须反馈为部分成功.
 ///
 /// 对齐 OST: package0 同时注入主 app 与全部 depot id (否则安装体积 0B).
-fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) -> LibraryAddedResult {
+/// `owned_apps` 含主游戏 + 本次并入的 DLC app (单文件模型).
+fn on_library_added(
+    steam_root: &Path,
+    state: &ConfigState,
+    primary: AppId,
+    owned_apps: &[AppId],
+) -> LibraryAddedResult {
     sync_download_runtime(state);
-    let inject_ids = package_ids_for_app(state, app_id);
+    let mut inject = HashSet::new();
+    let apps = if owned_apps.is_empty() {
+        std::slice::from_ref(&primary)
+    } else {
+        owned_apps
+    };
+    for &app_id in apps {
+        for id in package_ids_for_app(state, app_id) {
+            inject.insert(id);
+        }
+    }
+    let mut inject_ids: Vec<AppId> = inject.into_iter().collect();
+    inject_ids.sort_unstable();
     for &id in &inject_ids {
         stt_steamclient::add_configured_app(id);
     }
@@ -203,9 +221,9 @@ fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) -> Li
                 .join(",")
         ),
     );
-    // 库 UI 只认主 app, 不把 depot 当库条目.
+    // 库 UI 跟 owned 全集; present 只点主 app 触发刷新.
     state.with_rules(|rules| library_ux().sync_from_rules(rules));
-    library_ux().on_rules_app_present(app_id);
+    library_ux().on_rules_app_present(primary);
     if plan.client_applied {
         LibraryAddedResult {
             result: CatalogJobResult::Success,
@@ -223,12 +241,21 @@ fn on_library_added(steam_root: &Path, state: &ConfigState, app_id: AppId) -> Li
     }
 }
 
-fn catalog_job_note(result: CatalogJobResult, app_id: AppId, detail: &str) -> String {
-    format!("{}: 入库 {app_id}: {detail}", result.label())
+fn catalog_job_note(
+    result: CatalogJobResult,
+    app_id: AppId,
+    dlc_suffix: &str,
+    detail: &str,
+) -> String {
+    format!("{}: 入库 {app_id}{dlc_suffix}: {detail}", result.label())
 }
 
-fn catalog_button_label(result: CatalogJobResult, app_id: AppId) -> String {
-    format!("入库{} {app_id}", result.label())
+fn catalog_button_label(result: CatalogJobResult, app_id: AppId, dlc_total: usize) -> String {
+    if dlc_total == 0 {
+        format!("入库{} {app_id}", result.label())
+    } else {
+        format!("入库{} {app_id}+{dlc_total}", result.label())
+    }
 }
 
 /// 缺下载数据时的日志后缀 (空 = 齐全).
@@ -594,7 +621,32 @@ fn add_from_config(
 ) -> stt_config::Result<stt_config::AddToLibraryOutcome> {
     let host = state.host();
     let provider = build_catalog_provider(steam_root, &host.catalog)?;
-    add_to_library(state, steam_root, provider.as_ref(), app_id)
+    let dlc_opts = if host.catalog.auto_dlc {
+        stt_config::DlcExpandOptions {
+            enabled: true,
+            max_dlc: host.catalog.max_dlc as usize,
+            timeout: std::time::Duration::from_millis(u64::from(host.catalog.dlc_timeout_ms)),
+        }
+    } else {
+        stt_config::DlcExpandOptions::disabled()
+    };
+    let http = catalog_http_get_options(&host.catalog);
+    stt_config::add_to_library_with_dlc(
+        state,
+        steam_root,
+        provider.as_ref(),
+        app_id,
+        dlc_opts,
+        http,
+    )
+}
+
+fn catalog_http_get_options(config: &CatalogSection) -> stt_platform::WinHttpGetOptions {
+    let req = catalog_http_options(config);
+    stt_platform::WinHttpGetOptions {
+        timeouts: req.timeouts,
+        max_body_bytes: req.max_response_body_bytes,
+    }
 }
 
 fn catalog_trace_text(trace: &[CatalogTraceEntry]) -> String {
@@ -895,12 +947,15 @@ fn spawn_catalog_worker(
             while let Ok(job) = jobs_rx.recv() {
                 match add_from_config(&state, &root, job.app_id) {
                     Ok(out) => {
-                        let applied = on_library_added(&root, &state, job.app_id);
+                        let applied =
+                            on_library_added(&root, &state, job.app_id, &out.owned_apps);
                         let missing_log = missing_log_suffix(&out.missing);
+                        let dlc_total = out.dlc.total_added();
+                        let dlc_suffix = out.dlc.summary_suffix();
                         append_host_log(
                             &root,
                             &format!(
-                                "catalog_add={} result={} source={} app_id={} provider={} trace={} lua={} epoch={} owned={} manifest_files={} detail={}{missing_log}",
+                                "catalog_add={} result={} source={} app_id={} provider={} trace={} lua={} epoch={} owned={} manifest_files={} dlc_unlock={} dlc_full={} dlc_skip={} dlc_list={} detail={}{missing_log}",
                                 if applied.result == CatalogJobResult::Success {
                                     "ok"
                                 } else {
@@ -915,6 +970,10 @@ fn spawn_catalog_worker(
                                 out.epoch,
                                 out.owned_count,
                                 out.manifest_files_written,
+                                out.dlc.unlock_only.len(),
+                                out.dlc.downloadable.len(),
+                                out.dlc.skipped.len(),
+                                out.dlc.list_source,
                                 applied.detail
                             ),
                         );
@@ -923,6 +982,7 @@ fn spawn_catalog_worker(
                             catalog_job_note(
                                 applied.result,
                                 job.app_id,
+                                &dlc_suffix,
                                 &format!(
                                     "已落盘; provider={}; owned={}; {}{}",
                                     out.provider_id,
@@ -940,7 +1000,7 @@ fn spawn_catalog_worker(
                             let _ = feedback_tx.send(stt_steamui::store_button_result_js(
                                 job.app_id,
                                 true,
-                                &catalog_button_label(applied.result, job.app_id),
+                                &catalog_button_label(applied.result, job.app_id, dlc_total),
                             ));
                             // 有清单但缺下载数据 (key/token): 商店页弹窗提示,
                             // 免得用户以为能直接下载.
@@ -969,6 +1029,7 @@ fn spawn_catalog_worker(
                             catalog_job_note(
                                 CatalogJobResult::Failure,
                                 job.app_id,
+                                "",
                                 &error_text,
                             ),
                         );
@@ -976,7 +1037,7 @@ fn spawn_catalog_worker(
                             let _ = feedback_tx.send(stt_steamui::store_button_result_js(
                                 job.app_id,
                                 false,
-                                &catalog_button_label(CatalogJobResult::Failure, job.app_id),
+                                &catalog_button_label(CatalogJobResult::Failure, job.app_id, 0),
                             ));
                         }
                     }
@@ -3126,6 +3187,8 @@ end
         let mut host = HostConfig::default();
         host.catalog.mode = CatalogMode::CustomHttp;
         host.catalog.url_template = server.template.clone();
+        // 单测不走 DLC 扩展 (否则 related 空会打 store 兜底网, 易超时).
+        host.catalog.auto_dlc = false;
         host.tools.enabled.insert("download_kit".to_owned(), true);
         state.apply_host(host);
 
@@ -3211,6 +3274,7 @@ end
         let mut host = HostConfig::default();
         host.catalog.mode = CatalogMode::CustomHttp;
         host.catalog.url_template = server.template.clone();
+        host.catalog.auto_dlc = false;
         state.apply_host(host);
 
         let queue = Arc::new(LicenseQueue::new());
@@ -3279,8 +3343,8 @@ end
             (CatalogJobResult::Partial, "部分成功"),
             (CatalogJobResult::Failure, "失败"),
         ] {
-            assert!(catalog_job_note(result, 42, "detail").starts_with(label));
-            assert!(catalog_button_label(result, 42).contains(label));
+            assert!(catalog_job_note(result, 42, "", "detail").starts_with(label));
+            assert!(catalog_button_label(result, 42, 0).contains(label));
             assert!(!result.as_str().is_empty());
         }
     }
