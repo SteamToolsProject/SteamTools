@@ -5,6 +5,53 @@
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-08-03
+
+入库链路补齐 DLC / 清单下载数据, 配置面板支持拖放导入社区 lua, 下载与 package 注入若干稳定性修复。
+
+### Added
+
+- **自动 DLC**: 主游戏入库后可按配置自动扩展 DLC; 有清单+密钥则完整合并,
+  否则仅 `addappid` 解锁; 失败/超时不拖垮主游戏 (`catalog.auto_dlc`, 默认开)
+- **商店 DLC 勾选**: 入库菜单增加「仅游戏 / 选择 DLC」; Store DLC picker 浮层,
+  `CatalogDlcMode` (Full / GameOnly / Selected) 两段 list/commit 协议
+- **本地 lua 拖放导入**: 配置面板「脚本目录」支持 dropzone / 文件选择;
+  `import_local` 引擎校验 DSL 后写入 `config/lua`, 即时 package/库对齐;
+  工具开关 `lua_drop` (拖放导入)
+- **社区 DSL 大小写别名**: 兼容 `setManifestid` / `AddAppId` / `AddToken` /
+  `setAppDepots` 等社区脚本常见写法
+- **Catalog 源链增强**: CatMisteam 完整 Provider + key Enricher;
+  Community → CatMisteam → CaiGamer 回退; token 缺失时 CaiGames appinfo 补
+  access token; `listofdlc` 等字段解析带出 `related_dlc_ids`
+- **入库缺下载数据提示**: 成功但缺 depot key / access token 时商店页弹窗提示
+  (可右键刷新清单重试); 入库结果携带 `MissingDownloadData`
+- **depotcache 落盘**: manifest 双写 Steam `depotcache`; `setmanifestid` 写出
+  非零 size, 避免假 license 安装对话框显示 0B
+- **package0 multi-app 注入**: 入库后覆盖主 app + 全部 depot (对齐 OST);
+  库 UI 仍只认主 app; 反馈 DLC 计数 (`dlc_unlock` / `dlc_full`)
+- **配置面板**: 源设置页「自动添加 DLC」开关; 脚本页底部粘性反馈条
+
+### Changed
+
+- Community 成功路径不再因 key 不完整硬失败; 缺 key 改由上层 missing 提示
+- 管理列表识别 `stt_` / `import_` / 纯数字文件名
+
+### Fixed
+
+- **package0 自愈**: Steam 原生卸载清空 AppIdVec 后, 其它入库游戏一起从库消失;
+  周期 `heal_sync` + notify 前 resync, 不依赖用户点「刷新清单」
+- **无 key depot 剪枝**: 缺密钥的 DLC 仓不再进入下载面, 避免整包被判加密
+- **depot key hook**: 去掉错误的 EConfigStore UserLocal 过滤; 路径匹配对齐 OST
+  (`\DecryptionKey` / `/`)
+- **request-code**: 多源 HTTP 回退链 (opensteamtool / wudrm / steamrun);
+  recv 最多等 12s; 解析允许首尾空白
+- **共享 send hook**: token / request-code 共用 `BBuildAndAsyncSendFrame`,
+  已挂 hook 只激活 consumer; 去掉硬编码 steamclient SHA
+- **库 UX**: MarkAppChange detour 捕获 this; 移除 drain 后通知 UI;
+  CDP pipe/ws 分类日志与 reply 总时限
+- **安装器**: 固定安装到已验证的 Steam 根目录 (去掉目录选择页);
+  多源探测注册表与常见路径, 要求存在 `steam.exe`
+
 ## [v0.1.0] - 2026-08-01
 
 首个公测版 (M0–M8 + 发布形态): Steam 内嵌工具箱, 纯 Rust, DLL 劫持加载。
