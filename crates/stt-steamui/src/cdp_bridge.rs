@@ -20,20 +20,54 @@ use crate::store_inject::{app_id_from_store_path, STORE_INJECT_JS};
 
 pub(crate) const DRAIN_JS: &str = r#"(function(){var p=window.__SteamToolsPending||[];window.__SteamToolsPending=[];return p;})()"#;
 
+/// 商店页一次入库意图 (主击 / 菜单 / DLC 列表 / DLC 确认).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePendingJob {
+    pub app_id: u32,
+    /// full | game_only | select_dlc
+    pub mode: String,
+    /// 仅 select_dlc: list 拉候选 / commit 写入.
+    pub stage: Option<String>,
+    pub dlc_ids: Vec<u32>,
+    pub reason: String,
+}
+
+impl StorePendingJob {
+    pub fn is_dlc_list(&self) -> bool {
+        self.mode == "select_dlc" && self.stage.as_deref() == Some("list")
+    }
+
+    pub fn is_dlc_commit(&self) -> bool {
+        self.mode == "select_dlc" && self.stage.as_deref() != Some("list")
+    }
+}
+
 /// CDP 专用短脚本: 大脚本在 CEF evaluate 上偶发挂起; 短脚本狗粮已验证 near-cart 可挂.
 ///
 /// 点击只入 `window.__SteamToolsPending`, 由 [`DRAIN_JS`] 取走 — 商店页的 CSP
 /// `connect-src` 只放行 `127.0.0.1:27060` (Steam 自己占着), 页面发不出到别的
 /// 本机端口的请求, 所以不存在"直接回传"这条路.
+///
+/// 状态:
+/// - STT managed / Steam already_owned → 灰「已入库」, 不可点
+/// - 未管理 → split「入库 | ▾」: 主击全入库; 菜单 全入库/仅游戏/选择 DLC
 pub const CDP_STORE_INJECT_JS: &str = r##"
 (function(){
   window.__SteamToolsPending = window.__SteamToolsPending || [];
+  window.__SteamToolsManaged = window.__SteamToolsManaged || [];
   var href = String(location.href||"");
-  var m = String(location.pathname||"").match(/^\/app\/(\d+)(?:\/|$)/);
+  var m = String(location.pathname||"").match(/^\/(?:agecheck\/)?app\/(\d+)(?:\/|$)/);
   var appId = m ? m[1] : null;
   if(!appId) return "no-appid";
-  // 购买区: 按钮放进本体的 .game_purchase_action_bg, 与「添加至购物车」同一行.
-  // 跳过试玩版 (demo_above_purchase) 与捆绑包 ([data-ds-bundleid]) 区块.
+  function isManaged(){
+    var list = window.__SteamToolsManaged || [];
+    var id = Number(appId);
+    for(var i=0;i<list.length;i++){ if(Number(list[i])===id) return true; }
+    return false;
+  }
+  function isOwnedUi(){
+    return !!document.querySelector(".game_area_already_owned,.game_area_already_owned_ctn,.already_in_library");
+  }
   function anchorHost(){
     var games = document.querySelectorAll(".game_area_purchase_game");
     for(var i=0;i<games.length;i++){
@@ -61,35 +95,139 @@ pub const CDP_STORE_INJECT_JS: &str = r##"
     el.style.marginLeft="2px"; el.style.zIndex=""; el.style.boxShadow="";
     el.removeAttribute("data-stt-fallback");
   }
+  function closeMenu(){
+    var mnu=document.getElementById("stt-store-menu");
+    if(mnu && mnu.parentNode) mnu.parentNode.removeChild(mnu);
+  }
+  // Steam 原生按钮靠外层 a.btn_* + 内层 span 出渐变/高度; 不要改外层 display.
+  function setLabel(wrap, text, withChev){
+    wrap.innerHTML="";
+    var shell=document.createElement("span");
+    shell.style.cssText="display:inline-flex;align-items:center;gap:0;";
+    var main=document.createElement("span");
+    main.setAttribute("data-stt-main","1");
+    main.textContent=text;
+    shell.appendChild(main);
+    if(withChev){
+      var chev=document.createElement("span");
+      chev.setAttribute("data-stt-chev","1");
+      chev.setAttribute("aria-label","更多入库选项");
+      // 小三角, 跟主文案同一行; 左边一条淡分隔, 不另起一块底色.
+      chev.innerHTML="&#9662;";
+      chev.style.cssText="margin-left:7px;padding-left:7px;border-left:1px solid rgba(255,255,255,.22);font-size:11px;line-height:1;opacity:.92;";
+      shell.appendChild(chev);
+    }
+    wrap.appendChild(shell);
+    return {main:main, chev:wrap.querySelector("[data-stt-chev]")};
+  }
+  function setBusy(wrap, text){
+    closeMenu();
+    wrap.setAttribute("data-stt-busy","1");
+    wrap.className="btn_grey_steamui btn_medium";
+    wrap.style.cursor="default";
+    wrap.onclick=null;
+    setLabel(wrap, text, false);
+  }
+  function enqueue(mode, stage, dlcIds, reason){
+    var item={app_id:Number(appId),mode:mode||"full",reason:reason||"store_btn",href:href,ts:Date.now()};
+    if(stage) item.stage=stage;
+    if(dlcIds && dlcIds.length) item.dlc_ids=dlcIds;
+    window.__SteamToolsPending.push(item);
+  }
+  function openMenu(wrap){
+    closeMenu();
+    if(wrap.getAttribute("data-stt-busy")) return;
+    var menu=document.createElement("div");
+    menu.id="stt-store-menu";
+    menu.setAttribute("data-stt-store-menu","1");
+    // 贴近 Steam 上下文菜单: 深底 + 细边 + 轻阴影.
+    menu.style.cssText="position:absolute;z-index:2147483647;min-width:148px;background:#171a21;border:1px solid #3d4450;border-radius:2px;box-shadow:0 0 12px rgba(0,0,0,.55);padding:2px 0;font:13px/1.4 \"Motiva Sans\",Arial,sans-serif;color:#dcdedf;";
+    function addItem(text, fn){
+      var row=document.createElement("div");
+      row.textContent=text;
+      row.style.cssText="padding:7px 14px;cursor:pointer;white-space:nowrap;";
+      row.onmouseenter=function(){row.style.background="#1a9fff"; row.style.color="#fff";};
+      row.onmouseleave=function(){row.style.background=""; row.style.color="";};
+      row.onclick=function(ev){try{ev.preventDefault();ev.stopPropagation();}catch(e){} closeMenu(); fn();};
+      menu.appendChild(row);
+    }
+    addItem("全入库", function(){ enqueue("full",null,null,"store_menu"); setBusy(wrap,"已排队"); });
+    addItem("仅游戏", function(){ enqueue("game_only",null,null,"store_menu"); setBusy(wrap,"已排队"); });
+    addItem("选择 DLC…", function(){ enqueue("select_dlc","list",null,"store_dlc"); setBusy(wrap,"加载 DLC…"); });
+    var rect=wrap.getBoundingClientRect();
+    menu.style.left=(rect.left+(window.scrollX||0))+"px";
+    menu.style.top=(rect.bottom+2+(window.scrollY||0))+"px";
+    (document.body||document.documentElement).appendChild(menu);
+    setTimeout(function(){
+      function onDoc(ev){
+        if(menu.contains(ev.target) || wrap.contains(ev.target)) return;
+        closeMenu();
+        document.removeEventListener("mousedown", onDoc, true);
+      }
+      document.addEventListener("mousedown", onDoc, true);
+    },0);
+  }
+  function paintOwned(wrap){
+    closeMenu();
+    wrap.className="btn_grey_steamui btn_medium";
+    wrap.style.cursor="default";
+    wrap.style.display="";
+    wrap.style.alignItems="";
+    wrap.removeAttribute("data-stt-busy");
+    wrap.onclick=null;
+    setLabel(wrap, "已入库", false);
+  }
+  function paintActive(wrap){
+    wrap.className="btn_blue_steamui btn_medium";
+    wrap.style.cursor="pointer";
+    wrap.style.display="";
+    wrap.style.alignItems="";
+    wrap.removeAttribute("data-stt-busy");
+    // 一体式: 外层仍是单颗 Steam 蓝钮; 内层「入库 + ▾」共享同一渐变.
+    var parts=setLabel(wrap, "入库", true);
+    parts.main.style.cursor="pointer";
+    if(parts.chev) parts.chev.style.cursor="pointer";
+    parts.main.onclick=function(ev){
+      try{ev.preventDefault();ev.stopPropagation();}catch(e){}
+      if(wrap.getAttribute("data-stt-busy")) return;
+      enqueue("full",null,null,"store_btn");
+      setBusy(wrap,"已排队");
+    };
+    if(parts.chev){
+      parts.chev.onclick=function(ev){
+        try{ev.preventDefault();ev.stopPropagation();}catch(e){}
+        if(wrap.getAttribute("data-stt-busy")) return;
+        openMenu(wrap);
+      };
+    }
+  }
   var host = anchorHost();
   var old = document.querySelector("[data-stt-store-btn]");
+  var locked = isManaged() || isOwnedUi();
   if(old){
-    // 页面刚导航时购买区常未渲染, 先挂兜底; 之后有锚点了再搬过去.
-    if(old.getAttribute("data-stt-fallback") && host){
-      toInline(old); host.appendChild(old); return "moved "+appId;
+    if(old.getAttribute("data-stt-app") !== String(appId)){
+      // app 变了: 重建
+      if(old.parentNode) old.parentNode.removeChild(old);
+      old=null;
+    } else {
+      if(old.getAttribute("data-stt-fallback") && host){
+        toInline(old); host.appendChild(old);
+      }
+      // busy 中不打断; 否则按 managed 重绘 (也清掉旧版 split 的 display:flex 残留).
+      if(!old.getAttribute("data-stt-busy")){
+        if(locked) paintOwned(old); else paintActive(old);
+      } else if(locked){
+        paintOwned(old);
+      }
+      return old.getAttribute("data-stt-fallback") && host ? ("moved "+appId) : "already";
     }
-    return "already";
   }
-  function enqueue(id){
-    window.__SteamToolsPending.push({app_id:Number(id),reason:"store_btn",href:href,ts:Date.now()});
-  }
-  // 用 Steam 自己的按钮类, 与「添加至购物车」同一套渐变/字号/圆角 (蓝色区分是我们的).
   var btn=document.createElement("a");
-  btn.className="btn_blue_steamui btn_medium";
   btn.setAttribute("role","button");
   btn.setAttribute("data-stt-store-btn","1");
   btn.setAttribute("data-stt-app", String(appId));
-  btn.style.cssText="cursor:pointer;margin-left:2px;";
-  var label=document.createElement("span");
-  label.textContent="入库";
-  btn.appendChild(label);
-  btn.addEventListener("click",function(ev){
-    try{ev.preventDefault();ev.stopPropagation();}catch(e){}
-    enqueue(appId);
-    label.textContent="已排队";
-    btn.className="btn_grey_steamui btn_medium";
-    btn.style.cursor="default";
-  });
+  btn.style.cssText="margin-left:2px;";
+  if(locked) paintOwned(btn); else paintActive(btn);
   if(host){ host.appendChild(btn); return "near-cart "+appId; }
   toFixed(btn);
   (document.body||document.documentElement).appendChild(btn);
@@ -109,8 +247,13 @@ pub fn cdp_store_inject_js() -> String {
 pub const STORE_TEARDOWN_JS: &str = r##"
 (function(){
   var b=document.querySelectorAll("[data-stt-store-btn]");
-  if(!b.length) return "off";
+  var menu=document.getElementById("stt-store-menu");
+  var picker=document.getElementById("stt-dlc-picker");
+  var n=b.length;
   for(var i=0;i<b.length;i++){ if(b[i].remove) b[i].remove(); }
+  if(menu && menu.parentNode) menu.parentNode.removeChild(menu);
+  if(picker && picker.parentNode) picker.parentNode.removeChild(picker);
+  if(!n && !menu && !picker) return "off";
   return "removed";
 })()
 "##;
@@ -170,8 +313,8 @@ pub fn store_missing_key_warn_js(app_id: u32, missing_text: &str) -> String {
 
 /// 把一次入库结果写回商店按钮 (短脚本, 可每轮 evaluate).
 ///
-/// 只改带 `data-stt-store-btn` 且 `data-stt-app` 对得上的按钮; 对不上就不动,
-/// 避免把别的 app 页按钮改错. 成功/失败都不再停在「已排队」.
+/// 只改带 `data-stt-store-btn` 且 `data-stt-app` 对得上的按钮; 对不上就不动.
+/// 成功/失败都用灰态: 成功是「已入库」; 失败保留文案, 下一轮 inject 可恢复 split.
 pub fn store_button_result_js(app_id: u32, ok: bool, label: &str) -> String {
     let safe: String = label
         .chars()
@@ -182,11 +325,7 @@ pub fn store_button_result_js(app_id: u32, ok: bool, label: &str) -> String {
         })
         .take(24)
         .collect();
-    let cls = if ok {
-        "btn_blue_steamui btn_medium"
-    } else {
-        "btn_grey_steamui btn_medium"
-    };
+    let _ = ok;
     format!(
         "(function(){{\n  var id=String({app_id});\n  \
   var nodes=document.querySelectorAll('[data-stt-store-btn]');\n  \
@@ -194,11 +333,134 @@ pub fn store_button_result_js(app_id: u32, ok: bool, label: &str) -> String {
     var marked=b.getAttribute('data-stt-app');\n    \
     if(marked && marked!==id) continue;\n    \
     b.setAttribute('data-stt-app', id);\n    \
-    b.className='{cls}';\n    \
+    b.className='btn_grey_steamui btn_medium';\n    \
     b.style.cursor='default';\n    \
-    var sp=b.querySelector('span');\n    \
-    if(sp) sp.textContent='{safe}';\n    \
-    else b.textContent='{safe}';\n  }}\n  return 'ok';\n}})()"
+    if('{safe}'==='已入库'){{ b.removeAttribute('data-stt-busy'); }}\n    \
+    else {{ b.setAttribute('data-stt-busy','1'); }}\n    \
+    b.innerHTML='';\n    \
+    var sp=document.createElement('span');\n    \
+    sp.setAttribute('data-stt-main','1');\n    \
+    sp.textContent='{safe}';\n    \
+    b.appendChild(sp);\n  }}\n  return 'ok';\n}})()"
+    )
+}
+
+/// 打开 DLC 多选浮层. `items_json` 为 `[{"id":n,"name":"..."},…]` (serde 生成).
+pub fn store_dlc_picker_js(app_id: u32, items_json: &str, truncated: bool) -> String {
+    let foot = if truncated {
+        "列表已截断, 仅显示部分候选"
+    } else {
+        ""
+    };
+    format!(
+        r##"(function(){{
+  var d=document, appId={app_id};
+  var old=d.getElementById("stt-dlc-picker");
+  if(old && old.parentNode) old.parentNode.removeChild(old);
+  var items={items_json};
+  var wrap=d.createElement("div");
+  wrap.id="stt-dlc-picker";
+  wrap.style.cssText="position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;";
+  var box=d.createElement("div");
+  box.style.cssText="width:min(440px,92vw);max-height:80vh;display:flex;flex-direction:column;background:#1b2838;border:1px solid #4b6b80;border-radius:6px;padding:14px 16px;color:#c7d5e0;font:13px/1.45 Arial,sans-serif;box-shadow:0 8px 32px rgba(0,0,0,.5);";
+  var title=d.createElement("div");
+  title.textContent="选择要入库的 DLC";
+  title.style.cssText="font-size:15px;font-weight:bold;color:#dbe9f4;margin-bottom:8px;";
+  var sub=d.createElement("div");
+  sub.textContent="AppID "+appId+(items.length?(" · "+items.length+" 项"):" · 未找到 DLC");
+  sub.style.cssText="color:#8f98a0;margin-bottom:10px;font-size:12px;";
+  var tools=d.createElement("div");
+  tools.style.cssText="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;";
+  function mkBtn(t){{ var b=d.createElement("button"); b.textContent=t; b.style.cssText="padding:4px 10px;background:#2a475e;border:1px solid #4b6b80;border-radius:2px;color:#c7d5e0;cursor:pointer;font-size:12px;"; return b; }}
+  var all=mkBtn("全选"), none=mkBtn("全不选");
+  tools.appendChild(all); tools.appendChild(none);
+  var filter=d.createElement("input");
+  filter.placeholder="筛选…";
+  filter.style.cssText="flex:1;min-width:120px;padding:4px 8px;background:#0e1621;border:1px solid #4b6b80;border-radius:2px;color:#c7d5e0;";
+  tools.appendChild(filter);
+  var list=d.createElement("div");
+  list.style.cssText="overflow:auto;flex:1;min-height:120px;max-height:46vh;border:1px solid #2a475e;border-radius:3px;padding:4px 0;";
+  var checks=[];
+  function render(q){{
+    list.innerHTML=""; checks=[];
+    q=(q||"").toLowerCase();
+    for(var i=0;i<items.length;i++){{
+      var it=items[i]; var name=String(it.name||("DLC "+it.id));
+      if(q && name.toLowerCase().indexOf(q)<0 && String(it.id).indexOf(q)<0) continue;
+      var row=d.createElement("label");
+      row.style.cssText="display:flex;gap:8px;align-items:flex-start;padding:6px 10px;cursor:pointer;";
+      var cb=d.createElement("input"); cb.type="checkbox"; cb.checked=true; cb.value=String(it.id);
+      var tx=d.createElement("span"); tx.textContent=name+"  ("+it.id+")";
+      row.appendChild(cb); row.appendChild(tx); list.appendChild(row); checks.push(cb);
+    }}
+    if(!checks.length){{ var empty=d.createElement("div"); empty.textContent=items.length?"无匹配项":"未找到 DLC, 确认将仅入库主游戏"; empty.style.cssText="padding:16px;color:#8f98a0;"; list.appendChild(empty); }}
+  }}
+  render("");
+  all.onclick=function(){{ for(var i=0;i<checks.length;i++) checks[i].checked=true; }};
+  none.onclick=function(){{ for(var i=0;i<checks.length;i++) checks[i].checked=false; }};
+  filter.oninput=function(){{ render(filter.value); }};
+  var foot=d.createElement("div");
+  foot.textContent="{foot}";
+  foot.style.cssText="color:#8f98a0;font-size:11px;margin-top:6px;min-height:14px;";
+  var actions=d.createElement("div");
+  actions.style.cssText="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;";
+  var cancel=mkBtn("取消"); var ok=mkBtn("确认入库");
+  ok.style.background="#66c0f4"; ok.style.color="#1b2838"; ok.style.border="none";
+  function close(){{ if(wrap.parentNode) wrap.parentNode.removeChild(wrap); }}
+  function restoreBtn(){{
+    var nodes=d.querySelectorAll("[data-stt-store-btn]");
+    for(var i=0;i<nodes.length;i++){{
+      var b=nodes[i];
+      if(b.getAttribute("data-stt-app")!==String(appId)) continue;
+      b.removeAttribute("data-stt-busy");
+    }}
+  }}
+  cancel.onclick=function(){{ close(); restoreBtn(); }};
+  ok.onclick=function(){{
+    var ids=[];
+    for(var i=0;i<checks.length;i++){{ if(checks[i].checked) ids.push(Number(checks[i].value)); }}
+    window.__SteamToolsPending=window.__SteamToolsPending||[];
+    window.__SteamToolsPending.push({{app_id:Number(appId),mode:"select_dlc",stage:"commit",dlc_ids:ids,reason:"store_dlc",href:String(location.href||""),ts:Date.now()}});
+    close();
+    var nodes=d.querySelectorAll("[data-stt-store-btn]");
+    for(var j=0;j<nodes.length;j++){{
+      var b=nodes[j];
+      if(b.getAttribute("data-stt-app")!==String(appId)) continue;
+      b.setAttribute("data-stt-busy","1");
+      b.className="btn_grey_steamui btn_medium";
+      b.style.cursor="default";
+      b.innerHTML="";
+      var sp=d.createElement("span"); sp.setAttribute("data-stt-main","1"); sp.textContent="已排队"; b.appendChild(sp);
+    }}
+  }};
+  actions.appendChild(cancel); actions.appendChild(ok);
+  box.appendChild(title); box.appendChild(sub); box.appendChild(tools); box.appendChild(list); box.appendChild(foot); box.appendChild(actions);
+  wrap.appendChild(box);
+  (d.body||d.documentElement).appendChild(wrap);
+  return "picker";
+}})()"##
+    )
+}
+
+/// DLC 列表失败时恢复按钮并提示.
+pub fn store_dlc_picker_error_js(app_id: u32, message: &str) -> String {
+    let safe: String = message
+        .chars()
+        .map(|c| match c {
+            '\\' | '"' | '\'' | ';' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
+            _ => c,
+        })
+        .take(40)
+        .collect();
+    format!(
+        "(function(){{\n  var id=String({app_id});\n  \
+  var nodes=document.querySelectorAll('[data-stt-store-btn]');\n  \
+  for(var i=0;i<nodes.length;i++){{\n    var b=nodes[i];\n    \
+    if(b.getAttribute('data-stt-app')!==id) continue;\n    \
+    b.removeAttribute('data-stt-busy');\n    \
+    b.className='btn_grey_steamui btn_medium';\n    b.style.cursor='default';\n    \
+    b.innerHTML=''; var sp=document.createElement('span');\n    \
+    sp.setAttribute('data-stt-main','1'); sp.textContent='{safe}'; b.appendChild(sp);\n  }}\n  return 'err';\n}})()"
     )
 }
 
@@ -208,7 +470,10 @@ pub struct StoreCdpPoll {
     pub cdp_up: bool,
     pub store_pages: usize,
     pub injected: usize,
+    /// 兼容旧调用方: 仅 app_id 列表 (由 pending_jobs 派生).
     pub pending_app_ids: Vec<u32>,
+    /// 结构化入库意图 (含 mode / dlc).
+    pub pending_jobs: Vec<StorePendingJob>,
     pub notes: Vec<String>,
     /// 本轮摸到的商店 app 页 (端口模式 = ws URL; 管道模式 = target id).
     ///
@@ -336,9 +601,15 @@ pub fn poll_store_cdp(host_port: &str, inject_js: &str) -> StoreCdpPoll {
                 if !out.store_targets.contains(&ws_url) {
                     out.store_targets.push(ws_url.clone());
                 }
-                for id in res.pending {
-                    if !out.pending_app_ids.contains(&id) {
-                        out.pending_app_ids.push(id);
+                for job in res.pending {
+                    if !out.pending_jobs.iter().any(|j| {
+                        j.app_id == job.app_id
+                            && j.mode == job.mode
+                            && j.stage == job.stage
+                            && j.dlc_ids == job.dlc_ids
+                    }) {
+                        out.pending_app_ids.push(job.app_id);
+                        out.pending_jobs.push(job);
                     }
                 }
             }
@@ -436,7 +707,7 @@ fn verify_cef_endpoint(host_port: &str) -> Result<(), String> {
 /// 后台循环: 注入按钮, 并把点击排下的 app_id 回调出去.
 pub fn run_store_cdp_loop(
     poll_every: Duration,
-    on_app: &mut dyn FnMut(u32) -> Option<String>,
+    on_app: &mut dyn FnMut(StorePendingJob) -> Option<String>,
     on_log: &mut dyn FnMut(String),
 ) {
     run_store_cdp_loop_with_js(
@@ -454,7 +725,7 @@ pub fn run_store_cdp_loop(
 pub fn run_store_cdp_loop_with_js(
     poll_every: Duration,
     make_js: &mut dyn FnMut() -> String,
-    on_app: &mut dyn FnMut(u32) -> Option<String>,
+    on_app: &mut dyn FnMut(StorePendingJob) -> Option<String>,
     on_log: &mut dyn FnMut(String),
     mut panel: Option<&mut dyn PanelBridge>,
 ) {
@@ -533,8 +804,8 @@ pub fn run_store_cdp_loop_with_js(
                     zero_logged = true;
                 }
             }
-            for app_id in r.pending_app_ids {
-                if let Some(js) = on_app(app_id) {
+            for job in r.pending_jobs {
+                if let Some(js) = on_app(job) {
                     push_store_feedback_cdp(&r.store_targets, &js, on_log);
                 }
             }
@@ -959,7 +1230,7 @@ struct InjectOutcome {
     mounted: bool,
     /// 本轮是把按钮摘了 (工具被关掉).
     removed: bool,
-    pending: Vec<u32>,
+    pending: Vec<StorePendingJob>,
 }
 
 fn session_inject_and_drain(ws_url: &str, inject_js: &str) -> Result<InjectOutcome, String> {
@@ -980,7 +1251,7 @@ fn session_inject_and_drain(ws_url: &str, inject_js: &str) -> Result<InjectOutco
     let mounted = is_mount_news(&res);
     let removed = res.as_str() == Some("removed");
     let pending = match ws.eval_value(DRAIN_JS) {
-        Ok(pending) => parse_pending_app_ids(&pending),
+        Ok(pending) => parse_pending_jobs(&pending),
         Err(_) => Vec::new(),
     };
     Ok(InjectOutcome {
@@ -1025,16 +1296,59 @@ pub(crate) fn is_mount_news(res: &Value) -> bool {
     })
 }
 
-pub(crate) fn parse_pending_app_ids(v: &Value) -> Vec<u32> {
+/// 解析 `__SteamToolsPending` 队列: mode / stage / dlc_ids.
+pub fn parse_pending_jobs(v: &Value) -> Vec<StorePendingJob> {
     let Some(arr) = v.as_array() else {
         return Vec::new();
     };
-    // 负数 / 越界 / 0 都不是合法 app_id, 直接丢掉.
-    arr.iter()
-        .filter_map(|item| item.get("app_id")?.as_u64())
-        .filter_map(|id| u32::try_from(id).ok())
-        .filter(|&id| id > 0)
-        .collect()
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(app_id) = item
+            .get("app_id")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|&id| id > 0)
+        else {
+            continue;
+        };
+        let mode = item
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("full")
+            .to_owned();
+        let mode = match mode.as_str() {
+            "game_only" | "select_dlc" | "full" => mode,
+            _ => "full".to_owned(),
+        };
+        let stage = item
+            .get("stage")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let dlc_ids = item
+            .get("dlc_ids")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64())
+                    .filter_map(|id| u32::try_from(id).ok())
+                    .filter(|&id| id > 0)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reason = item
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("store_btn")
+            .to_owned();
+        out.push(StorePendingJob {
+            app_id,
+            mode,
+            stage,
+            dlc_ids,
+            reason,
+        });
+    }
+    out
 }
 
 fn http_get(url: &str, timeout: Duration) -> Result<String, String> {
@@ -1612,6 +1926,12 @@ mod tests {
         assert!(s.contains("demo_above_purchase"));
         assert!(s.contains("data-ds-bundleid"));
         assert!(s.contains("margin-left:2px"));
+        // managed / split / agecheck / DLC menu
+        assert!(s.contains("__SteamToolsManaged"));
+        assert!(s.contains("data-stt-chev"));
+        assert!(s.contains("select_dlc"));
+        assert!(s.contains("agecheck"));
+        assert!(s.contains("已入库"));
     }
 
     #[test]
@@ -1626,9 +1946,12 @@ mod tests {
         assert!(bad.contains("失败:  x y  pwn"));
         assert!(!bad.contains("\"x"));
         assert!(!bad.contains("x\ny"));
-        // 模板自身固定 18 个单引号 (9 对: 选择器/属性/赋值/return);
-        // 标签漏一个引号进字面量就会变 20, 这里必须是 18.
-        assert_eq!(bad.matches('\'').count(), 18);
+        // 模板不能把标签里的引号漏进字面量; 成功/失败都用 grey.
+        assert!(bad.contains("btn_grey_steamui"));
+        assert_eq!(
+            bad.matches('\'').count(),
+            store_button_result_js(1, false, "safe").matches('\'').count()
+        );
     }
 
     #[test]
@@ -1696,7 +2019,22 @@ mod tests {
     #[test]
     fn parse_pending() {
         let v = json!([{"app_id": 570, "reason": "store_btn"}, {"app_id": 0}]);
-        assert_eq!(parse_pending_app_ids(&v), vec![570]);
+        let simple = parse_pending_jobs(&v);
+        assert_eq!(simple.len(), 1);
+        assert_eq!(simple[0].app_id, 570);
+        let jobs = parse_pending_jobs(&json!([{
+            "app_id": 730,
+            "mode": "select_dlc",
+            "stage": "commit",
+            "dlc_ids": [1, 2, 0],
+            "reason": "store_dlc"
+        }]));
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].app_id, 730);
+        assert_eq!(jobs[0].mode, "select_dlc");
+        assert_eq!(jobs[0].stage.as_deref(), Some("commit"));
+        assert_eq!(jobs[0].dlc_ids, vec![1, 2]);
+        assert!(jobs[0].is_dlc_commit());
     }
 
     /// 整个 /json/version 响应和 Browser 字段值两种输入都要能解析.

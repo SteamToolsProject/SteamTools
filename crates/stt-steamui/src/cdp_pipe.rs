@@ -20,7 +20,7 @@ use stt_platform::DevToolsPipe;
 
 use crate::cdp_bridge::{
     hosts_nav_entry, is_mount_news, is_popup_menu_target, is_store_app_url, log_panel_step,
-    parse_pending_app_ids, wants_panel_tick, StoreCdpPoll, DRAIN_JS,
+    parse_pending_jobs, wants_panel_tick, StoreCdpPoll, StorePendingJob, DRAIN_JS,
 };
 use crate::config_panel::{
     apply_library_menu_drain, library_menu_inject_js, panel_step, EvalTarget, PanelBridge,
@@ -273,7 +273,10 @@ pub fn poll_store_pipe(session: &mut CdpPipeSession, inject_js: &str) -> StoreCd
                 if !out.store_targets.contains(&t.target_id) {
                     out.store_targets.push(t.target_id.clone());
                 }
-                out.pending_app_ids.extend(pending);
+                for job in pending {
+                    out.pending_app_ids.push(job.app_id);
+                    out.pending_jobs.push(job);
+                }
             }
             Err(e) => out.notes.push(format!("cdp_page_err={e} url={}", t.url)),
         }
@@ -296,7 +299,7 @@ enum Injected {
     Done {
         mounted: bool,
         removed: bool,
-        pending: Vec<u32>,
+        pending: Vec<StorePendingJob>,
     },
 }
 
@@ -330,7 +333,7 @@ fn inject_in_session(
     let mounted = is_mount_news(&res);
     let removed = res.as_str() == Some("removed");
     let pending = match session.eval_value(sid, DRAIN_JS) {
-        Ok(p) => parse_pending_app_ids(&p),
+        Ok(p) => parse_pending_jobs(&p),
         Err(_) => Vec::new(),
     };
     Ok(Injected::Done {
@@ -604,7 +607,7 @@ fn wait_for_pipe(timeout: Duration) -> Option<DevToolsPipe> {
 pub fn run_store_pipe_loop(
     poll_every: Duration,
     make_js: &mut dyn FnMut() -> String,
-    on_app: &mut dyn FnMut(u32) -> Option<String>,
+    on_app: &mut dyn FnMut(StorePendingJob) -> Option<String>,
     on_log: &mut dyn FnMut(String),
     ready_timeout: Duration,
     mut panel: Option<&mut dyn PanelBridge>,
@@ -667,8 +670,8 @@ pub fn run_store_pipe_loop(
                     on_log(format!("catalog_add={note}"));
                 }
             }
-            for app_id in r.pending_app_ids {
-                if let Some(js) = on_app(app_id) {
+            for job in r.pending_jobs {
+                if let Some(js) = on_app(job) {
                     push_store_feedback_pipe(&mut session, &r.store_targets, &js, on_log);
                 }
             }
