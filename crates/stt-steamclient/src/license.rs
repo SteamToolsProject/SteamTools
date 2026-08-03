@@ -86,6 +86,15 @@ impl LicenseQueue {
         self.lock().injected.len()
     }
 
+    /// 单测复用进程内 OnceLock 队列时, 先清空再跑下一条.
+    pub fn clear_for_test(&self) {
+        let mut g = self.lock();
+        g.pending_add.clear();
+        g.pending_remove.clear();
+        g.injected.clear();
+        g.fake_license_ready = false;
+    }
+
     pub fn is_fake_license_ready(&self) -> bool {
         self.lock().fake_license_ready
     }
