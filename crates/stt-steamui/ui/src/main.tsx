@@ -36,7 +36,8 @@ function PanelApp({ snapshot, onClose }: { snapshot: ConfigSnapshot; onClose: ()
           </div>
           <button ref={closeRef} type="button" className="stt-close" aria-label="关闭设置" onClick={onClose}><span aria-hidden="true">×</span></button>
         </header>
-        <main className="stt-body"><PageNotice snapshot={snapshot} />{snapshot.tools.length ? <PageBody page={page} snapshot={snapshot} /> : <LoadingState />}</main>
+        <main className="stt-body">{snapshot.tools.length ? <PageBody page={page} snapshot={snapshot} /> : <LoadingState />}</main>
+        <PageNotice snapshot={snapshot} />
       </section>
     </div>
   );

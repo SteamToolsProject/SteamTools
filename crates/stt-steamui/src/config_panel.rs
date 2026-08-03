@@ -827,6 +827,16 @@ fn parse_one(item: &Value) -> Option<ConfigIntent> {
         "remove_lua_path" => ConfigIntent::remove_lua_path(value),
         "refresh_app" => ConfigIntent::refresh_app(app_id(item)?),
         "remove_app" => ConfigIntent::remove_app(app_id(item)?),
+        "import_lua" => {
+            let arr = item.get("files")?.as_array()?;
+            let mut files = Vec::with_capacity(arr.len());
+            for f in arr {
+                let name = f.get("name")?.as_str()?.to_owned();
+                let body = f.get("body")?.as_str()?.to_owned();
+                files.push((name, body));
+            }
+            ConfigIntent::import_lua(files)
+        }
         _ => None,
     }
 }
@@ -1057,6 +1067,8 @@ mod tests {
         assert!(PANEL_JS.contains("add_lua_path"));
         assert!(PANEL_JS.contains("refresh_app"));
         assert!(PANEL_JS.contains("remove_app"));
+        assert!(PANEL_JS.contains("import_lua"));
+        assert!(PANEL_JS.contains("stt-dropzone"));
     }
 
     /// 内嵌包保留 SteamTools 自己的视觉基线, 不依赖 Steam 私有模块.
@@ -1510,6 +1522,17 @@ mod tests {
             "window.__SteamToolsManaged=[7,42];"
         );
         assert_eq!(managed_apps_js(&[]), "window.__SteamToolsManaged=[];");
+    }
+
+    #[test]
+    fn import_lua_intent_is_parsed() {
+        let tick = parse_panel_tick(&json!({"q":[
+            {"kind":"import_lua","files":[{"name":"570.lua","body":"addappid(570)\n"}]}
+        ]}));
+        assert_eq!(
+            tick.intents,
+            vec![ConfigIntent::import_lua(vec![("570.lua".into(), "addappid(570)\n".into())]).unwrap()]
+        );
     }
 
     #[test]

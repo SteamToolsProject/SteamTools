@@ -39,7 +39,8 @@ export type ConfigIntent =
   | { kind: "add_lua_path"; value: string }
   | { kind: "remove_lua_path"; value: string }
   | { kind: "refresh_app"; app_id: number }
-  | { kind: "remove_app"; app_id: number };
+  | { kind: "remove_app"; app_id: number }
+  | { kind: "import_lua"; files: Array<{ name: string; body: string }> };
 
 declare global {
   interface Window {
