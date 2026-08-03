@@ -46,6 +46,10 @@ pub enum ConfigIntent {
     RefreshApp(u32),
     /// 撤掉入库: 删我们写的那个 lua.
     RemoveApp(u32),
+    /// 面板拖入的 lua 文本: (文件名, 内容). 不写 toml, 由宿主导入.
+    ImportLua {
+        files: Vec<(String, String)>,
+    },
 }
 
 impl ConfigIntent {
@@ -96,12 +100,38 @@ impl ConfigIntent {
         (app_id > 0).then_some(Self::RemoveApp(app_id))
     }
 
+    /// 面板拖入: 最多 16 个文件, 单文件 2 MiB, 只要 .lua 文本.
+    pub fn import_lua(files: Vec<(String, String)>) -> Option<Self> {
+        const MAX_FILES: usize = 16;
+        const MAX_BYTES: usize = 2 * 1024 * 1024;
+        if files.is_empty() || files.len() > MAX_FILES {
+            return None;
+        }
+        let mut cleaned = Vec::with_capacity(files.len());
+        for (name, body) in files {
+            let name = name.trim();
+            if name.is_empty() || name.len() > 180 || body.len() > MAX_BYTES {
+                return None;
+            }
+            if name.contains(['\0', '\n', '\r']) || body.contains('\0') {
+                return None;
+            }
+            cleaned.push((name.to_owned(), body));
+        }
+        Some(Self::ImportLua { files: cleaned })
+    }
+
     /// 针对某个 app 的意图不改 toml, 由宿主拿 provider 去执行.
     pub fn app_target(&self) -> Option<u32> {
         match self {
             Self::RefreshApp(id) | Self::RemoveApp(id) => Some(*id),
             _ => None,
         }
+    }
+
+    /// 本地导入意图也不写 toml.
+    pub fn is_import(&self) -> bool {
+        matches!(self, Self::ImportLua { .. })
     }
 
     /// 改一份配置副本; 只有这里通过了才会落盘.
@@ -155,10 +185,10 @@ impl ConfigIntent {
                 }
                 Ok(format!("lua.paths -= {path}"))
             }
-            // 这两个不动 toml, 由宿主接手 (它才有 provider).
-            Self::RefreshApp(_) | Self::RemoveApp(_) => Err(ConfigError::Invalid(
-                "app 意图不写 toml, 应由宿主处理".into(),
-            )),
+            // 这些不动 toml, 由宿主接手.
+            Self::RefreshApp(_) | Self::RemoveApp(_) | Self::ImportLua { .. } => Err(
+                ConfigError::Invalid("该意图不写 toml, 应由宿主处理".into()),
+            ),
         }
     }
 }
@@ -184,8 +214,8 @@ pub fn apply_intent(
     intent: &ConfigIntent,
 ) -> Result<String> {
     debug_assert!(
-        intent.app_target().is_none(),
-        "app 意图该走宿主, 不该进 apply_intent"
+        intent.app_target().is_none() && !intent.is_import(),
+        "app/导入意图该走宿主, 不该进 apply_intent"
     );
     let mut host = state.host();
     let note = intent.apply_to(&mut host)?;
@@ -235,9 +265,11 @@ pub fn save_host_change(
             let table = table_at(&mut doc, &["manifest"])?;
             table["url"] = toml_edit::value(source.as_str());
         }
-        // app 意图不动 toml, 走不到这儿 (apply_intent 已经挡住).
-        ConfigIntent::RefreshApp(_) | ConfigIntent::RemoveApp(_) => {
-            return Err(ConfigError::Invalid("app 意图不写 toml".into()))
+        // 这些不动 toml, 走不到这儿 (apply_intent 已经挡住).
+        ConfigIntent::RefreshApp(_)
+        | ConfigIntent::RemoveApp(_)
+        | ConfigIntent::ImportLua { .. } => {
+            return Err(ConfigError::Invalid("该意图不写 toml".into()))
         }
         ConfigIntent::AddLuaPath(_) | ConfigIntent::RemoveLuaPath(_) => {
             let mut array = Array::new();

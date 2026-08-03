@@ -1,13 +1,57 @@
 //! 主游戏入库后的 DLC 扩展 (仅解锁 + 有限可下载探测).
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use stt_catalog::{fetch_dlc_ids_store, CatalogLimits, CatalogProvider};
 use stt_core::{AppId, CatalogBundle};
 use stt_platform::WinHttpGetOptions;
 
+use crate::appinfo::app_names;
 use crate::catalog_add::missing_download_data;
+
+/// 单次入库的 DLC 策略 (商店可覆盖全局 auto_dlc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogDlcMode {
+    /// 主游戏 + 全部候选 DLC.
+    Full,
+    /// 只写主游戏.
+    GameOnly,
+    /// 只扩展用户勾选的子集; 空 = 仅游戏.
+    Selected(Vec<AppId>),
+}
+
+impl CatalogDlcMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::GameOnly => "game_only",
+            Self::Selected(_) => "selected",
+        }
+    }
+
+    /// 映射到 expand 开关; Selected(空) 视作关闭.
+    pub fn expand_options(&self, max_dlc: usize, timeout: Duration) -> DlcExpandOptions {
+        match self {
+            Self::GameOnly => DlcExpandOptions::disabled(),
+            Self::Selected(ids) if ids.is_empty() => DlcExpandOptions::disabled(),
+            Self::Full | Self::Selected(_) => DlcExpandOptions {
+                enabled: true,
+                max_dlc,
+                timeout,
+            },
+        }
+    }
+
+    /// Selected 时作为 expand 的候选过滤; Full/GameOnly 为 None.
+    pub fn selected_filter(&self) -> Option<&[AppId]> {
+        match self {
+            Self::Selected(ids) if !ids.is_empty() => Some(ids.as_slice()),
+            _ => None,
+        }
+    }
+}
 
 /// DLC 扩展开关与预算.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +79,21 @@ impl DlcExpandOptions {
             timeout: Duration::from_millis(0),
         }
     }
+}
+
+/// 商店「选择 DLC」浮层用的一行.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlcListItem {
+    pub app_id: AppId,
+    pub name: String,
+}
+
+/// 只读列出候选 DLC (不写盘).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DlcListOutcome {
+    pub items: Vec<DlcListItem>,
+    pub list_source: String,
+    pub truncated: bool,
 }
 
 /// 一次 DLC 扩展的诊断.
@@ -78,7 +137,65 @@ pub fn is_downloadable_dlc(app_id: AppId, bundle: &CatalogBundle) -> bool {
         && missing_download_data(app_id, bundle).is_empty()
 }
 
+/// 只读列出主游戏的候选 DLC (供商店 picker).
+///
+/// 优先 provider 元数据里的 `related_dlc_ids`; 空则 store appdetails 兜底.
+/// 名称来自本地 appinfo, 缺失时用 `DLC {id}`.
+pub fn list_related_dlcs(
+    steam_root: &Path,
+    main_app: AppId,
+    provider: &dyn CatalogProvider,
+    http: WinHttpGetOptions,
+    max_dlc: usize,
+) -> DlcListOutcome {
+    let mut list_source = "none".to_owned();
+    let mut ids: Vec<AppId> = match provider.fetch_with_trace(main_app) {
+        Ok(fetched) if !fetched.related_dlc_ids.is_empty() => {
+            list_source = "metadata".to_owned();
+            fetched.related_dlc_ids
+        }
+        _ => Vec::new(),
+    };
+    if ids.is_empty() {
+        let store_ids = fetch_dlc_ids_store(main_app, http);
+        if !store_ids.is_empty() {
+            list_source = "store".to_owned();
+            ids = store_ids;
+        }
+    }
+    ids.retain(|&id| id != 0 && id != main_app);
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut truncated = false;
+    if max_dlc > 0 && ids.len() > max_dlc {
+        ids.truncate(max_dlc);
+        truncated = true;
+    }
+
+    let names = app_names(steam_root, &ids);
+    let items = ids
+        .into_iter()
+        .map(|app_id| DlcListItem {
+            name: names
+                .get(&app_id)
+                .cloned()
+                .unwrap_or_else(|| format!("DLC {app_id}")),
+            app_id,
+        })
+        .collect();
+    DlcListOutcome {
+        items,
+        list_source,
+        truncated,
+    }
+}
+
 /// 把 DLC 候选并入主 bundle; DLC 失败不返回 Err.
+///
+/// `selected_filter`:
+/// - `None` — 用 `related_dlc_ids` (空则 store 兜底), 即全量
+/// - `Some(ids)` — 只处理用户勾选的 id (不再 store 扩表)
 pub fn expand_dlcs(
     main_app: AppId,
     bundle: &mut CatalogBundle,
@@ -86,9 +203,12 @@ pub fn expand_dlcs(
     provider: &dyn CatalogProvider,
     opts: DlcExpandOptions,
     http: WinHttpGetOptions,
+    selected_filter: Option<&[AppId]>,
 ) -> DlcExpandReport {
     let mut report = DlcExpandReport {
-        list_source: if related_dlc_ids.is_empty() {
+        list_source: if selected_filter.is_some() {
+            "selected".to_owned()
+        } else if related_dlc_ids.is_empty() {
             "none".to_owned()
         } else {
             // community metadata (steamcmd/ddxnb/caigames) 已带列表.
@@ -101,8 +221,16 @@ pub fn expand_dlcs(
     }
 
     let started = Instant::now();
-    let mut candidates: Vec<AppId> = related_dlc_ids.to_vec();
-    if candidates.is_empty() {
+    let mut candidates: Vec<AppId> = if let Some(selected) = selected_filter {
+        selected
+            .iter()
+            .copied()
+            .filter(|&id| id != 0 && id != main_app)
+            .collect()
+    } else {
+        related_dlc_ids.to_vec()
+    };
+    if selected_filter.is_none() && candidates.is_empty() {
         // store 兜底: 用剩余预算收紧 HTTP 超时, 避免主路径已经很慢时再卡满 15s.
         let remain_ms = opts
             .timeout
@@ -270,6 +398,7 @@ mod tests {
             &provider,
             DlcExpandOptions::disabled(),
             WinHttpGetOptions::default(),
+            None,
         );
         assert_eq!(b.apps, vec![10]);
         assert_eq!(report.total_added(), 0);
@@ -290,6 +419,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
             },
             WinHttpGetOptions::default(),
+            None,
         );
         assert!(b.apps.contains(&20) && b.apps.contains(&21));
         assert_eq!(report.unlock_only, vec![20, 21]);
@@ -310,9 +440,30 @@ mod tests {
             &provider,
             DlcExpandOptions::default(),
             WinHttpGetOptions::default(),
+            None,
         );
         assert_eq!(report.list_source, "metadata");
         assert_eq!(report.total_added(), 1);
+    }
+
+    #[test]
+    fn selected_filter_only_expands_chosen_ids() {
+        let mut b = main_bundle();
+        let provider = MockCatalogProvider::new();
+        let report = expand_dlcs(
+            10,
+            &mut b,
+            &[20, 21, 22],
+            &provider,
+            DlcExpandOptions::default(),
+            WinHttpGetOptions::default(),
+            Some(&[21]),
+        );
+        assert_eq!(report.list_source, "selected");
+        assert_eq!(report.unlock_only, vec![21]);
+        assert!(b.apps.contains(&21));
+        assert!(!b.apps.contains(&20));
+        assert!(!b.apps.contains(&22));
     }
 
     #[test]
@@ -340,6 +491,7 @@ mod tests {
             &provider,
             DlcExpandOptions::default(),
             WinHttpGetOptions::default(),
+            None,
         );
         assert_eq!(report.downloadable, vec![20]);
         assert!(b.apps.contains(&20));
@@ -363,6 +515,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
             },
             WinHttpGetOptions::default(),
+            None,
         );
         assert_eq!(report.unlock_only.len(), 1);
         assert!(report.skipped.iter().any(|(_, r)| *r == "cap"));

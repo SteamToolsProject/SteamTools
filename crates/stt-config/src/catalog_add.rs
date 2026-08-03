@@ -7,7 +7,7 @@ use stt_catalog::{validate_bundle, CatalogProvider, CatalogTraceEntry};
 use stt_core::{AppId, CatalogBundle, DepotId};
 use stt_platform::WinHttpGetOptions;
 
-use crate::catalog_dlc::{expand_dlcs, DlcExpandOptions, DlcExpandReport};
+use crate::catalog_dlc::{expand_dlcs, CatalogDlcMode, DlcExpandOptions, DlcExpandReport};
 use crate::error::{ConfigError, Result};
 use crate::lua_load::default_lua_dir;
 use crate::tools::ToolId;
@@ -314,12 +314,32 @@ pub fn add_to_library(
     )
 }
 
-/// 同 [`add_to_library`], 带 DLC 扩展选项.
+/// 同 [`add_to_library`], 带 DLC 扩展选项 (全量 / 关闭; 无子集过滤).
 pub fn add_to_library_with_dlc(
     state: &ConfigState,
     steam_root: &Path,
     provider: &dyn CatalogProvider,
     app_id: AppId,
+    dlc_opts: DlcExpandOptions,
+    http: WinHttpGetOptions,
+) -> Result<AddToLibraryOutcome> {
+    let mode = if dlc_opts.enabled {
+        CatalogDlcMode::Full
+    } else {
+        CatalogDlcMode::GameOnly
+    };
+    add_to_library_with_mode(state, steam_root, provider, app_id, mode, dlc_opts, http)
+}
+
+/// 同 [`add_to_library_with_dlc`], 带显式 [`CatalogDlcMode`] (含 Selected 子集).
+///
+/// `dlc_opts` 的 enabled/max/timeout 仍生效; Selected 空列表强制不扩展.
+pub fn add_to_library_with_mode(
+    state: &ConfigState,
+    steam_root: &Path,
+    provider: &dyn CatalogProvider,
+    app_id: AppId,
+    dlc_mode: CatalogDlcMode,
     dlc_opts: DlcExpandOptions,
     http: WinHttpGetOptions,
 ) -> Result<AddToLibraryOutcome> {
@@ -332,13 +352,17 @@ pub fn add_to_library_with_dlc(
     let purchase = now_unix();
     bundle.purchase_times.entry(app_id).or_insert(purchase);
 
+    // Selected 空 / GameOnly → 关闭 expand; 否则沿用传入预算.
+    let opts = dlc_mode.expand_options(dlc_opts.max_dlc, dlc_opts.timeout);
+    let filter = dlc_mode.selected_filter();
     let dlc = expand_dlcs(
         app_id,
         &mut bundle,
         &fetched.related_dlc_ids,
         provider,
-        dlc_opts,
+        opts,
         http,
+        filter,
     );
     // 无 key 的 depot (常见: DLC 仓) 不进 setappdepots / setmanifestid,
     // 否则主游戏有 key 也会被 Steam 判「内容仍然处于加密状态」.
@@ -402,34 +426,40 @@ pub struct RemoveFromLibraryOutcome {
     pub owned_count: usize,
 }
 
-/// 把入库撤掉: 删 `stt_{app_id}.lua`, 然后整表重扫.
+/// 把入库撤掉: 删我们写的 `stt_` / `import_` / 纯数字名 lua, 然后整表重扫.
 ///
 /// 不去 `AppRules` 里做减法 —— 那份状态是所有 lua 合并出来的, 单独摘一个 app 容易
 /// 与磁盘不一致. 删完重扫是唯一能保证两边一致的做法, 而且几十个文件也就几毫秒.
 ///
-/// 只删我们自己写的那个文件; 用户手写的 lua 一概不碰.
+/// 只删我们自己的命名; 用户其它手写 lua 一概不碰.
 #[cfg(feature = "lua")]
 pub fn remove_from_library(
     state: &ConfigState,
     steam_root: &Path,
     app_id: AppId,
 ) -> Result<RemoveFromLibraryOutcome> {
-    let path = catalog_lua_path(steam_root, app_id);
-    let lua_path = match std::fs::remove_file(&path) {
-        Ok(()) => Some(path),
-        // 已经不在了: 目的已经达到, 不当错误.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(source) => {
-            return Err(ConfigError::Io {
-                path: path.clone(),
-                source,
-            })
+    let mut paths = crate::import_local::managed_lua_paths_for_app(steam_root, app_id);
+    let catalog = catalog_lua_path(steam_root, app_id);
+    if !paths.iter().any(|p| p == &catalog) {
+        paths.push(catalog);
+    }
+    let mut last_ok: Option<PathBuf> = None;
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => last_ok = Some(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: path.clone(),
+                    source,
+                })
+            }
         }
-    };
+    }
     state.reload_lua_dirs(steam_root);
     Ok(RemoveFromLibraryOutcome {
         app_id,
-        lua_path,
+        lua_path: last_ok,
         epoch: state.rules_epoch(),
         owned_count: state.owned_count(),
     })

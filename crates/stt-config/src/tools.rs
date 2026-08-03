@@ -9,6 +9,8 @@ pub enum ToolId {
     ConfigUi,
     DownloadKit,
     StoreAccel,
+    /// 在配置面板拖入本地 lua 包.
+    LuaDrop,
 }
 
 impl ToolId {
@@ -18,6 +20,7 @@ impl ToolId {
         ToolId::ConfigUi,
         ToolId::DownloadKit,
         ToolId::StoreAccel,
+        ToolId::LuaDrop,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -27,6 +30,7 @@ impl ToolId {
             ToolId::ConfigUi => "config_ui",
             ToolId::DownloadKit => "download_kit",
             ToolId::StoreAccel => "store_accel",
+            ToolId::LuaDrop => "lua_drop",
         }
     }
 
@@ -37,11 +41,12 @@ impl ToolId {
             "config_ui" => Some(Self::ConfigUi),
             "download_kit" => Some(Self::DownloadKit),
             "store_accel" => Some(Self::StoreAccel),
+            "lua_drop" => Some(Self::LuaDrop),
             _ => None,
         }
     }
 
-    /// 默认开: 入库 + 库 UX + 配置页 + 下载清单.
+    /// 默认开: 入库 + 库 UX + 配置页 + 下载清单 + 拖放导入.
     ///
     /// 产品表常写「默认仅 catalog_add + library_ux」; 狗粮期把 `config_ui` 也默认开,
     /// 否则通道 gating (`catalog_add || config_ui`) 下关掉入库会把自己关没,
@@ -50,7 +55,11 @@ impl ToolId {
     pub fn default_enabled(self) -> bool {
         matches!(
             self,
-            ToolId::CatalogAdd | ToolId::LibraryUx | ToolId::ConfigUi | ToolId::DownloadKit
+            ToolId::CatalogAdd
+                | ToolId::LibraryUx
+                | ToolId::ConfigUi
+                | ToolId::DownloadKit
+                | ToolId::LuaDrop
         )
     }
 
@@ -61,6 +70,7 @@ impl ToolId {
             ToolId::ConfigUi => "配置页",
             ToolId::DownloadKit => "下载清单",
             ToolId::StoreAccel => "商店加速",
+            ToolId::LuaDrop => "拖放导入",
         }
     }
 
@@ -157,6 +167,7 @@ mod tests {
         assert!(reg.is_enabled(ToolId::LibraryUx));
         assert!(reg.is_enabled(ToolId::ConfigUi));
         assert!(reg.is_enabled(ToolId::DownloadKit));
+        assert!(reg.is_enabled(ToolId::LuaDrop));
         assert!(!reg.is_enabled(ToolId::StoreAccel));
     }
 

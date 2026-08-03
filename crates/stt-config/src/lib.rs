@@ -5,6 +5,8 @@ mod catalog_add;
 mod catalog_dlc;
 mod error;
 mod host_toml;
+#[cfg(feature = "lua")]
+mod import_local;
 mod intent;
 mod snapshot;
 mod tools;
@@ -27,12 +29,19 @@ pub use appinfo::app_names;
 #[cfg(feature = "lua")]
 pub use catalog_add::remove_from_library;
 pub use catalog_add::{
-    add_to_library, add_to_library_with_dlc, catalog_lua_path, format_catalog_lua,
-    is_valid_depot_key, manifest_file_name, prune_keyless_depots, write_catalog_lua,
-    write_manifest_blobs, AddToLibraryOutcome, MissingDownloadData,
+    add_to_library, add_to_library_with_dlc, add_to_library_with_mode, catalog_lua_path,
+    format_catalog_lua, is_valid_depot_key, manifest_file_name, prune_keyless_depots,
+    write_catalog_lua, write_manifest_blobs, AddToLibraryOutcome, MissingDownloadData,
 };
-pub use catalog_dlc::{DlcExpandOptions, DlcExpandReport};
+pub use catalog_dlc::{
+    list_related_dlcs, CatalogDlcMode, DlcExpandOptions, DlcExpandReport, DlcListItem,
+    DlcListOutcome,
+};
 pub use error::{ConfigError, Result};
+#[cfg(feature = "lua")]
+pub use import_local::{
+    import_local_paths, import_local_texts, managed_lua_paths_for_app, ImportLocalReport,
+};
 pub use host_toml::{
     CatalogMode, CatalogSection, HostConfig, LogSection, LuaSection, ManifestSection,
     StoreAccelEgress, StoreAccelSection, ToolsSection, HOST_TOML_NAME, LEGACY_TOML_NAME,

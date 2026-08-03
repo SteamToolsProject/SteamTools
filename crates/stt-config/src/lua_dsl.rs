@@ -15,11 +15,11 @@ fn lock_bundle(b: &Mutex<CatalogBundle>) -> MutexGuard<'_, CatalogBundle> {
 
 /// 执行一段 Lua 配置并合并进 `rules`.
 ///
-/// 兼容面 (小写注册):
-/// - `addappid(id [, purchase_time, key64hex])`
-/// - `addtoken(appId, tokenDecimalString)`
-/// - `setmanifestid(depotId, gidString [, size])`
-/// - `setappdepots(appId, { depotId, ... })`
+/// 兼容面 (小写主名 + 社区常见大小写别名):
+/// - `addappid` / `AddAppId`
+/// - `addtoken` / `AddToken`
+/// - `setmanifestid` / `setManifestid` / `SetManifestid` / `SetManifestId`
+/// - `setappdepots` / `setAppDepots` / `SetAppDepots`
 pub fn apply_lua_chunk(rules: &mut AppRules, source: &str) -> Result<()> {
     let bundle = eval_lua_to_bundle(source)?;
     rules.apply_catalog_bundle(&bundle);
@@ -77,7 +77,8 @@ fn eval_lua_to_bundle_inner(
                 },
             )
             .map_err(lua_err)?;
-        lua.globals().set("addappid", f).map_err(lua_err)?;
+        // 社区 lua 大小写不统一, 主名 + 常见别名都挂同一函数.
+        set_global_aliases(&lua, &["addappid", "AddAppId", "AddAppID"], f)?;
     }
 
     {
@@ -103,7 +104,11 @@ fn eval_lua_to_bundle_inner(
                 Ok(())
             })
             .map_err(lua_err)?;
-        lua.globals().set("setappdepots", f).map_err(lua_err)?;
+        set_global_aliases(
+            &lua,
+            &["setappdepots", "setAppDepots", "SetAppDepots"],
+            f,
+        )?;
     }
 
     {
@@ -117,7 +122,7 @@ fn eval_lua_to_bundle_inner(
                 Ok(())
             })
             .map_err(lua_err)?;
-        lua.globals().set("addtoken", f).map_err(lua_err)?;
+        set_global_aliases(&lua, &["addtoken", "AddToken"], f)?;
     }
 
     {
@@ -145,7 +150,17 @@ fn eval_lua_to_bundle_inner(
                 },
             )
             .map_err(lua_err)?;
-        lua.globals().set("setmanifestid", f).map_err(lua_err)?;
+        // ManifestAutoUpdate / OpenSteamTool 系常用 setManifestid.
+        set_global_aliases(
+            &lua,
+            &[
+                "setmanifestid",
+                "setManifestid",
+                "SetManifestid",
+                "SetManifestId",
+            ],
+            f,
+        )?;
     }
 
     lua.load(source)
@@ -158,6 +173,14 @@ fn eval_lua_to_bundle_inner(
 
 fn lua_err(e: mlua::Error) -> ConfigError {
     ConfigError::Lua(e.to_string())
+}
+
+/// 同一函数挂多个全局名 (社区脚本大小写混用).
+fn set_global_aliases(lua: &mlua::Lua, names: &[&str], f: mlua::Function) -> Result<()> {
+    for name in names {
+        lua.globals().set(*name, f.clone()).map_err(lua_err)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -204,5 +227,24 @@ setmanifestid(228980, "9876543210")
         assert_eq!(rules.app_depots(42), &[43]);
         assert_eq!(rules.purchase_time(42), Some(123));
         assert!(!rules.is_owned(43));
+    }
+
+    /// 社区 ManifestAutoUpdate 系常用 setManifestid (大写 M).
+    #[test]
+    fn community_case_aliases_work() {
+        let src = r#"
+AddAppId(3167020)
+addappid(3167021, 0, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+setManifestid(3167021, "1234567890")
+AddToken(3167020, "42")
+"#;
+        let mut rules = AppRules::new();
+        apply_lua_chunk(&mut rules, src).unwrap();
+        assert!(rules.is_owned(3167020));
+        assert_eq!(
+            rules.manifest_override(3167021).map(|m| m.manifest_gid),
+            Some(1234567890)
+        );
+        assert_eq!(rules.access_token(3167020), Some(42));
     }
 }

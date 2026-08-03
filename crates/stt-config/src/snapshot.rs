@@ -143,7 +143,7 @@ impl ConfigSnapshot {
     }
 }
 
-/// 我们自己入库的 app: 目录里有 `stt_{id}.lua` 的那些.
+/// 我们自己入库的 app: 目录里有 `stt_{id}.lua` / `import_{id}.lua` 的那些.
 ///
 /// 按文件名认而不是按 `AppRules` 里的 owned —— owned 是所有 lua 合并出来的,
 /// 里面混着用户手写的, 那些不该由我们的菜单去"移除".
@@ -159,17 +159,32 @@ pub fn managed_apps(state: &ConfigState, steam_root: &Path) -> Vec<u32> {
         .filter_map(|e| {
             let name = e.file_name();
             let name = name.to_str()?;
-            let id: u32 = name
-                .strip_prefix("stt_")?
-                .strip_suffix(".lua")?
-                .parse()
-                .ok()?;
+            let id = managed_app_id_from_filename(name)?;
             // 文件在但规则里没有 = 那份 lua 有问题, 别当成管着.
             state.with_rules(|r| r.is_owned(id)).then_some(id)
         })
         .collect();
     ids.sort_unstable();
+    ids.dedup();
     ids
+}
+
+/// `stt_730.lua` / `import_730.lua` / `import_730_2.lua` / `730.lua` → 730.
+fn managed_app_id_from_filename(name: &str) -> Option<u32> {
+    let stem = name.strip_suffix(".lua")?;
+    if let Some(id) = stem.strip_prefix("stt_") {
+        return id.parse().ok().filter(|v| *v != 0);
+    }
+    if let Some(rest) = stem.strip_prefix("import_") {
+        // import_730 或 import_730_2
+        let id_part = rest.split('_').next()?;
+        return id_part.parse().ok().filter(|v| *v != 0);
+    }
+    // 社区包常用纯数字文件名.
+    if !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit()) {
+        return stem.parse().ok().filter(|v| *v != 0);
+    }
+    None
 }
 
 #[cfg(test)]
