@@ -61,11 +61,48 @@ impl MissingDownloadData {
     }
 }
 
+/// 合法 depot decryption key: 正好 64 位 ascii hex.
+pub fn is_valid_depot_key(key: &str) -> bool {
+    key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// 从可下载集合里摘掉「有清单/已声明但没有合法 key」的 depot.
+///
+/// 背景: steamcmd 会把 DLC 关联 depot (带 dlcappid) 也挂到主 app 的 depots 上.
+/// 若上游没有这些 DLC 仓的 key, 仍写进 `setappdepots` / 空 key 的 `addappid`,
+/// Steam 会把**整包**判成加密 (「内容仍然处于加密状态」), 主游戏有 key 也下不了.
+///
+/// 策略: 无 key 的 depot 不进入下载面; DLC **所有权** (apps 里的 dlc appid) 保留.
+/// 返回被摘掉的 depot id (诊断用).
+pub fn prune_keyless_depots(bundle: &mut CatalogBundle) -> Vec<DepotId> {
+    // 先清掉非法/空 key 条目.
+    bundle.depot_keys.retain(|_, key| is_valid_depot_key(key));
+
+    let mut dropped: Vec<DepotId> = Vec::new();
+    for depots in bundle.app_depots.values_mut() {
+        for depot_id in depots.iter().copied() {
+            if !bundle.depot_keys.contains_key(&depot_id) {
+                dropped.push(depot_id);
+            }
+        }
+        depots.retain(|depot_id| bundle.depot_keys.contains_key(depot_id));
+    }
+
+    // 没 key 的清单不要 pin, 否则 Steam 仍可能去拉加密仓.
+    bundle
+        .manifests
+        .retain(|depot_id, _| bundle.depot_keys.contains_key(depot_id));
+
+    dropped.sort_unstable();
+    dropped.dedup();
+    dropped
+}
+
 /// 算 bundle 里缺的下载数据 (只算请求 app 的).
 ///
 /// 判定:
-/// - depot key: 该 depot 声明了 manifest (能告诉 Steam 下哪个清单), 但没有 depot key
-///   (解密需要). 只有 manifest 没有 key 时 Steam 拿不到解密钥匙, 下载会失败.
+/// - depot key: 该 depot 仍挂在 app_depots 且有 manifest, 但没有合法 depot key.
+///   调用方应先 [`prune_keyless_depots`], 这样 DLC 仓缺 key 不会误报成主游戏不可下.
 /// - access token: 有清单但没给 token, Steam 下载授权过不去 (常见表现为下载 0B).
 pub fn missing_download_data(app_id: AppId, bundle: &CatalogBundle) -> MissingDownloadData {
     let app_depots = bundle.app_depots.get(&app_id);
@@ -74,7 +111,11 @@ pub fn missing_download_data(app_id: AppId, bundle: &CatalogBundle) -> MissingDo
         .flatten()
         .copied()
         .filter(|depot_id| {
-            bundle.manifests.contains_key(depot_id) && !bundle.depot_keys.contains_key(depot_id)
+            bundle.manifests.contains_key(depot_id)
+                && !bundle
+                    .depot_keys
+                    .get(depot_id)
+                    .is_some_and(|k| is_valid_depot_key(k))
         })
         .collect();
     depot_keys.sort_unstable();
@@ -108,11 +149,13 @@ pub fn format_catalog_lua(app_id: AppId, bundle: &CatalogBundle) -> String {
     depots.sort_unstable();
     depots.dedup();
     for depot_id in depots {
-        let key = bundle
-            .depot_keys
-            .get(&depot_id)
-            .map(String::as_str)
-            .unwrap_or_default();
+        // 无合法 key 的 depot 不写 (空 key 会让 Steam 整包判加密).
+        let Some(key) = bundle.depot_keys.get(&depot_id).map(String::as_str) else {
+            continue;
+        };
+        if !is_valid_depot_key(key) {
+            continue;
+        }
         out.push_str(&format!("addappid({depot_id}, 0, \"{key}\")\n"));
     }
     let mut access_tokens: Vec<_> = bundle.access_tokens.iter().collect();
@@ -297,13 +340,27 @@ pub fn add_to_library_with_dlc(
         dlc_opts,
         http,
     );
+    // 无 key 的 depot (常见: DLC 仓) 不进 setappdepots / setmanifestid,
+    // 否则主游戏有 key 也会被 Steam 判「内容仍然处于加密状态」.
+    let _pruned = prune_keyless_depots(&mut bundle);
     // 扩展后可能多了 apps/depots, 再校验一次.
     let bundle = validate_bundle(app_id, bundle)?;
 
     let lua_path = write_catalog_lua(steam_root, app_id, &bundle)?;
     // Fluent 路径: 有原始 .manifest 就写 depotcache; 没有也不挡入库.
+    // 已 prune 的 keyless depot 对应 blob 即使源给了也不写, 避免 Steam 去拉加密仓.
+    let kept_manifests = &bundle.manifests;
+    let filtered_blobs: Vec<stt_catalog::ManifestBlob> = fetched
+        .manifest_blobs
+        .into_iter()
+        .filter(|blob| {
+            kept_manifests
+                .get(&blob.depot_id)
+                .is_some_and(|over| over.manifest_gid == blob.manifest_gid)
+        })
+        .collect();
     let manifest_files_written =
-        write_manifest_blobs(steam_root, &fetched.manifest_blobs).unwrap_or(0);
+        write_manifest_blobs(steam_root, &filtered_blobs).unwrap_or(0);
 
     // 以磁盘 lua 为准重载, 避免 DLC 列表缩小时 merge 残留旧 owned.
     #[cfg(feature = "lua")]
@@ -633,33 +690,108 @@ mod tests {
 
     #[cfg(feature = "lua")]
     #[test]
-    fn add_to_library_persists_manifest_when_download_key_is_missing() {
+    fn add_to_library_prunes_keyless_depot_from_download_surface() {
+        // 只有清单没有 key 的 depot 不再写入 setmanifestid / setappdepots,
+        // 避免主游戏被 Steam 整包判加密. 所有权 (addappid 主 app) 仍在.
         let root = tempfile::tempdir().unwrap();
         let state = ConfigState::new();
         let bundle = CatalogBundle {
             apps: vec![42],
-            app_depots: std::collections::HashMap::from([(42, vec![11])]),
-            manifests: std::collections::HashMap::from([(
-                11,
-                stt_core::ManifestOverride {
-                    manifest_gid: 99,
-                    size: 0,
-                },
-            )]),
+            app_depots: std::collections::HashMap::from([(42, vec![11, 12])]),
+            depot_keys: std::collections::HashMap::from([(12, "ab".repeat(32))]),
+            manifests: std::collections::HashMap::from([
+                (
+                    11,
+                    stt_core::ManifestOverride {
+                        manifest_gid: 99,
+                        size: 0,
+                    },
+                ),
+                (
+                    12,
+                    stt_core::ManifestOverride {
+                        manifest_gid: 88,
+                        size: 100,
+                    },
+                ),
+            ]),
             requires_token: Some(false),
             ..CatalogBundle::default()
         };
         let provider = MockCatalogProvider::new().with_fixture(42, bundle);
 
         let outcome = add_to_library(&state, root.path(), &provider, 42).unwrap();
+        let text = std::fs::read_to_string(&outcome.lua_path).unwrap();
 
-        assert_eq!(outcome.missing.depot_keys, vec![11]);
-        assert!(outcome.lua_path.exists());
-        assert!(std::fs::read_to_string(outcome.lua_path)
-            .unwrap()
-            .contains("setmanifestid(11, \"99\")\n"));
-        // Mock 不给 blob → 0 文件, 仍算入库成功.
-        assert_eq!(outcome.manifest_files_written, 0);
+        assert!(text.contains("addappid(12, 0,"), "{text}");
+        assert!(!text.contains("addappid(11,"), "{text}");
+        assert!(text.contains("setmanifestid(12,"), "{text}");
+        assert!(!text.contains("setmanifestid(11,"), "{text}");
+        assert!(text.contains("setappdepots(42, {12})"), "{text}");
+        assert!(
+            outcome.missing.depot_keys.is_empty(),
+            "{:?}",
+            outcome.missing
+        );
+        assert!(text.contains("addappid(42,"), "{text}");
+    }
+
+    #[test]
+    fn prune_keyless_keeps_owned_apps_drops_dlc_depots_without_keys() {
+        // 模拟 TLOU: 主仓有 key, DLC 仓无 key — 只摘 depot, 保留 dlc app 所有权.
+        let mut b = CatalogBundle {
+            apps: vec![1888930, 2245260, 2254450],
+            ..CatalogBundle::default()
+        };
+        b.app_depots
+            .insert(1888930, vec![1888931, 2255770, 2290640]);
+        b.depot_keys.insert(1888931, "ab".repeat(32));
+        b.requires_token = Some(false);
+        b.manifests.insert(
+            1888931,
+            stt_core::ManifestOverride {
+                manifest_gid: 1,
+                size: 10,
+            },
+        );
+        b.manifests.insert(
+            2255770,
+            stt_core::ManifestOverride {
+                manifest_gid: 2,
+                size: 10,
+            },
+        );
+        b.manifests.insert(
+            2290640,
+            stt_core::ManifestOverride {
+                manifest_gid: 3,
+                size: 10,
+            },
+        );
+
+        let dropped = prune_keyless_depots(&mut b);
+        assert_eq!(dropped, vec![2255770, 2290640]);
+        assert_eq!(b.app_depots.get(&1888930), Some(&vec![1888931]));
+        assert!(b.manifests.contains_key(&1888931));
+        assert!(!b.manifests.contains_key(&2255770));
+        assert_eq!(b.apps, vec![1888930, 2245260, 2254450]);
+
+        let text = format_catalog_lua(1888930, &b);
+        assert!(text.contains("addappid(2245260,"));
+        assert!(text.contains("setappdepots(1888930, {1888931})"));
+        assert!(!text.contains("2255770"));
+        assert!(missing_download_data(1888930, &b).is_empty());
+    }
+
+    #[test]
+    fn format_lua_skips_depots_without_valid_keys() {
+        let mut b = CatalogBundle::default();
+        b.apps.push(42);
+        b.app_depots.insert(42, vec![11, 12]);
+        b.depot_keys.insert(12, "cd".repeat(32));
+        let text = format_catalog_lua(42, &b);
+        assert!(text.contains("addappid(12, 0,"));
+        assert!(!text.contains("addappid(11,"));
     }
 
     #[test]

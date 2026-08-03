@@ -28,8 +28,8 @@ pub use appinfo::app_names;
 pub use catalog_add::remove_from_library;
 pub use catalog_add::{
     add_to_library, add_to_library_with_dlc, catalog_lua_path, format_catalog_lua,
-    manifest_file_name, write_catalog_lua, write_manifest_blobs, AddToLibraryOutcome,
-    MissingDownloadData,
+    is_valid_depot_key, manifest_file_name, prune_keyless_depots, write_catalog_lua,
+    write_manifest_blobs, AddToLibraryOutcome, MissingDownloadData,
 };
 pub use catalog_dlc::{DlcExpandOptions, DlcExpandReport};
 pub use error::{ConfigError, Result};
