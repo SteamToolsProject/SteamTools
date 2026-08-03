@@ -28,11 +28,13 @@ use stt_catalog::{
     CustomHttpCatalogProvider, MockCatalogProvider, ProviderErrorKind,
 };
 use stt_config::{
-    apply_intent, remove_from_library, CatalogMode, CatalogSection, ConfigIntent, ConfigSnapshot,
-    ConfigState, HostConfig, LuaCatalogProvider, LuaHttpClient, LuaHttpErrorKind, LuaHttpMethod,
-    LuaHttpRequest, LuaHttpResponse, MissingDownloadData, StoreAccelEgress, StoreAccelSection,
-    ToolId,
+    add_to_library_with_mode, apply_intent, import_local_texts, list_related_dlcs,
+    remove_from_library, CatalogDlcMode, CatalogMode, CatalogSection, ConfigIntent, ConfigSnapshot,
+    ConfigState, DlcExpandOptions, HostConfig, LuaCatalogProvider, LuaHttpClient, LuaHttpErrorKind,
+    LuaHttpMethod, LuaHttpRequest, LuaHttpResponse, MissingDownloadData, StoreAccelEgress,
+    StoreAccelSection, ToolId,
 };
+use stt_steamui::StorePendingJob;
 use stt_core::{AppId, AppRules};
 use stt_steamclient::{LicenseQueue, UiLicenseAction};
 
@@ -46,6 +48,8 @@ static LIBRARY_UX: OnceLock<stt_steamui::LibraryUx> = OnceLock::new();
 static HOST_LOGGER: OnceLock<HostLogger> = OnceLock::new();
 /// 自更新状态一行, 由后台 worker 写, 配置页快照读.
 static UPDATE_STATUS: OnceLock<Mutex<String>> = OnceLock::new();
+/// 面板 / 入库 / 导入共用的最近一次操作文案.
+static SHARED_NOTE: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
 /// DLL 内商店代理的唯一运行实例.
 static STORE_ACCEL_RUNTIME: OnceLock<Mutex<StoreAccelRuntime>> = OnceLock::new();
 
@@ -250,11 +254,10 @@ fn catalog_job_note(
     format!("{}: 入库 {app_id}{dlc_suffix}: {detail}", result.label())
 }
 
-fn catalog_button_label(result: CatalogJobResult, app_id: AppId, dlc_total: usize) -> String {
-    if dlc_total == 0 {
-        format!("入库{} {app_id}", result.label())
-    } else {
-        format!("入库{} {app_id}+{dlc_total}", result.label())
+fn catalog_button_label(result: CatalogJobResult, app_id: AppId, _dlc_total: usize) -> String {
+    match result {
+        CatalogJobResult::Success | CatalogJobResult::Partial => "已入库".to_owned(),
+        CatalogJobResult::Failure => format!("入库失败 {app_id}"),
     }
 }
 
@@ -614,31 +617,59 @@ fn build_catalog_provider(
     }
 }
 
+fn default_dlc_mode(state: &ConfigState) -> CatalogDlcMode {
+    if state.host().catalog.auto_dlc {
+        CatalogDlcMode::Full
+    } else {
+        CatalogDlcMode::GameOnly
+    }
+}
+
+fn dlc_expand_budget(state: &ConfigState) -> DlcExpandOptions {
+    let host = state.host();
+    DlcExpandOptions {
+        enabled: true,
+        max_dlc: host.catalog.max_dlc as usize,
+        timeout: std::time::Duration::from_millis(u64::from(host.catalog.dlc_timeout_ms)),
+    }
+}
+
 fn add_from_config(
     state: &ConfigState,
     steam_root: &Path,
     app_id: AppId,
+    dlc_mode: CatalogDlcMode,
 ) -> stt_config::Result<stt_config::AddToLibraryOutcome> {
     let host = state.host();
     let provider = build_catalog_provider(steam_root, &host.catalog)?;
-    let dlc_opts = if host.catalog.auto_dlc {
-        stt_config::DlcExpandOptions {
-            enabled: true,
-            max_dlc: host.catalog.max_dlc as usize,
-            timeout: std::time::Duration::from_millis(u64::from(host.catalog.dlc_timeout_ms)),
-        }
-    } else {
-        stt_config::DlcExpandOptions::disabled()
-    };
     let http = catalog_http_get_options(&host.catalog);
-    stt_config::add_to_library_with_dlc(
+    let budget = dlc_expand_budget(state);
+    add_to_library_with_mode(
         state,
         steam_root,
         provider.as_ref(),
         app_id,
-        dlc_opts,
+        dlc_mode,
+        budget,
         http,
     )
+}
+
+fn list_dlcs_from_config(
+    state: &ConfigState,
+    steam_root: &Path,
+    app_id: AppId,
+) -> stt_config::Result<stt_config::DlcListOutcome> {
+    let host = state.host();
+    let provider = build_catalog_provider(steam_root, &host.catalog)?;
+    let http = catalog_http_get_options(&host.catalog);
+    Ok(list_related_dlcs(
+        steam_root,
+        app_id,
+        provider.as_ref(),
+        http,
+        host.catalog.max_dlc as usize,
+    ))
 }
 
 fn catalog_http_get_options(config: &CatalogSection) -> stt_platform::WinHttpGetOptions {
@@ -829,6 +860,13 @@ pub fn run_init(steam_root: &Path) -> std::io::Result<()> {
         );
     }
 
+    // 拖放导入: 在配置面板「脚本目录」页拖入 .lua; 窗口级捕获已不做.
+    if state.tools().is_enabled(ToolId::LuaDrop) {
+        append_host_log(steam_root, "lua_drop=enabled (panel drop zone on Lua page)");
+    } else {
+        append_host_log(steam_root, "lua_drop=disabled");
+    }
+
     match stt_platform::write_store_inject_js(steam_root, stt_steamui::STORE_INJECT_JS) {
         Ok(path) => append_host_log(
             steam_root,
@@ -913,10 +951,11 @@ impl CatalogJobSource {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CatalogJob {
     app_id: AppId,
     source: CatalogJobSource,
+    dlc_mode: CatalogDlcMode,
 }
 
 fn queue_catalog_job(sender: &SyncSender<CatalogJob>, job: CatalogJob) -> stt_config::Result<()> {
@@ -945,7 +984,7 @@ fn spawn_catalog_worker(
         .name("catalog-worker".into())
         .spawn(move || {
             while let Ok(job) = jobs_rx.recv() {
-                match add_from_config(&state, &root, job.app_id) {
+                match add_from_config(&state, &root, job.app_id, job.dlc_mode.clone()) {
                     Ok(out) => {
                         let applied =
                             on_library_added(&root, &state, job.app_id, &out.owned_apps);
@@ -1087,6 +1126,13 @@ fn shared_note(note: &Arc<Mutex<String>>) -> String {
         .clone()
 }
 
+/// 进程内唯一 note 槽: 面板 / catalog / 导入都写这儿, 配置页才能看见.
+fn global_note() -> Arc<Mutex<String>> {
+    SHARED_NOTE
+        .get_or_init(|| Arc::new(Mutex::new(String::new())))
+        .clone()
+}
+
 impl HostPanel {
     /// 受管列表; rules 没变就用上一次的.
     fn managed_cached(&mut self) -> &[u32] {
@@ -1109,6 +1155,7 @@ impl HostPanel {
                     CatalogJob {
                         app_id,
                         source: CatalogJobSource::ConfigRefresh,
+                        dlc_mode: default_dlc_mode(&self.state),
                     },
                 )?;
                 Ok(format!("已排队刷新 {app_id}"))
@@ -1120,6 +1167,46 @@ impl HostPanel {
             }
             _ => Err(stt_config::ConfigError::Invalid("不是 app 意图".into())),
         }
+    }
+
+    /// 面板拖入的 lua 文本导入.
+    fn apply_import_intent(&self, intent: &ConfigIntent) -> stt_config::Result<String> {
+        let ConfigIntent::ImportLua { files } = intent else {
+            return Err(stt_config::ConfigError::Invalid("不是导入意图".into()));
+        };
+        if !self.state.tools().is_enabled(ToolId::LuaDrop) {
+            return Err(stt_config::ConfigError::Invalid(
+                "lua_drop tool is disabled".into(),
+            ));
+        }
+        set_shared_note(&self.note, "正在导入本地 lua…");
+        let report = import_local_texts(&self.state, &self.steam_root, files)?;
+        append_host_log(
+            &self.steam_root,
+            &format!("lua_drop=panel {}", report.summary_line()),
+        );
+        if !report.lua_written.is_empty() {
+            // 面板线程没有 pattern store; reload 后走与手改 lua 相同的热重载路径
+            // (watch 循环会在下一轮 rescan 再对齐 package). 这里先触库 present.
+            for &app_id in &report.apps {
+                library_ux().on_rules_app_present(app_id);
+            }
+            // 立刻对齐 package/configured, 不等 watch.
+            sync_download_runtime(&self.state);
+            sync_configured_from_state(&self.state);
+            if let Some(q) = license_queue() {
+                let package_ids = package_ids_from_state(&self.state);
+                q.reconcile_owned(package_ids.iter().copied());
+                if q.pending_add_len() > 0 || q.pending_remove_len() > 0 {
+                    let plan = stt_steamclient::notify_license_changed(&q);
+                    append_host_log(&self.steam_root, &plan.summary_line());
+                }
+            }
+            self.state.with_rules(|rules| library_ux().sync_from_rules(rules));
+        }
+        let note = report.note_line();
+        set_shared_note(&self.note, note.clone());
+        Ok(note)
     }
 }
 
@@ -1153,10 +1240,14 @@ impl stt_steamui::PanelBridge for HostPanel {
         for intent in intents {
             let was_store_accel = self.state.tools().is_enabled(ToolId::StoreAccel);
             let previous_store_accel = self.state.host().store_accel;
-            // 针对某个 app 的意图不写 toml, 要 provider, 只有宿主这儿有.
-            let done = match intent.app_target() {
-                Some(app_id) => self.apply_app_intent(intent, app_id),
-                None => apply_intent(&self.state, &self.steam_root, intent),
+            // app / 导入意图不写 toml, 只有宿主这儿能处理.
+            let done = if intent.is_import() {
+                self.apply_import_intent(intent)
+            } else {
+                match intent.app_target() {
+                    Some(app_id) => self.apply_app_intent(intent, app_id),
+                    None => apply_intent(&self.state, &self.steam_root, intent),
+                }
             };
             match done {
                 Ok(done) => {
@@ -1167,7 +1258,11 @@ impl stt_steamui::PanelBridge for HostPanel {
                         &self.state,
                     );
                     append_host_log(&self.steam_root, &format!("config_ui=saved {done}"));
-                    if !matches!(intent, ConfigIntent::RefreshApp(_)) {
+                    // 导入/刷新自己已经写过 note; 其它意图统一 "已保存".
+                    if !matches!(
+                        intent,
+                        ConfigIntent::RefreshApp(_) | ConfigIntent::ImportLua { .. }
+                    ) {
                         set_shared_note(&self.note, format!("已保存 {done}"));
                     }
                 }
@@ -1221,7 +1316,7 @@ fn spawn_store_cdp_bridge(
     let _ = std::thread::Builder::new()
         .name("store-cdp".into())
         .spawn(move || {
-            let note = Arc::new(Mutex::new(String::new()));
+            let note = global_note();
             let (catalog_jobs, catalog_feedback) = spawn_catalog_worker(&root, &state, &note);
             let mut panel = HostPanel {
                 steam_root: root.clone(),
@@ -1238,8 +1333,14 @@ fn spawn_store_cdp_bridge(
             // 短脚本: 大 STORE_INJECT_JS 在 CEF evaluate 上易挂起.
             // 工具关掉就换成摘按钮的脚本, 让开关当场看得见.
             let mut make_js = || {
+                // 商店按钮「已入库」依赖 managed 列表; 直接扫盘, 不借 panel
+                // (panel 同时要交给 loop 作 PanelBridge).
+                let managed = stt_config::managed_apps(&state, &root);
                 let mut script = if state.tools().is_enabled(ToolId::CatalogAdd) {
-                    stt_steamui::cdp_store_inject_js()
+                    let mut s = stt_steamui::managed_apps_js(&managed);
+                    s.push_str(";\n");
+                    s.push_str(&stt_steamui::cdp_store_inject_js());
+                    s
                 } else {
                     stt_steamui::store_teardown_js()
                 };
@@ -1247,33 +1348,72 @@ fn spawn_store_cdp_bridge(
                     script.push_str(";\n");
                     script.push_str(&feedback);
                 }
-                script
+                                script
             };
-            // 点击只入有界队列; HTTP 和落盘由 catalog worker 执行.
-            let mut on_app = |app_id: u32| -> Option<String> {
-                let job = CatalogJob {
-                    app_id,
-                    source: CatalogJobSource::StoreCdp,
-                };
-                match queue_catalog_job(&catalog_jobs, job) {
-                    Ok(()) => Some(stt_steamui::store_button_result_js(
+            // 点击只入有界队列; HTTP/落盘由 catalog worker 执行.
+            // select_dlc/list 在回调里同步拉列表并回写 picker.
+            let mut on_app = |pending: StorePendingJob| -> Option<String> {
+                let app_id = pending.app_id;
+                if pending.is_dlc_list() {
+                    match list_dlcs_from_config(&state, &root, app_id) {
+                        Ok(list) => {
+                            let items: Vec<serde_json::Value> = list
+                                .items
+                                .iter()
+                                .map(|it| serde_json::json!({"id": it.app_id, "name": it.name}))
+                                .collect();
+                            let items_json =
+                                serde_json::to_string(&items).unwrap_or_else(|_| "[]".into());
+                            append_host_log(
+                                &root,
+                                &format!(
+                                    "catalog_dlc_list=ok app_id={app_id} count={} source={} truncated={}",
+                                    list.items.len(),
+                                    list.list_source,
+                                    list.truncated
+                                ),
+                            );
+                            Some(stt_steamui::store_dlc_picker_js(
+                                app_id,
+                                &items_json,
+                                list.truncated,
+                            ))
+                        }
+                        Err(error) => {
+                            append_host_log(
+                                &root,
+                                &format!("catalog_dlc_list=err app_id={app_id} {error}"),
+                            );
+                            Some(stt_steamui::store_dlc_picker_error_js(app_id, "DLC 列表失败"))
+                        }
+                    }
+                } else {
+                    let dlc_mode = match pending.mode.as_str() {
+                        "game_only" => CatalogDlcMode::GameOnly,
+                        "select_dlc" => CatalogDlcMode::Selected(pending.dlc_ids.clone()),
+                        _ => CatalogDlcMode::Full,
+                    };
+                    let job = CatalogJob {
                         app_id,
-                        false,
-                        "正在拉取",
-                    )),
-                    Err(error) => {
-                        append_host_log(
-                            &root,
-                            &format!(
-                                "catalog_add=queue_err source=store_cdp app_id={app_id} {error}"
-                            ),
-                        );
-                        set_shared_note(&note, format!("失败: 入库 {app_id}: {error}"));
-                        Some(stt_steamui::store_button_result_js(
-                            app_id,
-                            false,
-                            "队列不可用",
-                        ))
+                        source: CatalogJobSource::StoreCdp,
+                        dlc_mode,
+                    };
+                    match queue_catalog_job(&catalog_jobs, job) {
+                        Ok(()) => Some(stt_steamui::store_button_result_js(
+                            app_id, false, "正在拉取",
+                        )),
+                        Err(error) => {
+                            append_host_log(
+                                &root,
+                                &format!(
+                                    "catalog_add=queue_err source=store_cdp app_id={app_id} {error}"
+                                ),
+                            );
+                            set_shared_note(&note, format!("失败: 入库 {app_id}: {error}"));
+                            Some(stt_steamui::store_button_result_js(
+                                app_id, false, "队列不可用",
+                            ))
+                        }
                     }
                 }
             };
@@ -1934,6 +2074,14 @@ fn tool_details(context: ToolDetailsContext<'_>) -> stt_config::ToolDetails {
         ToolId::StoreAccel.as_str(),
         store_accel_detail(steam_root, state),
     );
+    d.insert(
+        ToolId::LuaDrop.as_str(),
+        if !tools.is_enabled(ToolId::LuaDrop) {
+            "已关闭, 面板拖入不会导入".to_owned()
+        } else {
+            "已启用: 在「脚本目录」页拖入 .lua 文件".to_owned()
+        },
+    );
     d
 }
 
@@ -2193,6 +2341,7 @@ fn clip_bad_line(line: &str) -> String {
 /// 队列满就记日志放弃, 不让 watch 线程同步网络, 也不阻塞轮询.
 fn process_inbox(
     steam_root: &Path,
+    state: &ConfigState,
     catalog_jobs: &SyncSender<CatalogJob>,
     seen: &mut std::collections::HashSet<std::path::PathBuf>,
 ) {
@@ -2264,6 +2413,7 @@ fn process_inbox(
             let job = CatalogJob {
                 app_id,
                 source: CatalogJobSource::Inbox,
+                dlc_mode: default_dlc_mode(state),
             };
             if let Err(error) = queue_catalog_job(catalog_jobs, job) {
                 // 有界队列, 满就丢这一次, 不阻塞 watch 轮询.
@@ -2373,7 +2523,7 @@ fn run_watch_loop(
     let mut inbox_seen: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
     // inbox 只入队, 由这里独立的有界 worker 处理; 反馈通道没人读, 丢弃即可.
-    let watch_note = Arc::new(Mutex::new(String::new()));
+    let watch_note = global_note();
     let (catalog_jobs, _catalog_feedback) = spawn_catalog_worker(steam_root, state, &watch_note);
 
     // 定期重扫目录, 好把新建的 .lua 纳入监视.
@@ -2408,7 +2558,7 @@ fn run_watch_loop(
 
     loop {
         std::thread::sleep(WATCH_POLL);
-        process_inbox(steam_root, &catalog_jobs, &mut inbox_seen);
+        process_inbox(steam_root, state, &catalog_jobs, &mut inbox_seen);
         cef_rearm.tick(steam_root, state);
 
         // ~2s 一轮: 未 attach 且 catalog_add 开着则重试 package hooks.
@@ -3194,8 +3344,26 @@ end
 
         let queue = Arc::new(LicenseQueue::new());
         let configured = Arc::new(RwLock::new(HashSet::new()));
-        let _ = LICENSE_QUEUE.set(Arc::clone(&queue));
-        let _ = CONFIGURED_APPS.set(Arc::clone(&configured));
+        // 进程内 OnceLock 只能 set 一次; 已有就清空复用.
+        let queue = match LICENSE_QUEUE.set(Arc::clone(&queue)) {
+            Ok(()) => queue,
+            Err(_) => {
+                let existing = LICENSE_QUEUE.get().unwrap().clone();
+                existing.clear_for_test();
+                existing
+            }
+        };
+        let configured = match CONFIGURED_APPS.set(Arc::clone(&configured)) {
+            Ok(()) => configured,
+            Err(_) => {
+                let existing = CONFIGURED_APPS.get().unwrap().clone();
+                existing
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                existing
+            }
+        };
         stt_steamclient::register_runtime(Arc::clone(&queue), Arc::clone(&configured));
         stt_steamclient::set_ui_action_handler(apply_ui_license_action);
 
@@ -3206,12 +3374,13 @@ end
             CatalogJob {
                 app_id: 42,
                 source: CatalogJobSource::StoreCdp,
+                dlc_mode: CatalogDlcMode::GameOnly,
             },
         )
         .unwrap();
 
         let feedback = feedback.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(feedback.contains("入库部分成功 42"), "{feedback}");
+        assert!(feedback.contains("已入库"), "{feedback}");
         let lua_path = stt_config::catalog_lua_path(root.path(), 42);
         let lua = fs::read_to_string(&lua_path).unwrap();
         assert!(lua.contains("addappid(43, 0,"), "{lua}");
@@ -3261,8 +3430,8 @@ end
         feature = "download-request-code"
     ))]
     #[test]
-    fn store_catalog_job_warns_when_manifest_missing_depot_key() {
-        // provider 只给 manifest 不给 key: 入库成功, 但必须弹"缺下载密钥"提示.
+    fn store_catalog_job_prunes_keyless_depot_and_still_imports() {
+        // provider 只给 manifest 不给 key: prune 后下载面为空, 仍入库成功, 不弹缺 key.
         let body = r#"{"schema_version":1,"apps":[{"app_id":42,"depots":[{"depot_id":43,"manifest":{"gid":"99","size":"100"}}]}]}"#
             .as_bytes()
             .to_vec();
@@ -3279,8 +3448,25 @@ end
 
         let queue = Arc::new(LicenseQueue::new());
         let configured = Arc::new(RwLock::new(HashSet::new()));
-        let _ = LICENSE_QUEUE.set(Arc::clone(&queue));
-        let _ = CONFIGURED_APPS.set(Arc::clone(&configured));
+        let queue = match LICENSE_QUEUE.set(Arc::clone(&queue)) {
+            Ok(()) => queue,
+            Err(_) => {
+                let existing = LICENSE_QUEUE.get().unwrap().clone();
+                existing.clear_for_test();
+                existing
+            }
+        };
+        let configured = match CONFIGURED_APPS.set(Arc::clone(&configured)) {
+            Ok(()) => configured,
+            Err(_) => {
+                let existing = CONFIGURED_APPS.get().unwrap().clone();
+                existing
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                existing
+            }
+        };
         stt_steamclient::register_runtime(Arc::clone(&queue), Arc::clone(&configured));
         stt_steamclient::set_ui_action_handler(apply_ui_license_action);
 
@@ -3291,30 +3477,33 @@ end
             CatalogJob {
                 app_id: 42,
                 source: CatalogJobSource::StoreCdp,
+                dlc_mode: CatalogDlcMode::GameOnly,
             },
         )
         .unwrap();
 
-        // 第一条是按钮回写, 第二条是缺下载数据弹窗.
+        // 只有按钮回写; keyless depot 已被 prune, 不再二次弹缺 key.
         let first = feedback.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(first.contains("入库部分成功 42"), "{first}");
-        let warn = feedback.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(warn.contains("stt-missing-key"), "{warn}");
-        assert!(warn.contains("Depot 43"), "{warn}");
+        assert!(first.contains("已入库"), "{first}");
+        assert!(
+            feedback.recv_timeout(Duration::from_millis(200)).is_err(),
+            "不应再发 missing-key 弹窗"
+        );
 
         let note = note
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        assert!(note.contains("缺 下载密钥 (Depot 43)"), "{note}");
-        // 有 manifest 没给 token, 弹窗文案也要提 token.
-        assert!(note.contains("访问令牌"), "{note}");
+        assert!(note.contains("已落盘"), "{note}");
+        assert!(!note.contains("缺 下载密钥"), "{note}");
 
-        let log = fs::read_to_string(stt_platform::host_log_path(root.path())).unwrap();
-        assert!(
-            log.contains("missing=depot_keys=43 missing_access_token=1"),
-            "{log}"
-        );
+        // 落盘 lua 只有 app 行, 没有无 key 的 depot.
+        let lua = fs::read_to_string(root.path().join("config/lua/stt_42.lua")).unwrap();
+        assert!(lua.contains("addappid(42"), "{lua}");
+        assert!(!lua.contains("addappid(43"), "{lua}");
+        assert!(!lua.contains("setmanifestid(43"), "{lua}");
+        let _ = queue;
+        let _ = configured;
     }
 
     #[test]
@@ -3338,13 +3527,13 @@ end
 
     #[test]
     fn catalog_feedback_uses_the_same_three_outcome_labels() {
-        for (result, label) in [
-            (CatalogJobResult::Success, "成功"),
-            (CatalogJobResult::Partial, "部分成功"),
-            (CatalogJobResult::Failure, "失败"),
+        for (result, note_label, button_part) in [
+            (CatalogJobResult::Success, "成功", "已入库"),
+            (CatalogJobResult::Partial, "部分成功", "已入库"),
+            (CatalogJobResult::Failure, "失败", "失败"),
         ] {
-            assert!(catalog_job_note(result, 42, "", "detail").starts_with(label));
-            assert!(catalog_button_label(result, 42, 0).contains(label));
+            assert!(catalog_job_note(result, 42, "", "detail").starts_with(note_label));
+            assert!(catalog_button_label(result, 42, 0).contains(button_part));
             assert!(!result.as_str().is_empty());
         }
     }
