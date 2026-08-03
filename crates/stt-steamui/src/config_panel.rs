@@ -1531,7 +1531,10 @@ mod tests {
         ]}));
         assert_eq!(
             tick.intents,
-            vec![ConfigIntent::import_lua(vec![("570.lua".into(), "addappid(570)\n".into())]).unwrap()]
+            vec![
+                ConfigIntent::import_lua(vec![("570.lua".into(), "addappid(570)\n".into())])
+                    .unwrap()
+            ]
         );
     }
 

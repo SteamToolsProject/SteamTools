@@ -22,8 +22,8 @@ pub use library_detour::{
 };
 
 pub use cdp_bridge::{
-    cdp_store_inject_js, parse_pending_jobs, poll_store_cdp,
-    poll_store_cdp_default, run_store_cdp_loop, run_store_cdp_loop_with_js, store_button_result_js,
+    cdp_store_inject_js, parse_pending_jobs, poll_store_cdp, poll_store_cdp_default,
+    run_store_cdp_loop, run_store_cdp_loop_with_js, store_button_result_js,
     store_dlc_picker_error_js, store_dlc_picker_js, store_missing_key_warn_js, store_teardown_js,
     StoreCdpPoll, StorePendingJob, CDP_STORE_INJECT_JS, STORE_TEARDOWN_JS,
 };

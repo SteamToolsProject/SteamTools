@@ -1320,10 +1320,7 @@ pub fn parse_pending_jobs(v: &Value) -> Vec<StorePendingJob> {
             "game_only" | "select_dlc" | "full" => mode,
             _ => "full".to_owned(),
         };
-        let stage = item
-            .get("stage")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let stage = item.get("stage").and_then(Value::as_str).map(str::to_owned);
         let dlc_ids = item
             .get("dlc_ids")
             .and_then(Value::as_array)
@@ -1950,7 +1947,9 @@ mod tests {
         assert!(bad.contains("btn_grey_steamui"));
         assert_eq!(
             bad.matches('\'').count(),
-            store_button_result_js(1, false, "safe").matches('\'').count()
+            store_button_result_js(1, false, "safe")
+                .matches('\'')
+                .count()
         );
     }
 

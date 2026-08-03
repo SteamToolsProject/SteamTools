@@ -383,8 +383,7 @@ pub fn add_to_library_with_mode(
                 .is_some_and(|over| over.manifest_gid == blob.manifest_gid)
         })
         .collect();
-    let manifest_files_written =
-        write_manifest_blobs(steam_root, &filtered_blobs).unwrap_or(0);
+    let manifest_files_written = write_manifest_blobs(steam_root, &filtered_blobs).unwrap_or(0);
 
     // 以磁盘 lua 为准重载, 避免 DLC 列表缩小时 merge 残留旧 owned.
     #[cfg(feature = "lua")]

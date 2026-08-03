@@ -186,9 +186,9 @@ impl ConfigIntent {
                 Ok(format!("lua.paths -= {path}"))
             }
             // 这些不动 toml, 由宿主接手.
-            Self::RefreshApp(_) | Self::RemoveApp(_) | Self::ImportLua { .. } => Err(
-                ConfigError::Invalid("该意图不写 toml, 应由宿主处理".into()),
-            ),
+            Self::RefreshApp(_) | Self::RemoveApp(_) | Self::ImportLua { .. } => {
+                Err(ConfigError::Invalid("该意图不写 toml, 应由宿主处理".into()))
+            }
         }
     }
 }

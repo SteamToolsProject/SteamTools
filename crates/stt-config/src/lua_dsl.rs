@@ -104,11 +104,7 @@ fn eval_lua_to_bundle_inner(
                 Ok(())
             })
             .map_err(lua_err)?;
-        set_global_aliases(
-            &lua,
-            &["setappdepots", "setAppDepots", "SetAppDepots"],
-            f,
-        )?;
+        set_global_aliases(&lua, &["setappdepots", "setAppDepots", "SetAppDepots"], f)?;
     }
 
     {

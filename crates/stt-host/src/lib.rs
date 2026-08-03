@@ -34,9 +34,9 @@ use stt_config::{
     LuaHttpMethod, LuaHttpRequest, LuaHttpResponse, MissingDownloadData, StoreAccelEgress,
     StoreAccelSection, ToolId,
 };
-use stt_steamui::StorePendingJob;
 use stt_core::{AppId, AppRules};
 use stt_steamclient::{LicenseQueue, UiLicenseAction};
+use stt_steamui::StorePendingJob;
 
 /// 进程内 package 许可队列 (init 时注册).
 static LICENSE_QUEUE: OnceLock<Arc<LicenseQueue>> = OnceLock::new();
@@ -1202,7 +1202,8 @@ impl HostPanel {
                     append_host_log(&self.steam_root, &plan.summary_line());
                 }
             }
-            self.state.with_rules(|rules| library_ux().sync_from_rules(rules));
+            self.state
+                .with_rules(|rules| library_ux().sync_from_rules(rules));
         }
         let note = report.note_line();
         set_shared_note(&self.note, note.clone());

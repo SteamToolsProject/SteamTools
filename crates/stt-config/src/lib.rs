@@ -38,13 +38,13 @@ pub use catalog_dlc::{
     DlcListOutcome,
 };
 pub use error::{ConfigError, Result};
-#[cfg(feature = "lua")]
-pub use import_local::{
-    import_local_paths, import_local_texts, managed_lua_paths_for_app, ImportLocalReport,
-};
 pub use host_toml::{
     CatalogMode, CatalogSection, HostConfig, LogSection, LuaSection, ManifestSection,
     StoreAccelEgress, StoreAccelSection, ToolsSection, HOST_TOML_NAME, LEGACY_TOML_NAME,
+};
+#[cfg(feature = "lua")]
+pub use import_local::{
+    import_local_paths, import_local_texts, managed_lua_paths_for_app, ImportLocalReport,
 };
 pub use intent::{
     apply_intent, host_toml_write_path, save_host_change, ConfigIntent, CATALOG_MODES, LOG_LEVELS,

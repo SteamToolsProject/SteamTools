@@ -124,7 +124,14 @@ pub fn import_local_paths(
             Ok(p) => p,
             Err(_) => raw.clone(),
         };
-        collect_from_path(&path, 0, &mut lua_sources, &mut manifest_sources, &mut seen, &mut report);
+        collect_from_path(
+            &path,
+            0,
+            &mut lua_sources,
+            &mut manifest_sources,
+            &mut seen,
+            &mut report,
+        );
     }
 
     if lua_sources.len() > MAX_LUA_FILES {
@@ -196,7 +203,9 @@ fn collect_from_path(
         }
     };
     if meta.file_type().is_symlink() {
-        report.skipped.push(format!("跳过符号链接 {}", path.display()));
+        report
+            .skipped
+            .push(format!("跳过符号链接 {}", path.display()));
         return;
     }
     if meta.is_file() {
@@ -227,9 +236,7 @@ fn collect_from_path(
     }
     if meta.is_dir() {
         if depth > MAX_DIR_DEPTH {
-            report
-                .skipped
-                .push(format!("目录过深: {}", path.display()));
+            report.skipped.push(format!("目录过深: {}", path.display()));
             return;
         }
         let rd = match std::fs::read_dir(path) {
@@ -242,20 +249,11 @@ fn collect_from_path(
             }
         };
         for ent in rd.flatten() {
-            collect_from_path(
-                &ent.path(),
-                depth + 1,
-                luas,
-                manifests,
-                seen,
-                report,
-            );
+            collect_from_path(&ent.path(), depth + 1, luas, manifests, seen, report);
         }
         return;
     }
-    report
-        .skipped
-        .push(format!("无法识别 {}", path.display()));
+    report.skipped.push(format!("无法识别 {}", path.display()));
 }
 
 fn import_one_lua(lua_dir: &Path, src: &Path) -> Result<(PathBuf, Vec<AppId>)> {
@@ -357,11 +355,7 @@ fn import_one_lua_text(lua_dir: &Path, src: &Path, text: &str) -> Result<(PathBu
 
 /// 面板上传文件名: 只要叶子名, 必须是 .lua, 去掉路径分隔.
 fn sanitize_upload_name(name: &str) -> Option<String> {
-    let leaf = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .trim();
+    let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
     if leaf.is_empty() || leaf.len() > 180 {
         return None;
     }
@@ -651,17 +645,17 @@ mod tests {
 
         let pack = root.path().join("game");
         std::fs::create_dir_all(&pack).unwrap();
-        std::fs::write(pack.join("892970.lua"), "addappid(892970)\nsetmanifestid(892971, \"123\")\n")
-            .unwrap();
+        std::fs::write(
+            pack.join("892970.lua"),
+            "addappid(892970)\nsetmanifestid(892971, \"123\")\n",
+        )
+        .unwrap();
         std::fs::write(pack.join("892971_123.manifest"), b"manifest-bytes").unwrap();
 
         let report = import_local_paths(&state, root.path(), &[pack]).unwrap();
         assert_eq!(report.lua_written.len(), 1);
         assert_eq!(report.manifests_written, 1);
-        let primary = root
-            .path()
-            .join("depotcache")
-            .join("892971_123.manifest");
+        let primary = root.path().join("depotcache").join("892971_123.manifest");
         assert_eq!(std::fs::read(primary).unwrap(), b"manifest-bytes");
     }
 
