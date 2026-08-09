@@ -196,6 +196,31 @@ pub fn format_catalog_lua(app_id: AppId, bundle: &CatalogBundle) -> String {
             "if type(setappdepots) == \"function\" then setappdepots({id}, {{{values}}}) end\n"
         ));
     }
+    // 社区包 ticket: 落盘后 reload 会写 HKCU (对齐 OST setAppticket).
+    let mut tickets: Vec<_> = bundle.app_tickets.iter().collect();
+    tickets.sort_unstable_by_key(|(id, _)| **id);
+    for (&id, hex) in tickets {
+        if hex.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("setAppticket({id}, \"{hex}\")\n"));
+    }
+    let mut etickets: Vec<_> = bundle.etickets.iter().collect();
+    etickets.sort_unstable_by_key(|(id, _)| **id);
+    for (&id, hex) in etickets {
+        if hex.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("setETicket({id}, \"{hex}\")\n"));
+    }
+    let mut steam_ids: Vec<_> = bundle.steam_ids.iter().collect();
+    steam_ids.sort_unstable_by_key(|(id, _)| **id);
+    for (&id, steam_id) in steam_ids {
+        if steam_id.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("setStat({id}, \"{steam_id}\")\n"));
+    }
     debug_assert!(bundle.apps.contains(&app_id));
     out
 }
@@ -965,5 +990,23 @@ mod tests {
         let error = add_to_library(&state, root.path(), &InvalidProvider, 42).unwrap_err();
 
         assert!(!catalog_lua_path(root.path(), 42).exists(), "{error}");
+    }
+
+    #[test]
+    fn format_catalog_lua_emits_set_appticket_and_eticket() {
+        let b = CatalogBundle {
+            apps: vec![10, 11],
+            app_depots: std::collections::HashMap::from([(10, vec![12])]),
+            depot_keys: std::collections::HashMap::from([(12, "ab".repeat(32))]),
+            app_tickets: std::collections::HashMap::from([(10, "aabb".to_owned())]),
+            etickets: std::collections::HashMap::from([(11, "ccdd".to_owned())]),
+            steam_ids: std::collections::HashMap::from([(10, "76561198000000000".to_owned())]),
+            ..CatalogBundle::default()
+        };
+        let s = format_catalog_lua(10, &b);
+        assert!(s.contains("setAppticket(10, \"aabb\")"));
+        assert!(s.contains("setETicket(11, \"ccdd\")"));
+        assert!(s.contains("setStat(10, \"76561198000000000\")"));
+        assert!(s.contains(&format!("addappid(12, 0, \"{}\")", "ab".repeat(32))));
     }
 }

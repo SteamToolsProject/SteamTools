@@ -88,6 +88,9 @@ fn validate_apps(
         .keys()
         .chain(bundle.purchase_times.keys())
         .chain(bundle.app_depots.keys())
+        .chain(bundle.app_tickets.keys())
+        .chain(bundle.etickets.keys())
+        .chain(bundle.steam_ids.keys())
     {
         if !seen.contains(&app_id) {
             return Err(CatalogError::UndeclaredApp(app_id));
@@ -162,6 +165,12 @@ fn normalize(bundle: &mut CatalogBundle) {
     }
     for key in bundle.depot_keys.values_mut() {
         key.make_ascii_lowercase();
+    }
+    for hex in bundle.app_tickets.values_mut() {
+        hex.make_ascii_lowercase();
+    }
+    for hex in bundle.etickets.values_mut() {
+        hex.make_ascii_lowercase();
     }
 }
 

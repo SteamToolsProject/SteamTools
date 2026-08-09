@@ -11,9 +11,9 @@ use stt_core::{AppId, CatalogBundle, DepotId};
 use stt_platform::{winhttp_get, HttpError, WinHttpGetOptions};
 
 use crate::{
-    keys_parse::collect_lua_keys, validate_bundle, CatalogEnricher, CatalogError,
-    CatalogFetchOutcome, CatalogProvider, CatalogResult, CatalogTraceEntry, CatalogTraceOutcome,
-    EnrichContext, ProviderErrorKind,
+    keys_parse::{collect_lua_keys, collect_lua_tickets, LuaTicketSet},
+    validate_bundle, CatalogEnricher, CatalogError, CatalogFetchOutcome, CatalogProvider,
+    CatalogResult, CatalogTraceEntry, CatalogTraceOutcome, EnrichContext, ProviderErrorKind,
 };
 
 const PROVIDER: &str = "community:catmisteam";
@@ -90,14 +90,6 @@ impl CatmisteamCatalogProvider {
         })?;
         Ok(text.to_owned())
     }
-
-    /// 补全用: 只解析 lua 里的 depot keys (不过滤 declared).
-    fn fetch_keys_for_enrich(&self, app_id: AppId) -> CatalogResult<HashMap<DepotId, String>> {
-        let text = self.fetch_lua(app_id)?;
-        let mut keys = HashMap::new();
-        collect_lua_keys(&text, &mut keys)?;
-        Ok(keys)
-    }
 }
 
 impl CatalogProvider for CatmisteamCatalogProvider {
@@ -114,7 +106,7 @@ impl CatalogProvider for CatmisteamCatalogProvider {
     }
 }
 
-/// Community 成功路径上的 best-effort key 补全 (不覆盖已有 key; 无 token).
+/// Community 成功路径上的 best-effort key/ticket 补全 (不覆盖已有).
 impl CatalogEnricher for CatmisteamCatalogProvider {
     fn id(&self) -> &str {
         PROVIDER
@@ -131,38 +123,78 @@ impl CatalogEnricher for CatmisteamCatalogProvider {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        if missing_keys.is_empty() {
+        let need_tickets = ctx.bundle.app_tickets.is_empty()
+            && ctx.bundle.etickets.is_empty()
+            && ctx.bundle.steam_ids.is_empty();
+        if missing_keys.is_empty() && !need_tickets {
             return;
         }
-        let keys = match self.fetch_keys_for_enrich(ctx.app_id) {
-            Ok(keys) => keys,
+        let text = match self.fetch_lua(ctx.app_id) {
+            Ok(text) => text,
             Err(error) => {
-                ctx.trace.push(CatalogTraceEntry {
-                    provider: "community:catmisteam_key".to_owned(),
-                    outcome: CatalogTraceOutcome::Failed(classify_provider_err(&error)),
-                });
+                if !missing_keys.is_empty() {
+                    ctx.trace.push(CatalogTraceEntry {
+                        provider: "community:catmisteam_key".to_owned(),
+                        outcome: CatalogTraceOutcome::Failed(classify_provider_err(&error)),
+                    });
+                }
+                if need_tickets {
+                    ctx.trace.push(CatalogTraceEntry {
+                        provider: "community:catmisteam_ticket".to_owned(),
+                        outcome: CatalogTraceOutcome::Failed(classify_provider_err(&error)),
+                    });
+                }
                 return;
             }
         };
-        let mut filled = 0;
-        for depot_id in &missing_keys {
-            if let Some(key) = keys.get(depot_id) {
-                if !ctx.bundle.depot_keys.contains_key(depot_id) {
-                    ctx.bundle.depot_keys.insert(*depot_id, key.clone());
-                    filled += 1;
+
+        if !missing_keys.is_empty() {
+            let mut keys = HashMap::new();
+            let _ = collect_lua_keys(&text, &mut keys);
+            let mut filled = 0;
+            for depot_id in &missing_keys {
+                if let Some(key) = keys.get(depot_id) {
+                    if !ctx.bundle.depot_keys.contains_key(depot_id) {
+                        ctx.bundle.depot_keys.insert(*depot_id, key.clone());
+                        filled += 1;
+                    }
                 }
             }
+            ctx.trace.push(CatalogTraceEntry {
+                provider: "community:catmisteam_key".to_owned(),
+                outcome: if filled > 0 {
+                    CatalogTraceOutcome::Hit
+                } else {
+                    CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound)
+                },
+            });
         }
-        if filled > 0 {
-            ctx.trace.push(CatalogTraceEntry {
-                provider: "community:catmisteam_key".to_owned(),
-                outcome: CatalogTraceOutcome::Hit,
-            });
-        } else {
-            ctx.trace.push(CatalogTraceEntry {
-                provider: "community:catmisteam_key".to_owned(),
-                outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
-            });
+
+        if need_tickets {
+            let mut tickets = LuaTicketSet::default();
+            let _ = collect_lua_tickets(&text, &mut tickets);
+            if tickets.is_empty() {
+                ctx.trace.push(CatalogTraceEntry {
+                    provider: "community:catmisteam_ticket".to_owned(),
+                    outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
+                });
+            } else {
+                tickets.merge_into_bundle(ctx.bundle);
+                for &app_id in tickets
+                    .app_tickets
+                    .keys()
+                    .chain(tickets.etickets.keys())
+                    .chain(tickets.steam_ids.keys())
+                {
+                    if app_id != 0 && !ctx.bundle.apps.contains(&app_id) {
+                        ctx.bundle.apps.push(app_id);
+                    }
+                }
+                ctx.trace.push(CatalogTraceEntry {
+                    provider: "community:catmisteam_ticket".to_owned(),
+                    outcome: CatalogTraceOutcome::Hit,
+                });
+            }
         }
     }
 }
@@ -172,11 +204,14 @@ impl CatalogEnricher for CatmisteamCatalogProvider {
 /// 兼容面 (与调研样例一致, 不执行脚本):
 /// - `addappid(appId)` / `addappid(appId, purchaseTime)` → apps (+ purchase_times)
 /// - `addappid(depotId, _, "64hex")` → depot_keys; 全部挂到请求 app 的 app_depots
+/// - `setAppticket` / `setETicket` / `setStat` → ticket 字段 (写 lua / 注册表)
 ///
 /// 不含 setManifestid / token; 完整下载仍依赖上游 metadata / archive / request-code.
 fn parse_lua_catalog(app_id: AppId, text: &str) -> CatalogResult<CatalogBundle> {
     let mut depot_keys = HashMap::new();
     collect_lua_keys(text, &mut depot_keys)?;
+    let mut tickets = LuaTicketSet::default();
+    collect_lua_tickets(text, &mut tickets)?;
 
     let mut apps = Vec::new();
     let mut purchase_times = HashMap::new();
@@ -231,6 +266,16 @@ fn parse_lua_catalog(app_id: AppId, text: &str) -> CatalogResult<CatalogBundle> 
     if !apps.contains(&app_id) {
         apps.insert(0, app_id);
     }
+    for &ticket_app in tickets
+        .app_tickets
+        .keys()
+        .chain(tickets.etickets.keys())
+        .chain(tickets.steam_ids.keys())
+    {
+        if ticket_app != 0 && !apps.contains(&ticket_app) {
+            apps.push(ticket_app);
+        }
+    }
 
     let mut depots: Vec<DepotId> = depot_keys.keys().copied().collect();
     depots.sort_unstable();
@@ -244,13 +289,15 @@ fn parse_lua_catalog(app_id: AppId, text: &str) -> CatalogResult<CatalogBundle> 
         ));
     }
 
-    Ok(CatalogBundle {
+    let mut bundle = CatalogBundle {
         apps,
         app_depots: HashMap::from([(app_id, depots)]),
         depot_keys,
         purchase_times,
         ..CatalogBundle::default()
-    })
+    };
+    tickets.merge_into_bundle(&mut bundle);
+    Ok(bundle)
 }
 
 fn classify_provider_err(error: &CatalogError) -> ProviderErrorKind {
@@ -499,5 +546,23 @@ addappid(44,0,"abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 let _ = thread.join();
             }
         }
+    }
+
+    #[test]
+    fn parse_lua_catalog_keeps_set_appticket() {
+        let key = "ab".repeat(32);
+        let lua = format!(
+            "addappid(42)\naddappid(43,0,\"{key}\")\nsetAppticket(42, \"AaBb\")\nsetETicket(42, \"CcDd\")\n"
+        );
+        let bundle = parse_lua_catalog(42, &lua).unwrap();
+        assert_eq!(
+            bundle.app_tickets.get(&42).map(String::as_str),
+            Some("aabb")
+        );
+        assert_eq!(bundle.etickets.get(&42).map(String::as_str), Some("ccdd"));
+        assert_eq!(
+            bundle.depot_keys.get(&43).map(String::as_str),
+            Some(key.as_str())
+        );
     }
 }

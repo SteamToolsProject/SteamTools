@@ -57,6 +57,8 @@ struct ArchiveCatalogData {
     manifests: HashMap<DepotId, ManifestOverride>,
     /// 原始 .manifest 文件字节, key = (depot_id, manifest_gid).
     manifest_blobs: HashMap<(DepotId, u64), Vec<u8>>,
+    /// ZIP 内 lua 的 setAppticket / setETicket / setStat.
+    tickets: keys_parse::LuaTicketSet,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,7 +146,8 @@ impl CommunityCatalogProvider {
             Ok(_) => trace.push(hit_trace("community:key_snapshot")),
             Err(error) => trace.push(failed_trace("community:key_snapshot", &error)),
         }
-        if !missing_depot_keys(&bundle).is_empty() {
+        // key 缺 或 ticket 空时都拉 archive: 社区包 lua 常带 setAppticket.
+        if !missing_depot_keys(&bundle).is_empty() || tickets_empty(&bundle) {
             self.enrich_archive_keys(app_id, &mut bundle, &mut trace, &mut manifest_blobs);
         }
         // 元数据链命中时 archive 可能还没被拉过; 尽力补 .manifest 字节 (Fluent 路径).
@@ -211,13 +214,16 @@ impl CommunityCatalogProvider {
             match self.fetch_archive(source, app_id) {
                 Ok(data) if !data.manifests.is_empty() => {
                     let depot_ids = data.manifests.keys().copied().collect::<Vec<_>>();
-                    let bundle = CatalogBundle {
+                    let mut bundle = CatalogBundle {
                         apps: vec![app_id],
                         app_depots: HashMap::from([(app_id, depot_ids)]),
                         depot_keys: data.depot_keys,
                         manifests: data.manifests,
                         ..CatalogBundle::default()
                     };
+                    // ticket app 可能不在 apps (DLC 票); 先记下来, validate 前并入 apps.
+                    data.tickets.merge_into_bundle(&mut bundle);
+                    ensure_ticket_apps_declared(&mut bundle);
                     match validate_bundle(app_id, bundle) {
                         Ok(bundle) => {
                             append_manifest_blobs(manifest_blobs, data.manifest_blobs);
@@ -272,18 +278,30 @@ impl CommunityCatalogProvider {
             };
             // 顺手收下 ZIP 里的 .manifest 字节 (与 key 共用一次下载).
             merge_matching_manifest_blobs(bundle, &data.manifest_blobs, manifest_blobs);
+            // ticket 与 key 同包; 缺票时补, 不覆盖已有.
+            if !data.tickets.is_empty() {
+                data.tickets.merge_into_bundle(bundle);
+                ensure_ticket_apps_declared(bundle);
+            }
             match merge_archive_keys(bundle, data.depot_keys) {
-                Ok(0) => trace.push(CatalogTraceEntry {
-                    provider: source.id.to_owned(),
-                    outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
-                }),
+                Ok(0) => {
+                    if data.tickets.is_empty() {
+                        trace.push(CatalogTraceEntry {
+                            provider: source.id.to_owned(),
+                            outcome: CatalogTraceOutcome::Failed(ProviderErrorKind::NotFound),
+                        });
+                    } else {
+                        trace.push(hit_trace(source.id));
+                    }
+                }
                 Ok(_) => trace.push(hit_trace(source.id)),
                 Err(error) => {
                     trace.push(failed_trace(source.id, &error));
                     continue;
                 }
             }
-            if missing_depot_keys(bundle).is_empty() {
+            // key 齐了且票也齐了才停; 只齐 key 时继续扫其它 archive 找 ticket.
+            if missing_depot_keys(bundle).is_empty() && !tickets_empty(bundle) {
                 return;
             }
         }
@@ -654,6 +672,10 @@ fn missing_depot_keys(bundle: &CatalogBundle) -> Vec<DepotId> {
     missing
 }
 
+fn tickets_empty(bundle: &CatalogBundle) -> bool {
+    bundle.app_tickets.is_empty() && bundle.etickets.is_empty() && bundle.steam_ids.is_empty()
+}
+
 fn merge_archive_keys(
     bundle: &mut CatalogBundle,
     keys: HashMap<DepotId, String>,
@@ -799,9 +821,24 @@ fn parse_archive(
             keys_parse::collect_vdf_keys(provider, text, &mut result.depot_keys)?;
         } else {
             keys_parse::collect_lua_keys(text, &mut result.depot_keys)?;
+            keys_parse::collect_lua_tickets(text, &mut result.tickets)?;
         }
     }
     Ok(result)
+}
+
+/// ticket 目标 app 若尚未在 bundle.apps, 补进去 (仅解锁, 无 depot).
+fn ensure_ticket_apps_declared(bundle: &mut CatalogBundle) {
+    for &app_id in bundle
+        .app_tickets
+        .keys()
+        .chain(bundle.etickets.keys())
+        .chain(bundle.steam_ids.keys())
+    {
+        if app_id != 0 && !bundle.apps.contains(&app_id) {
+            bundle.apps.push(app_id);
+        }
+    }
 }
 
 fn append_manifest_blobs(
@@ -1707,6 +1744,35 @@ mod tests {
                 .any(|entry| entry.provider == "community:caigamer_key"),
             "{:?}",
             outcome.trace
+        );
+    }
+
+    #[test]
+    fn archive_parser_extracts_set_appticket_from_lua() {
+        let key = "ab".repeat(32);
+        let lua = format!(
+            "addappid(43,0,\"{key}\")\nsetAppticket(42, \"DEAD\")\nsetETicket(42, \"BEEF\")\nsetStat(42, \"76561198000000000\")\n"
+        );
+        let archive = zip_bytes(&[
+            ("42_99.manifest", b"manifest-bytes"),
+            ("42.lua", lua.as_bytes()),
+        ]);
+        let data = parse_archive("community:test", &archive, ArchiveLimits::default()).unwrap();
+        assert_eq!(
+            data.depot_keys.get(&43).map(String::as_str),
+            Some(key.as_str())
+        );
+        assert_eq!(
+            data.tickets.app_tickets.get(&42).map(String::as_str),
+            Some("dead")
+        );
+        assert_eq!(
+            data.tickets.etickets.get(&42).map(String::as_str),
+            Some("beef")
+        );
+        assert_eq!(
+            data.tickets.steam_ids.get(&42).map(String::as_str),
+            Some("76561198000000000")
         );
     }
 }
