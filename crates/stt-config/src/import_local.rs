@@ -1,7 +1,8 @@
 //! 本地 lua 包导入 (拖放 / 其它入口共用).
 //!
 //! 不走 CatalogProvider: 信任用户 lua 原文, 校验能解析后拷进 `config/lua`,
-//! 旁路 `.manifest` 写入 depotcache. 生效靠既有 `reload_lua_dirs`.
+//! 旁路 `.manifest` 写入 depotcache; `UserGameStatsSchema_*.bin` 写到
+//! `appcache/stats`. 生效靠既有 `reload_lua_dirs` (ticket 在 eval 时已写注册表).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ const MAX_LUA_FILES: usize = 64;
 const MAX_LUA_BYTES: u64 = 2 * 1024 * 1024;
 /// 单个 .manifest 大小上限.
 const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+/// 单个 stats schema 大小上限.
+const MAX_STATS_SCHEMA_BYTES: u64 = 4 * 1024 * 1024;
 /// 目录扫描深度 (0 = 只看这一层).
 const MAX_DIR_DEPTH: usize = 2;
 
@@ -31,6 +34,7 @@ const MAX_DIR_DEPTH: usize = 2;
 pub struct ImportLocalReport {
     pub lua_written: Vec<PathBuf>,
     pub manifests_written: usize,
+    pub stats_schemas_written: usize,
     /// 解析出的主 app (去重升序), 供 package notify.
     pub apps: Vec<AppId>,
     pub skipped: Vec<String>,
@@ -49,9 +53,10 @@ impl ImportLocalReport {
                 .join(",")
         };
         format!(
-            "import_local lua={} manifest={} apps={} skip={} err={}",
+            "import_local lua={} manifest={} stats={} apps={} skip={} err={}",
             self.lua_written.len(),
             self.manifests_written,
+            self.stats_schemas_written,
             apps,
             self.skipped.len(),
             self.errors.len()
@@ -59,13 +64,20 @@ impl ImportLocalReport {
     }
 
     pub fn note_line(&self) -> String {
-        if !self.errors.is_empty() && self.lua_written.is_empty() {
+        if !self.errors.is_empty()
+            && self.lua_written.is_empty()
+            && self.manifests_written == 0
+            && self.stats_schemas_written == 0
+        {
             return format!(
                 "失败: {}",
                 humanize_import_error(self.errors.first().map(String::as_str).unwrap_or(""))
             );
         }
-        if self.lua_written.is_empty() && self.manifests_written == 0 {
+        if self.lua_written.is_empty()
+            && self.manifests_written == 0
+            && self.stats_schemas_written == 0
+        {
             let reason = self
                 .skipped
                 .first()
@@ -79,6 +91,9 @@ impl ImportLocalReport {
         }
         if self.manifests_written > 0 {
             parts.push(format!("{} 个 manifest", self.manifests_written));
+        }
+        if self.stats_schemas_written > 0 {
+            parts.push(format!("{} 个 stats schema", self.stats_schemas_written));
         }
         if !self.apps.is_empty() {
             parts.push(format!(
@@ -117,6 +132,7 @@ pub fn import_local_paths(
     let mut report = ImportLocalReport::default();
     let mut lua_sources: Vec<PathBuf> = Vec::new();
     let mut manifest_sources: Vec<PathBuf> = Vec::new();
+    let mut stats_sources: Vec<PathBuf> = Vec::new();
     let mut seen = BTreeSet::new();
 
     for raw in paths {
@@ -129,6 +145,7 @@ pub fn import_local_paths(
             0,
             &mut lua_sources,
             &mut manifest_sources,
+            &mut stats_sources,
             &mut seen,
             &mut report,
         );
@@ -172,14 +189,31 @@ pub fn import_local_paths(
         }
     }
 
-    if report.lua_written.is_empty() && report.manifests_written == 0 {
+    for src in &stats_sources {
+        match import_one_stats_schema(steam_root, src) {
+            Ok(app_id) => {
+                report.stats_schemas_written += 1;
+                if app_id != 0 {
+                    app_set.insert(app_id);
+                }
+            }
+            Err(e) => report.errors.push(format!("{}: {e}", src.display())),
+        }
+    }
+
+    if report.lua_written.is_empty()
+        && report.manifests_written == 0
+        && report.stats_schemas_written == 0
+    {
         // 全失败也返回 Ok(report), 让宿主用 note 展示; 只有工具关闭等才 Err.
         report.apps = app_set.into_iter().collect();
         return Ok(report);
     }
 
     // 以磁盘为准重载, 与 catalog_add 一致.
-    let _ = state.reload_lua_dirs(steam_root);
+    if !report.lua_written.is_empty() {
+        let _ = state.reload_lua_dirs(steam_root);
+    }
     report.apps = app_set.into_iter().collect();
     Ok(report)
 }
@@ -189,6 +223,7 @@ fn collect_from_path(
     depth: usize,
     luas: &mut Vec<PathBuf>,
     manifests: &mut Vec<PathBuf>,
+    stats: &mut Vec<PathBuf>,
     seen: &mut BTreeSet<PathBuf>,
     report: &mut ImportLocalReport,
 ) {
@@ -227,10 +262,20 @@ fn collect_from_path(
                 return;
             }
             manifests.push(path.to_path_buf());
+        } else if is_stats_schema_path(path) {
+            if meta.len() > MAX_STATS_SCHEMA_BYTES {
+                report.skipped.push(format!(
+                    "stats schema 过大 ({} B) {}",
+                    meta.len(),
+                    path.display()
+                ));
+                return;
+            }
+            stats.push(path.to_path_buf());
         } else {
             report
                 .skipped
-                .push(format!("不是 lua/manifest: {}", path.display()));
+                .push(format!("不是 lua/manifest/stats: {}", path.display()));
         }
         return;
     }
@@ -249,7 +294,7 @@ fn collect_from_path(
             }
         };
         for ent in rd.flatten() {
-            collect_from_path(&ent.path(), depth + 1, luas, manifests, seen, report);
+            collect_from_path(&ent.path(), depth + 1, luas, manifests, stats, seen, report);
         }
         return;
     }
@@ -569,6 +614,74 @@ fn is_manifest_path(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("manifest"))
 }
 
+/// `UserGameStatsSchema_<appid>.bin` (大小写不敏感).
+fn is_stats_schema_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("usergamestatsschema_") && lower.ends_with(".bin")
+}
+
+fn stats_schema_app_id(path: &Path) -> Option<AppId> {
+    let name = path.file_name()?.to_str()?;
+    let lower = name.to_ascii_lowercase();
+    let stem = lower
+        .strip_prefix("usergamestatsschema_")?
+        .strip_suffix(".bin")?;
+    if stem.is_empty() || !stem.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    stem.parse().ok().filter(|id: &AppId| *id != 0)
+}
+
+fn stats_schema_dir(steam_root: &Path) -> PathBuf {
+    steam_root.join("appcache").join("stats")
+}
+
+fn import_one_stats_schema(steam_root: &Path, src: &Path) -> Result<AppId> {
+    let app_id = stats_schema_app_id(src).ok_or_else(|| {
+        ConfigError::Invalid("stats schema 文件名应为 UserGameStatsSchema_<appid>.bin".into())
+    })?;
+    let bytes = std::fs::read(src).map_err(|source| ConfigError::Io {
+        path: src.to_path_buf(),
+        source,
+    })?;
+    if bytes.is_empty() {
+        return Err(ConfigError::Invalid("空 stats schema".into()));
+    }
+    if bytes.len() as u64 > MAX_STATS_SCHEMA_BYTES {
+        return Err(ConfigError::Invalid("stats schema 过大".into()));
+    }
+    let dir = stats_schema_dir(steam_root);
+    std::fs::create_dir_all(&dir).map_err(|source| ConfigError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    // 固定规范名, 避免大小写混用导致 Steam 读不到.
+    let dest = dir.join(format!("UserGameStatsSchema_{app_id}.bin"));
+    write_atomic_bin(&dest, &bytes)?;
+    Ok(app_id)
+}
+
+fn write_atomic_bin(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::ffi::OsString;
+    let mut name: OsString = path.file_name().unwrap_or_default().to_owned();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    std::fs::write(&tmp, bytes).map_err(|source| ConfigError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, path).map_err(|source| {
+        let _ = std::fs::remove_file(&tmp);
+        ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
 /// 默认目录里属于某个 app 的受管文件 (stt_ / import_ / 纯数字名).
 pub fn managed_lua_paths_for_app(steam_root: &Path, app_id: AppId) -> Vec<PathBuf> {
     let dir = default_lua_dir(steam_root);
@@ -717,6 +830,48 @@ mod tests {
         assert!(
             name.starts_with("stt_730") || name.starts_with("import_730"),
             "got {name}"
+        );
+    }
+
+    #[test]
+    fn imports_stats_schema_bin_to_appcache() {
+        let root = tempfile::tempdir().unwrap();
+        let state = ConfigState::new();
+        enable_lua_drop(&state);
+        let bin = root.path().join("UserGameStatsSchema_4570720.bin");
+        std::fs::write(&bin, b"\0stats-schema").unwrap();
+        let report = import_local_paths(&state, root.path(), &[bin]).unwrap();
+        assert_eq!(report.stats_schemas_written, 1, "{report:?}");
+        assert!(report.apps.contains(&4570720), "{report:?}");
+        let dest = root
+            .path()
+            .join("appcache")
+            .join("stats")
+            .join("UserGameStatsSchema_4570720.bin");
+        assert_eq!(std::fs::read(dest).unwrap(), b"\0stats-schema");
+    }
+
+    #[test]
+    fn community_lua_with_set_appticket_imports() {
+        let root = tempfile::tempdir().unwrap();
+        let state = ConfigState::new();
+        enable_lua_drop(&state);
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        // 高位测试 appid, 避免撞真实游戏注册表.
+        let body = format!(
+            "addappid(4000000020,1,\"{key}\")\naddappid(4000000021,0,\"{key}\")\naddappid(4000000022)\nsetAppticket(4000000020,\"aabb\")\nsetAppticket(4000000022,\"ccdd\")\n"
+        );
+        let src = root.path().join("4000000020.lua");
+        std::fs::write(&src, &body).unwrap();
+        let report = import_local_paths(&state, root.path(), &[src]).unwrap();
+        assert_eq!(report.lua_written.len(), 1, "{report:?}");
+        assert!(report.apps.contains(&4_000_000_020), "{report:?}");
+        assert!(state.with_rules(|r| r.is_owned(4_000_000_020)));
+        assert!(state.with_rules(|r| r.is_owned(4_000_000_022)));
+        assert!(!state.with_rules(|r| r.is_owned(4_000_000_021)));
+        assert_eq!(
+            stt_platform::read_app_ticket(4_000_000_020).unwrap(),
+            vec![0xaa, 0xbb]
         );
     }
 }

@@ -20,6 +20,9 @@ fn lock_bundle(b: &Mutex<CatalogBundle>) -> MutexGuard<'_, CatalogBundle> {
 /// - `addtoken` / `AddToken`
 /// - `setmanifestid` / `setManifestid` / `SetManifestid` / `SetManifestId`
 /// - `setappdepots` / `setAppDepots` / `SetAppDepots`
+/// - `setappticket` / `setAppticket` / `setAppTicket` (写本机 AppTicket)
+/// - `seteticket` / `setETicket` / `setAppEticket` (写本机 ETicket)
+/// - `setstat` / `setStat` (写 per-app SteamID, 成就路径用)
 pub fn apply_lua_chunk(rules: &mut AppRules, source: &str) -> Result<()> {
     let bundle = eval_lua_to_bundle(source)?;
     rules.apply_catalog_bundle(&bundle);
@@ -56,8 +59,20 @@ fn eval_lua_to_bundle_inner(
                 move |_, (id, purchase_time, key): (u32, Option<u32>, Option<String>)| {
                     let mut g = lock_bundle(&b);
                     if let Some(k) = key {
-                        if k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()) {
+                        let key_ok = k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit());
+                        if key_ok {
                             g.depot_keys.insert(id, k);
+                        }
+                        // 社区常见: addappid(app, purchaseTime, "64hex") 主 app 自带 key.
+                        // purchase_time != 0 视为 app; ==0 多为纯 depot (只收 key).
+                        let treat_as_app = purchase_time.is_some_and(|t| t != 0);
+                        if treat_as_app {
+                            if !g.apps.contains(&id) {
+                                g.apps.push(id);
+                            }
+                            if let Some(pt) = purchase_time.filter(|v| *v != 0) {
+                                g.purchase_times.insert(id, pt);
+                            }
                         }
                         if g.apps.contains(&id) {
                             let depots = g.app_depots.entry(id).or_default();
@@ -159,6 +174,63 @@ fn eval_lua_to_bundle_inner(
         )?;
     }
 
+    // setAppTicket(appId, hex): 写 HKCU AppTicket, 不进 CatalogBundle.
+    {
+        let f = lua
+            .create_function(move |_, (app_id, hex): (u32, String)| {
+                stt_platform::write_app_ticket_hex(app_id, &hex)
+                    .map_err(|e| mlua::Error::external(format!("setappticket: {e}")))
+            })
+            .map_err(lua_err)?;
+        set_global_aliases(
+            &lua,
+            &[
+                "setappticket",
+                "setAppticket",
+                "setAppTicket",
+                "SetAppTicket",
+            ],
+            f,
+        )?;
+    }
+
+    // setETicket / setAppEticket: 写 HKCU ETicket.
+    {
+        let f = lua
+            .create_function(move |_, (app_id, hex): (u32, String)| {
+                stt_platform::write_eticket_hex(app_id, &hex)
+                    .map_err(|e| mlua::Error::external(format!("seteticket: {e}")))
+            })
+            .map_err(lua_err)?;
+        set_global_aliases(
+            &lua,
+            &[
+                "seteticket",
+                "setETicket",
+                "setEticket",
+                "SetETicket",
+                "setappeticket",
+                "setAppEticket",
+                "SetAppEticket",
+            ],
+            f,
+        )?;
+    }
+
+    // setStat(appId, "steamId"): 写 per-app SteamID (成就 spoof 用).
+    {
+        let f = lua
+            .create_function(move |_, (app_id, sid_s): (u32, String)| {
+                let steam_id: u64 = sid_s.parse().map_err(|e| {
+                    mlua::Error::external(format!("setstat: steamId must be digits: {e}"))
+                })?;
+                stt_platform::write_steam_id(app_id, steam_id)
+                    .map_err(|e| mlua::Error::external(format!("setstat: {e}")))
+            })
+            .map_err(lua_err)?;
+        set_global_aliases(&lua, &["setstat", "setStat", "SetStat"], f)?;
+    }
+
     lua.load(source)
         .exec()
         .map_err(|e| ConfigError::Lua(e.to_string()))?;
@@ -242,5 +314,50 @@ AddToken(3167020, "42")
             Some(1234567890)
         );
         assert_eq!(rules.access_token(3167020), Some(42));
+    }
+
+    /// 社区包: 主 app 一行带 purchaseTime + key, depot 用 purchaseTime=0.
+    #[test]
+    fn app_with_purchase_time_and_key_is_owned() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let src = format!(
+            "addappid(4570720, 1, \"{key}\")\naddappid(4570721, 0, \"{key}\")\naddappid(4742640)\n"
+        );
+        let mut rules = AppRules::new();
+        apply_lua_chunk(&mut rules, &src).unwrap();
+        assert!(rules.is_owned(4570720));
+        assert_eq!(rules.purchase_time(4570720), Some(1));
+        assert_eq!(rules.depot_key(4570720).map(|s| s.len()), Some(64));
+        // depot 行不进 owned, 只收 key.
+        assert!(!rules.is_owned(4570721));
+        assert_eq!(rules.depot_key(4570721).map(|s| s.len()), Some(64));
+        assert!(rules.is_owned(4742640));
+    }
+
+    /// setAppticket 写注册表, 脚本不因未知函数失败.
+    #[test]
+    fn set_appticket_writes_credential_store() {
+        const APP: u32 = 4_000_000_010;
+        let src = r#"
+addappid(4000000010)
+setAppticket(4000000010, "aabbccdd")
+"#;
+        let mut rules = AppRules::new();
+        apply_lua_chunk(&mut rules, src).unwrap();
+        assert!(rules.is_owned(APP));
+        let got = stt_platform::read_app_ticket(APP).unwrap();
+        assert_eq!(got, vec![0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn set_eticket_alias_writes_credential_store() {
+        const APP: u32 = 4_000_000_011;
+        let src = r#"
+addappid(4000000011)
+setAppEticket(4000000011, "11223344")
+"#;
+        apply_lua_chunk(&mut AppRules::new(), src).unwrap();
+        let got = stt_platform::read_eticket(APP).unwrap();
+        assert_eq!(got, vec![0x11, 0x22, 0x33, 0x44]);
     }
 }
