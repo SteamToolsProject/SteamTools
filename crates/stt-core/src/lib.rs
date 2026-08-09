@@ -22,6 +22,12 @@ pub struct CatalogBundle {
     pub purchase_times: HashMap<AppId, u32>,
     /// 该 app 是否需要 access token 才能下载; None = 未知 (按需要处理).
     pub requires_token: Option<bool>,
+    /// 社区 lua `setAppticket` 的 hex (写 HKCU AppTicket; 不进 AppRules).
+    pub app_tickets: HashMap<AppId, String>,
+    /// 社区 lua `setETicket` 的 hex (写 HKCU ETicket).
+    pub etickets: HashMap<AppId, String>,
+    /// 社区 lua `setStat` 的 SteamID 十进制字符串.
+    pub steam_ids: HashMap<AppId, String>,
 }
 
 #[derive(Debug, Clone, Default)]
