@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+## [v0.2.1] - 2026-08-09
+
+社区源 ticket 贯通 (lua / 注册表), 以及库「购买」相关的 package0 / forge 闸门修复。
+
+### Added
+
+- **Catalog ticket 字段**: `CatalogBundle` 保留 `app_tickets` / `etickets` / `steam_ids`,
+  社区源解析不再丢弃 ticket 相关字段
+- **lua `setAppticket`**: DSL 写出 app ticket; 导入兼容 `UserGameStatsSchema`
+- **HKCU 凭据**: 平台层读写 `AppTicket` / `ETicket` / `SteamID`, 与入库落盘对齐
+
+### Fixed
+
+- **热重载误删 package0**: lua 重载 / 导入后改用 `ensure_configured` 只补缺,
+  禁止 `reconcile_owned` 把仍受管 id 清掉 (库变「购买」)
+- **冷启 forge 闸门**: seed / 同步 configured 后刷新 `CONFIGURED_NONEMPTY`,
+  避免冷启动 CheckAppOwnership 不 forge、库仍显示购买
+
 ## [v0.2.0] - 2026-08-03
 
 入库链路补齐 DLC / 清单下载数据, 配置面板支持拖放导入社区 lua, 下载与 package 注入若干稳定性修复。

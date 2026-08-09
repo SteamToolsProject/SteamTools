@@ -603,7 +603,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "stt-catalog"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "keyvalues-parser",
  "serde",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "stt-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "mlua",
  "serde",
@@ -631,11 +631,11 @@ dependencies = [
 
 [[package]]
 name = "stt-core"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "stt-hook"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror",
  "windows",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "stt-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "stt-catalog",
@@ -662,15 +662,15 @@ dependencies = [
 
 [[package]]
 name = "stt-loader-dwmapi"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "stt-loader-xinput"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "stt-metadata"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "stt-platform"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sha2",
  "thiserror",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "stt-steamclient"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "stt-config",
  "stt-core",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "stt-steamui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "stt-config",
@@ -717,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "stt-store-accel"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rustls",
  "serde",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "stt-update"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "stt-platform",
  "tempfile",
