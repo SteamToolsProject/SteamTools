@@ -127,9 +127,30 @@ impl LicenseQueue {
         true
     }
 
+    /// 只把 missing id 入 pending_add, **不** queue_removal.
+    ///
+    /// 热重载 / 导入 lua 用这个: seed 的逻辑 injected 或 package0 里多出来的
+    /// Steam 条目, 不能按 keep 差集硬删, 否则会误清仍受管游戏 (库显示「购买」).
+    /// 真移除只走 [`Self::queue_removal`] / [`Self::reconcile_owned`] (用户点移除).
+    pub fn ensure_configured(&self, desired: impl IntoIterator<Item = AppId>) {
+        let desired: HashSet<AppId> = desired.into_iter().collect();
+        let mut g = self.lock();
+        let to_add: Vec<AppId> = desired.difference(&g.injected).copied().collect();
+        for id in to_add {
+            g.pending_remove.retain(|&x| x != id);
+            if g.injected.contains(&id) {
+                continue;
+            }
+            if !g.pending_add.contains(&id) {
+                g.pending_add.push_back(id);
+            }
+        }
+    }
+
     /// 按当前 owned 快照与逻辑 injected 做差, 入 pending (不立刻 notify).
     ///
-    /// 热重载 lua / 全量扫盘后用: 多出来的 queue_addition, 少了的 queue_removal.
+    /// **仅**显式移除路径用 (例如用户删 lua): 多出来的 queue_addition,
+    /// 少了的 queue_removal. 热重载请用 [`Self::ensure_configured`].
     pub fn reconcile_owned(&self, owned: impl IntoIterator<Item = AppId>) {
         let owned: HashSet<AppId> = owned.into_iter().collect();
         let mut g = self.lock();
@@ -375,6 +396,30 @@ mod tests {
         assert!(q.injected_contains(2));
         assert!(q.injected_contains(3));
         assert!(!q.injected_contains(1));
+    }
+
+    #[test]
+    fn ensure_configured_only_adds_missing() {
+        let q = LicenseQueue::new();
+        q.seed_injected_from_owned([1, 2, 3]);
+        // keep 比 seed 小: 热重载绝不能因此 queue_removal.
+        q.ensure_configured([2, 3, 4]);
+        assert_eq!(q.pending_add_len(), 1);
+        assert_eq!(q.pending_remove_len(), 0);
+        let plan = q.plan_notify_logic_only();
+        assert_eq!(plan.insert_ids, vec![4]);
+        assert!(plan.remove_ids.is_empty());
+        assert!(q.injected_contains(1), "ensure must not drop seed extras");
+        assert!(q.injected_contains(4));
+    }
+
+    #[test]
+    fn ensure_configured_skips_already_injected() {
+        let q = LicenseQueue::new();
+        q.seed_injected_from_owned([10, 20]);
+        q.ensure_configured([10, 20]);
+        assert_eq!(q.pending_add_len(), 0);
+        assert_eq!(q.pending_remove_len(), 0);
     }
 
     #[test]
