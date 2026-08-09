@@ -125,11 +125,15 @@ fn sync_configured_from_state(state: &ConfigState) {
     // 若持写锁时再调 set_configured_apps 会 **自死锁** (RwLock 写锁不可重入).
     let ids = package_ids_from_state(state);
     if let Some(set) = configured_apps() {
-        let mut g = set
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.clear();
-        g.extend(ids.iter().copied());
+        {
+            let mut g = set
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.clear();
+            g.extend(ids.iter().copied());
+        }
+        // 直写 HashSet 不走 set/add API, 必须手动刷 forge 闸门.
+        stt_steamclient::refresh_configured_gate();
     } else {
         // runtime 尚未注册时仍推一份给 hooks 侧 (若已 register 则写同一把锁).
         stt_steamclient::set_configured_apps(ids);
@@ -301,7 +305,11 @@ fn on_library_removed(steam_root: &Path, state: &ConfigState, app_id: AppId) {
     library_ux().queue_removal(app_id);
 }
 
-/// lua 全量重载后: 与 owned 做差再 notify.
+/// lua 全量重载后: 同步 configured, 只补缺, 再 notify 自愈 package0.
+///
+/// **禁止**在这里 `reconcile_owned`: setup 会 seed 逻辑 injected, notify 又会
+/// resync 成 package0 真值; 用 keep 差集硬删会把仍受管 id 清掉 (库变「购买」).
+/// 真移除只走 [`on_library_removed`].
 fn on_rules_reloaded(
     steam_root: &Path,
     state: &ConfigState,
@@ -322,7 +330,8 @@ fn on_rules_reloaded(
     // package0 对齐 app+depot; 库 UI 仍只跟 owned app.
     let package_ids = package_ids_from_state(state);
     let owned: Vec<AppId> = state.with_rules(|r| r.owned_iter().collect());
-    q.reconcile_owned(package_ids.iter().copied());
+    // 只补缺: 真正的 remove 留给用户点「移除」.
+    q.ensure_configured(package_ids.iter().copied());
     // 从配置消失的 app 走 UI 移除队列 (RunFrame drain 清 ownership).
     let before: std::collections::HashSet<AppId> =
         library_ux().owned_snapshot().into_iter().collect();
@@ -336,10 +345,10 @@ fn on_rules_reloaded(
     for id in &owned {
         library_ux().on_rules_app_present(*id);
     }
-    if q.pending_add_len() > 0 || q.pending_remove_len() > 0 {
-        let plan = stt_steamclient::notify_license_changed(&q);
-        append_host_log(steam_root, &plan.summary_line());
-    }
+    // 即使 pending 空也要 notify: client 路径会 resync package0 真值,
+    // 再按 configured 把被 wipe / 误删的 id 补回.
+    let plan = stt_steamclient::notify_license_changed(&q);
+    append_host_log(steam_root, &plan.summary_line());
 }
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -1192,15 +1201,14 @@ impl HostPanel {
                 library_ux().on_rules_app_present(app_id);
             }
             // 立刻对齐 package/configured, 不等 watch.
+            // 与 on_rules_reloaded 同策略: 只补缺 + 必 notify, 禁止 reconcile 误删.
             sync_download_runtime(&self.state);
             sync_configured_from_state(&self.state);
             if let Some(q) = license_queue() {
                 let package_ids = package_ids_from_state(&self.state);
-                q.reconcile_owned(package_ids.iter().copied());
-                if q.pending_add_len() > 0 || q.pending_remove_len() > 0 {
-                    let plan = stt_steamclient::notify_license_changed(&q);
-                    append_host_log(&self.steam_root, &plan.summary_line());
-                }
+                q.ensure_configured(package_ids.iter().copied());
+                let plan = stt_steamclient::notify_license_changed(&q);
+                append_host_log(&self.steam_root, &plan.summary_line());
             }
             self.state
                 .with_rules(|rules| library_ux().sync_from_rules(rules));
@@ -1715,7 +1723,10 @@ fn setup_package_layer(
 
     let _ = LICENSE_QUEUE.set(Arc::clone(&queue));
     let _ = CONFIGURED_APPS.set(Arc::clone(&configured));
+    // register 会按 Arc 内已 seed 的 id 刷 CONFIGURED_NONEMPTY;
+    // 若 OnceLock 已被测试占用, 再补一次 gate.
     stt_steamclient::register_runtime(Arc::clone(&queue), Arc::clone(&configured));
+    stt_steamclient::refresh_configured_gate();
     stt_steamclient::set_ui_action_handler(apply_ui_license_action);
     // 已与 runtime 共享 configured Arc, 只填本地锁即可 (勿再嵌套 set_configured_apps).
     append_host_log(

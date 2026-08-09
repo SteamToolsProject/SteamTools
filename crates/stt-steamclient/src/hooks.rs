@@ -87,12 +87,16 @@ fn package_hooks_enabled_by_env() -> bool {
 }
 
 /// 进程内共享运行时 (host init 时注册一次).
+///
+/// host 可能先把 id seed 进 `configured` Arc 再 register;
+/// 这里必须 refresh 非空闸门, 否则 CheckAppOwnership 永远 forged=0.
 pub fn register_runtime(queue: Arc<LicenseQueue>, configured: Arc<RwLock<HashSet<AppId>>>) {
     let _ = RUNTIME.set(PackageRuntime {
         queue,
         configured,
         on_ui: Mutex::new(None),
     });
+    refresh_configured_nonempty();
 }
 
 /// 注册 UI 联动回调 (CancelRemoval / QueueRemoval).
@@ -157,6 +161,11 @@ pub fn remove_configured_app(app_id: AppId) {
             .remove(&app_id);
         refresh_configured_nonempty();
     }
+}
+
+/// host 直写共享 `configured` HashSet 后调用 (不走 set/add API 时).
+pub fn refresh_configured_gate() {
+    refresh_configured_nonempty();
 }
 
 pub fn is_attached() -> bool {
@@ -757,6 +766,49 @@ mod tests {
     fn env_default_allows_attach() {
         // 不依赖真实环境变量内容做强断言; 仅保证函数可调用.
         let _ = package_hooks_enabled_by_env();
+    }
+
+    /// 回归: host seed 直写 HashSet 后必须刷闸门, 否则 checks 涨 forged 一直 0.
+    #[test]
+    fn direct_configured_write_needs_refresh_gate() {
+        let queue = Arc::new(LicenseQueue::new());
+        let configured = Arc::new(RwLock::new(HashSet::new()));
+        let _ = register_runtime(Arc::clone(&queue), Arc::clone(&configured));
+        // 若 RUNTIME 已被其它测试占用, 下面写的是本地 Arc, 闸门仍应能被 refresh 读到 runtime 真值.
+        // 能控制的路径: 走 set_configured_apps / add 或本测试独占的第一次 register.
+        if let Some(rt) = RUNTIME.get() {
+            {
+                let mut g = rt
+                    .configured
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                g.clear();
+            }
+            refresh_configured_gate();
+            assert!(
+                !CONFIGURED_NONEMPTY.load(Ordering::Relaxed),
+                "empty set must close forge gate"
+            );
+            {
+                let mut g = rt
+                    .configured
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                g.insert(42);
+            }
+            // 直写后未 refresh: 闸门仍关 (本 bug 的根).
+            assert!(
+                !CONFIGURED_NONEMPTY.load(Ordering::Relaxed),
+                "direct write alone must not open gate"
+            );
+            refresh_configured_gate();
+            assert!(
+                CONFIGURED_NONEMPTY.load(Ordering::Relaxed),
+                "refresh after seed must open forge gate"
+            );
+            assert!(is_configured(42));
+            assert!(!is_configured(99));
+        }
     }
 
     /// 模拟 CUtlMemoryGrow 失败: 返回空指针, 不扩容量.
