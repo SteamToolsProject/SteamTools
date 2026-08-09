@@ -773,7 +773,7 @@ mod tests {
     fn direct_configured_write_needs_refresh_gate() {
         let queue = Arc::new(LicenseQueue::new());
         let configured = Arc::new(RwLock::new(HashSet::new()));
-        let _ = register_runtime(Arc::clone(&queue), Arc::clone(&configured));
+        register_runtime(Arc::clone(&queue), Arc::clone(&configured));
         // 若 RUNTIME 已被其它测试占用, 下面写的是本地 Arc, 闸门仍应能被 refresh 读到 runtime 真值.
         // 能控制的路径: 走 set_configured_apps / add 或本测试独占的第一次 register.
         if let Some(rt) = RUNTIME.get() {
