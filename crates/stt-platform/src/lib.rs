@@ -3,6 +3,7 @@
 #![cfg(windows)]
 
 mod child_pipe;
+mod credential_store;
 mod hash;
 mod http;
 mod module;
@@ -16,6 +17,10 @@ use windows::Win32::System::Threading::CreateThread;
 pub use child_pipe::{
     crt_fd_block, prepare_devtools_pipe, ChildPipeLaunch, DevToolsPipe, CHILD_READ_FD,
     CHILD_WRITE_FD, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOW_SIZE,
+};
+pub use credential_store::{
+    decode_ticket_hex, read_app_ticket, read_eticket, write_app_ticket, write_app_ticket_hex,
+    write_eticket, write_eticket_hex, write_steam_id, CredentialError, CredentialStatus,
 };
 pub use hash::{sha256_bytes, sha256_file};
 pub use http::{
