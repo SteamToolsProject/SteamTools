@@ -55,13 +55,39 @@ Type: filesandordirs; Name: "{app}\steamtools"
 Type: files; Name: "{app}\stbase.dll.old"
 
 [Code]
-function FindWindowW(lpClassName, lpWindowName: string): HWND;
-  external 'FindWindowW@user32.dll stdcall';
+// 用进程快照查 steam.exe, 不用窗口标题: 任意标题为 "Steam" 的窗口都会误报,
+// 用户关干净 Steam / 重启后仍装不上.
+// 类型必须写在 external 前面 (Inno Pascal).
+// 安装器进程是 32 位, th32DefaultHeapID 按 ULONG_PTR=4 用 DWORD 即可.
+type
+  TProcessEntry32 = record
+    dwSize: DWORD;
+    cntUsage: DWORD;
+    th32ProcessID: DWORD;
+    th32DefaultHeapID: DWORD;
+    th32ModuleID: DWORD;
+    cntThreads: DWORD;
+    th32ParentProcessID: DWORD;
+    pcPriClassBase: Longint;
+    dwFlags: DWORD;
+    szExeFile: array[0..MAX_PATH - 1] of Char;
+  end;
+
+function CreateToolhelp32Snapshot(dwFlags, th32ProcessID: DWORD): THandle;
+  external 'CreateToolhelp32Snapshot@kernel32.dll stdcall';
+function Process32FirstW(hSnapshot: THandle; var lppe: TProcessEntry32): BOOL;
+  external 'Process32FirstW@kernel32.dll stdcall';
+function Process32NextW(hSnapshot: THandle; var lppe: TProcessEntry32): BOOL;
+  external 'Process32NextW@kernel32.dll stdcall';
+function CloseHandle(hObject: THandle): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
 
 var
   SteamFound: string;
 
 const
+  TH32CS_SNAPPROCESS = $00000002;
+  INVALID_HANDLE_VALUE = THandle(-1);
   SteamPathKey = 'Software\Valve\Steam';
   SteamPathValue = 'SteamPath';
   SteamInstallValue = 'InstallPath';
@@ -169,16 +195,65 @@ begin
   Result := SteamFound;
 end;
 
-// Steam 主窗口标题就是 "Steam"; 托盘常驻时也有窗口. 检测到就拦安装/卸载.
+// 只认 steam.exe 进程: 安装器要换的 DLL 由它加载; 窗口标题不可靠.
 function IsSteamRunning(): Boolean;
+var
+  Snapshot: THandle;
+  Entry: TProcessEntry32;
+  ExeName: string;
 begin
-  Result := FindWindowW('', 'Steam') <> 0;
+  Result := False;
+  Snapshot := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if Snapshot = INVALID_HANDLE_VALUE then
+    Exit;
+
+  Entry.dwSize := SizeOf(Entry);
+  if Process32FirstW(Snapshot, Entry) then
+  begin
+    repeat
+      // Toolhelp 一般只给文件名; ExtractFileName 兜底带路径的情况.
+      ExeName := ExtractFileName(Entry.szExeFile);
+      if SameText(ExeName, 'steam.exe') then
+      begin
+        Result := True;
+        Break;
+      end;
+    until not Process32NextW(Snapshot, Entry);
+  end;
+  CloseHandle(Snapshot);
+end;
+
+// 循环提示直到 steam.exe 退出, 或用户取消; 避免一次误判就整段安装中止.
+function ConfirmSteamNotRunning(const ForUninstall: Boolean): Boolean;
+var
+  Hint: string;
+begin
+  if ForUninstall then
+    Hint := '卸载'
+  else
+    Hint := '安装';
+
+  while IsSteamRunning() do
+  begin
+    if MsgBox(
+         '检测到 steam.exe 仍在运行, 无法' + Hint + ' (DLL 会被占用).' + #13#10#13#10 +
+         '请完全退出 Steam: 托盘图标右键 → 退出 Steam.' + #13#10 +
+         '也可在任务管理器结束 steam.exe 后点「重试」.' + #13#10#13#10 +
+         '若任务管理器已无 steam.exe 仍提示, 请反馈本信息.',
+         mbError, MB_RETRYCANCEL) <> IDRETRY then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+  Result := True;
 end;
 
 function InitializeSetup(): Boolean;
 var
   DiagPath: string;
   RawHkcu, RawHklm: string;
+  SteamRunning: Boolean;
 begin
   Result := False;
 
@@ -186,11 +261,13 @@ begin
   RawHkcu := ReadSteamPathFromRoot(HKCU);
   RawHklm := ReadSteamPathFromRoot(HKLM);
   SteamFound := ReadSteamPath();
+  SteamRunning := IsSteamRunning();
   DiagPath := GetTempDir() + 'steamtools-iss-diag.txt';
   SaveStringToFile(
     DiagPath,
     'RawHKCU=[' + RawHkcu + '] RawHKLM=[' + RawHklm +
-    '] SteamFound=[' + SteamFound + '] GetSteamDir=[' + GetSteamDir('') + ']',
+    '] SteamFound=[' + SteamFound + '] GetSteamDir=[' + GetSteamDir('') +
+    '] SteamRunning=' + IntToStr(Ord(SteamRunning)),
     False);
 
   if SteamFound = '' then
@@ -222,18 +299,13 @@ begin
     Exit;
   end;
 
-  // 安装前确认 Steam 已退出, 否则 DLL 被锁, 复制会失败.
-  if IsSteamRunning() then
-  begin
-    MsgBox('检测到 Steam 正在运行。请先完全退出 Steam (含托盘图标), 再继续。', mbError, MB_OK);
+  // 安装前确认 steam.exe 已退出, 否则 DLL 被锁, 复制会失败.
+  if not ConfirmSteamNotRunning(False) then
     Exit;
-  end;
   Result := True;
 end;
 
 function InitializeUninstall(): Boolean;
 begin
-  Result := not IsSteamRunning();
-  if not Result then
-    MsgBox('检测到 Steam 正在运行。请先完全退出 Steam (含托盘图标), 再卸载。', mbError, MB_OK);
+  Result := ConfirmSteamNotRunning(True);
 end;
