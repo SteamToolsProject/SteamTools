@@ -5,10 +5,21 @@
 
 ## [Unreleased]
 
+## [v0.2.2] - 2026-10-01
+
+Pattern 版本兼容回退, 以及安装器 steam.exe 运行检测修复 (首次真正编译出货)。
+
+### Added
+
+- **pattern 远端按 SHA 回退**: 主清单重新钉定; 钉死清单不含当前 `steamclient64.dll` /
+  `steamui.dll` SHA 时, 依次回退 SteamTools-Patterns `main` (GitHub Raw / jsDelivr)
+  与 steam-monitor 源, 解析成功即原子写入本地缓存
+
 ### Fixed
 
-- **安装器误报 Steam 在运行**: 不再用窗口标题 `"Steam"` 判断; 改为枚举进程查
-  `steam.exe`. 任意同名窗口会误拦安装/卸载; 现支持退出后「重试」
+- **安装器误报 Steam 在运行**: 不再用窗口标题 `"Steam"` 判断; 改为 WMI `Win32_Process`
+  查询 `steam.exe` 进程. 任意同名窗口不再误拦安装/卸载; 支持退出后「重试」;
+  修复此前 Toolhelp32 版本从未通过 Inno 编译的问题
 
 ## [v0.2.1] - 2026-08-09
 
