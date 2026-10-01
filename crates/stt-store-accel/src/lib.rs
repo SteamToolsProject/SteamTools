@@ -1830,9 +1830,10 @@ fn decode_utf16_bytes(value: &[u8]) -> Option<String> {
     if value.len() < 2 || !value.len().is_multiple_of(2) {
         return None;
     }
-    let units = value
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    let (pairs, _) = value.as_chunks::<2>();
+    let units = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect::<Vec<_>>();
     String::from_utf16(&units)
         .ok()
