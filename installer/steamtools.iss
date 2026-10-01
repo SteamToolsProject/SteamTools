@@ -55,39 +55,14 @@ Type: filesandordirs; Name: "{app}\steamtools"
 Type: files; Name: "{app}\stbase.dll.old"
 
 [Code]
-// 用进程快照查 steam.exe, 不用窗口标题: 任意标题为 "Steam" 的窗口都会误报,
+// 用 WMI 查 steam.exe 进程, 不用窗口标题: 任意标题为 "Steam" 的窗口都会误报,
 // 用户关干净 Steam / 重启后仍装不上.
-// 类型必须写在 external 前面 (Inno Pascal).
-// 安装器进程是 32 位, th32DefaultHeapID 按 ULONG_PTR=4 用 DWORD 即可.
-type
-  TProcessEntry32 = record
-    dwSize: DWORD;
-    cntUsage: DWORD;
-    th32ProcessID: DWORD;
-    th32DefaultHeapID: DWORD;
-    th32ModuleID: DWORD;
-    cntThreads: DWORD;
-    th32ParentProcessID: DWORD;
-    pcPriClassBase: Longint;
-    dwFlags: DWORD;
-    szExeFile: array[0..MAX_PATH - 1] of Char;
-  end;
-
-function CreateToolhelp32Snapshot(dwFlags, th32ProcessID: DWORD): THandle;
-  external 'CreateToolhelp32Snapshot@kernel32.dll stdcall';
-function Process32FirstW(hSnapshot: THandle; var lppe: TProcessEntry32): BOOL;
-  external 'Process32FirstW@kernel32.dll stdcall';
-function Process32NextW(hSnapshot: THandle; var lppe: TProcessEntry32): BOOL;
-  external 'Process32NextW@kernel32.dll stdcall';
-function CloseHandle(hObject: THandle): BOOL;
-  external 'CloseHandle@kernel32.dll stdcall';
-
+// 注: 先前 Toolhelp32 方案没编过 — PascalScript 的 Char 是 1 字节,
+// 和 W 版快照返回的 WCHAR 缓冲布局对不上, 且 char 数组不能直接转 string.
 var
   SteamFound: string;
 
 const
-  TH32CS_SNAPPROCESS = $00000002;
-  INVALID_HANDLE_VALUE = THandle(-1);
   SteamPathKey = 'Software\Valve\Steam';
   SteamPathValue = 'SteamPath';
   SteamInstallValue = 'InstallPath';
@@ -196,31 +171,25 @@ begin
 end;
 
 // 只认 steam.exe 进程: 安装器要换的 DLL 由它加载; 窗口标题不可靠.
+// WQL 的文本比较不区分大小写, 等价于 SameText.
 function IsSteamRunning(): Boolean;
 var
-  Snapshot: THandle;
-  Entry: TProcessEntry32;
-  ExeName: string;
+  Locator, Service, Processes: Variant;
 begin
   Result := False;
-  Snapshot := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if Snapshot = INVALID_HANDLE_VALUE then
-    Exit;
-
-  Entry.dwSize := SizeOf(Entry);
-  if Process32FirstW(Snapshot, Entry) then
-  begin
-    repeat
-      // Toolhelp 一般只给文件名; ExtractFileName 兜底带路径的情况.
-      ExeName := ExtractFileName(Entry.szExeFile);
-      if SameText(ExeName, 'steam.exe') then
-      begin
-        Result := True;
-        Break;
-      end;
-    until not Process32NextW(Snapshot, Entry);
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('.', 'root\CIMV2', '', '');
+    Processes := Service.ExecQuery(
+      'SELECT ProcessId FROM Win32_Process WHERE Name = ''steam.exe''');
+    Result := Processes.Count > 0;
+    Processes := Unassigned;
+    Service := Unassigned;
+    Locator := Unassigned;
+  except
+    // WMI 服务不可用时放行 (复制若真被占用, Inno 会重试), 不误拦.
+    Result := False;
   end;
-  CloseHandle(Snapshot);
 end;
 
 // 循环提示直到 steam.exe 退出, 或用户取消; 避免一次误判就整段安装中止.
