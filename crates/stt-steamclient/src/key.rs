@@ -221,13 +221,9 @@ unsafe fn parse_depot_id_from_ptr(key_name: *const c_char) -> Option<DepotId> {
 /// OST 语义: `find("\\DecryptionKey")`, 再向前找分隔符取 depot id.
 /// 额外接受 `/DecryptionKey`.
 fn parse_depot_key_path(path: &[u8]) -> Option<DepotId> {
-    let (mark, sep) = if let Some(pos) = find_bytes(path, DECRYPTION_KEY_MARK_BACK) {
-        (pos, b'\\')
-    } else if let Some(pos) = find_bytes(path, DECRYPTION_KEY_MARK_FWD) {
-        (pos, b'/')
-    } else {
-        return None;
-    };
+    let (mark, sep) = find_bytes(path, DECRYPTION_KEY_MARK_BACK)
+        .map(|pos| (pos, b'\\'))
+        .or_else(|| find_bytes(path, DECRYPTION_KEY_MARK_FWD).map(|pos| (pos, b'/')))?;
     if mark == 0 {
         return None;
     }
@@ -259,10 +255,11 @@ fn decode_key(value: &str) -> Option<[u8; KEY_SIZE]> {
         return None;
     }
     let mut key = [0u8; KEY_SIZE];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
-        key[index] = hex_nibble(pair[0])?
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for (index, [hi, lo]) in pairs.iter().enumerate() {
+        key[index] = hex_nibble(*hi)?
             .checked_mul(16)?
-            .checked_add(hex_nibble(pair[1])?)?;
+            .checked_add(hex_nibble(*lo)?)?;
     }
     Some(key)
 }
