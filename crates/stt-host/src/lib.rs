@@ -1484,10 +1484,18 @@ fn log_module_hashes(steam_root: &Path) {
 
 /// 更新 pattern 时随发布流程改这个 commit (git ls-remote 取 main 最新),
 /// 别直接指 main: manifest 没有完整性校验, 钉死 commit 才算钉死信任根.
+/// Steam 换 DLL SHA 后单条 manifest 对不上, 再按 `{component}/{sha}.toml` 回退
+/// (本仓库 main + 上游 OST steam-monitor, 对齐 OST 每次启动按 SHA 拉).
 const PATTERN_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/SteamToolsProject/SteamTools-Patterns/a17f3a98db60b2f8427125e673aa0d2e9b5fef39/manifests/stable.json";
+    "https://raw.githubusercontent.com/SteamToolsProject/SteamTools-Patterns/e85d2d63123822838f00cf0feedad052632f0a95/manifests/stable.json";
 const PATTERN_RAW_BASE_URL: &str =
     "https://raw.githubusercontent.com/SteamToolsProject/SteamTools-Patterns/main";
+const PATTERN_JSDELIVR_BASE_URL: &str =
+    "https://cdn.jsdelivr.net/gh/SteamToolsProject/SteamTools-Patterns@main";
+const STEAM_MONITOR_RAW_BASE_URL: &str =
+    "https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern";
+const STEAM_MONITOR_JSDELIVR_BASE_URL: &str =
+    "https://cdn.jsdelivr.net/gh/OpenSteam001/steam-monitor@pattern";
 
 #[derive(Debug, thiserror::Error)]
 enum PatternFetchError {
@@ -1536,6 +1544,47 @@ fn fetch_pattern_manifest() -> Result<stt_metadata::PatternManifest, PatternFetc
     Ok(manifest)
 }
 
+fn is_pattern_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// SHA 对不上钉死 manifest 时的回退源: 本仓库 → jsDelivr → OST steam-monitor.
+fn pattern_sha_sources(component: &str, sha: &str) -> Option<Vec<(&'static str, String)>> {
+    if !matches!(component, "steamui" | "steamclient") || !is_pattern_sha256(sha) {
+        return None;
+    }
+    let sha = sha.to_ascii_lowercase();
+    let rel = format!("{component}/{sha}.toml");
+    Some(vec![
+        ("patterns_main", format!("{PATTERN_RAW_BASE_URL}/{rel}")),
+        ("patterns_jsd", format!("{PATTERN_JSDELIVR_BASE_URL}/{rel}")),
+        (
+            "steam_monitor",
+            format!("{STEAM_MONITOR_RAW_BASE_URL}/{rel}"),
+        ),
+        (
+            "steam_monitor_jsd",
+            format!("{STEAM_MONITOR_JSDELIVR_BASE_URL}/{rel}"),
+        ),
+    ])
+}
+
+fn store_pattern_body(
+    steam_root: &Path,
+    component: &str,
+    sha: &str,
+    body: &[u8],
+) -> Result<(), PatternFetchError> {
+    let text = std::str::from_utf8(body)?;
+    let map = stt_metadata::PatternMap::parse_str(component, text)?;
+    if map.is_empty() {
+        return Err(PatternFetchError::EmptyPattern);
+    }
+    let path = stt_platform::pattern_cache_file(steam_root, component, sha);
+    write_pattern_cache(&path, body)?;
+    Ok(())
+}
+
 fn fetch_remote_pattern(
     steam_root: &Path,
     component: &str,
@@ -1554,15 +1603,36 @@ fn fetch_remote_pattern(
             status: response.status,
         });
     }
-    let text = std::str::from_utf8(&response.body)?;
-    let map = stt_metadata::PatternMap::parse_str(component, text)?;
-    if map.is_empty() {
-        return Err(PatternFetchError::EmptyPattern);
-    }
-
-    let path = stt_platform::pattern_cache_file(steam_root, component, sha);
-    write_pattern_cache(&path, response.body.as_slice())?;
+    store_pattern_body(steam_root, component, sha, &response.body)?;
     Ok(true)
+}
+
+/// manifest 未收录本机 SHA 时, 按文件名向 Patterns / steam-monitor 要 toml.
+fn fetch_remote_pattern_by_sha(
+    steam_root: &Path,
+    component: &str,
+    sha: &str,
+) -> Result<Option<&'static str>, PatternFetchError> {
+    let Some(sources) = pattern_sha_sources(component, sha) else {
+        return Ok(None);
+    };
+    let mut last_error = None;
+    for (source, url) in sources {
+        match stt_platform::winhttp_get(&url, pattern_http_options()) {
+            Ok(response) if (200..300).contains(&response.status) => {
+                match store_pattern_body(steam_root, component, sha, &response.body) {
+                    Ok(()) => return Ok(Some(source)),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => last_error = Some(error.into()),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 fn write_pattern_cache(path: &Path, body: &[u8]) -> io::Result<()> {
@@ -1633,31 +1703,49 @@ fn log_pattern_probe(steam_root: &Path) -> stt_metadata::PatternStore {
 
         let primary = stt_platform::pattern_cache_file(steam_root, component, &sha);
         if !primary.is_file() {
+            let mut fetched = false;
             match remote_manifest.get_or_insert_with(fetch_pattern_manifest) {
                 Ok(manifest) => {
                     match fetch_remote_pattern(steam_root, component, dll, &sha, manifest) {
-                        Ok(true) => append_host_log(
-                            steam_root,
-                            &format!(
-                                "pattern_{component}=remote path={} build={} sha={sha}",
-                                primary.display(),
-                                manifest.steam_build()
-                            ),
-                        ),
-                        Ok(false) => append_host_log(
-                            steam_root,
-                            &format!("pattern_{component}=remote miss sha={sha}"),
-                        ),
+                        Ok(true) => {
+                            fetched = true;
+                            append_host_log(
+                                steam_root,
+                                &format!(
+                                    "pattern_{component}=remote source=patterns_manifest build={} sha={sha}",
+                                    manifest.steam_build()
+                                ),
+                            );
+                        }
+                        Ok(false) => {}
                         Err(error) => append_host_log(
                             steam_root,
-                            &format!("pattern_{component}=remote unavailable ({error}) sha={sha}"),
+                            &format!(
+                                "pattern_{component}=manifest unavailable ({error}) sha={sha}"
+                            ),
                         ),
                     }
                 }
                 Err(error) => append_host_log(
                     steam_root,
-                    &format!("pattern_{component}=remote unavailable ({error}) sha={sha}"),
+                    &format!("pattern_{component}=manifest unavailable ({error}) sha={sha}"),
                 ),
+            }
+            if !fetched && !primary.is_file() {
+                match fetch_remote_pattern_by_sha(steam_root, component, &sha) {
+                    Ok(Some(source)) => append_host_log(
+                        steam_root,
+                        &format!("pattern_{component}=remote source={source} sha={sha}"),
+                    ),
+                    Ok(None) => append_host_log(
+                        steam_root,
+                        &format!("pattern_{component}=remote miss sha={sha}"),
+                    ),
+                    Err(error) => append_host_log(
+                        steam_root,
+                        &format!("pattern_{component}=remote unavailable ({error}) sha={sha}"),
+                    ),
+                }
             }
         }
 
@@ -3132,6 +3220,27 @@ mod tests {
     fn placeholder_init_empty() {
         let rules = init_placeholder();
         assert_eq!(rules.epoch(), 0);
+    }
+
+    #[test]
+    fn pattern_sha_sources_prefer_project_then_ost_monitor() {
+        let sha = "C".repeat(64);
+        let sources = pattern_sha_sources("steamclient", &sha).unwrap();
+        let file = format!("/steamclient/{}.toml", sha.to_ascii_lowercase());
+
+        assert_eq!(
+            sources.iter().map(|item| item.0).collect::<Vec<_>>(),
+            [
+                "patterns_main",
+                "patterns_jsd",
+                "steam_monitor",
+                "steam_monitor_jsd"
+            ]
+        );
+        assert!(sources[0].1.ends_with(&file));
+        assert!(sources[2].1.contains("/steam-monitor/pattern/steamclient/"));
+        assert!(pattern_sha_sources("steam", &sha).is_none());
+        assert!(pattern_sha_sources("steamclient", "zz").is_none());
     }
 
     #[test]
