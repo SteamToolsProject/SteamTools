@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+## [v0.2.3] - 2026-10-03
+
+修复 Valve 收紧匿名清单请求码后「无网络连接 / Access Denied」的下载失败。
+
+### Added
+
+- **ManifestDeX 请求码源**: `[manifest] url = "manifestdex"` (OST PR #200 对齐,
+  `https://manifest.manifestdex.com/{gid}`, 带 `User-Agent: ManifestDeX/1.0`),
+  作为新默认源置于 HTTP 链首; 配置面板数据源下拉同步可选
+
+### Changed
+
+- `[manifest].url` 默认值 `opensteamtool` → `manifestdex`
+  (`manifest.opensteamtool.com` 已 403 不可用); 原四个源仍可按名切换, 失败自动降级
+
 ## [v0.2.2] - 2026-10-01
 
 Pattern 版本兼容回退, 以及安装器 steam.exe 运行检测修复 (首次真正编译出货)。
