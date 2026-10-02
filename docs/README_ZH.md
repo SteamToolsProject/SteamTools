@@ -108,7 +108,7 @@ mode = "community"        # 默认: community; disabled / custom_http / lua / co
 url_template = ""         # custom_http 时: https://example.com/catalog/{app_id}
 
 [manifest]
-url = "opensteamtool"     # manifest request code 源: opensteamtool / steamrun / wudrm
+url = "manifestdex"       # manifest request code 源: manifestdex / opensteamtool / steamrun / wudrm
 
 [store_accel]
 egress = "disabled"       # disabled / direct_dns / local_cdn / http_connect

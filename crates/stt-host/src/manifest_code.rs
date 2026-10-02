@@ -157,23 +157,33 @@ enum HttpResponseFormat {
     SteamRunJson,
 }
 
-/// 内置 HTTP request-code 源 (与 OST ManifestClient::kProviders 对齐).
-const HTTP_SOURCES: &[(&str, &str, HttpResponseFormat)] = &[
+/// 内置 HTTP request-code 源 (在 OST ManifestClient::kProviders 基础上加 manifestdex).
+/// 末列是该源要求的 User-Agent (OST PR #200: manifestdex 无此头会 403).
+const HTTP_SOURCES: &[(&str, &str, HttpResponseFormat, Option<&str>)] = &[
+    (
+        "manifestdex",
+        "https://manifest.manifestdex.com/{manifest_gid}",
+        HttpResponseFormat::PlainDecimal,
+        Some("ManifestDeX/1.0"),
+    ),
     (
         "opensteamtool",
         "https://manifest.opensteamtool.com/{manifest_gid}",
         HttpResponseFormat::PlainDecimal,
+        None,
     ),
     // OST 用明文 HTTP: 该站 HTTPS 证书主机名不匹配, WinHttp 严格校验会失败.
     (
         "wudrm",
         "http://gmrc.wudrm.com/manifest/{manifest_gid}",
         HttpResponseFormat::PlainDecimal,
+        None,
     ),
     (
         "steamrun",
         "https://manifest.steam.run/api/manifest/{manifest_gid}",
         HttpResponseFormat::SteamRunJson,
+        None,
     ),
 ];
 
@@ -181,16 +191,19 @@ struct HttpManifestProvider {
     id: String,
     url_template: String,
     format: HttpResponseFormat,
+    user_agent: Option<String>,
     options: stt_platform::WinHttpGetOptions,
 }
 
 impl HttpManifestProvider {
     fn from_named(id: &str, config: &ManifestSection) -> Option<Self> {
-        let (name, template, format) = HTTP_SOURCES.iter().copied().find(|(n, _, _)| *n == id)?;
+        let (name, template, format, user_agent) =
+            HTTP_SOURCES.iter().copied().find(|(n, _, _, _)| *n == id)?;
         Some(Self {
             id: name.to_owned(),
             url_template: template.to_owned(),
             format,
+            user_agent: user_agent.map(str::to_owned),
             options: stt_platform::WinHttpGetOptions {
                 timeouts: timeouts(config),
                 max_body_bytes: MAX_HTTP_RESPONSE_BYTES,
@@ -203,12 +216,14 @@ impl HttpManifestProvider {
         id: &str,
         url_template: String,
         format: HttpResponseFormat,
+        user_agent: Option<&str>,
         options: stt_platform::WinHttpGetOptions,
     ) -> Self {
         Self {
             id: id.to_owned(),
             url_template,
             format,
+            user_agent: user_agent.map(str::to_owned),
             options,
         }
     }
@@ -220,7 +235,23 @@ impl HttpManifestProvider {
         let url = self
             .url_template
             .replace("{manifest_gid}", &request.manifest_gid.to_string());
-        let response = stt_platform::winhttp_get(&url, self.options).map_err(map_http_error)?;
+        let mut headers = Vec::with_capacity(usize::from(self.user_agent.is_some()));
+        if let Some(user_agent) = &self.user_agent {
+            headers.push(("User-Agent".to_owned(), user_agent.clone()));
+        }
+        let options = stt_platform::WinHttpRequestOptions {
+            timeouts: self.options.timeouts,
+            max_request_body_bytes: 0,
+            max_response_body_bytes: self.options.max_body_bytes,
+        };
+        let response = stt_platform::winhttp_request(
+            stt_platform::HttpMethod::Get,
+            &url,
+            &headers,
+            &[],
+            options,
+        )
+        .map_err(map_http_error)?;
         if response.status != 200 {
             return Err(ManifestCodeFailureKind::Rejected);
         }
@@ -242,7 +273,7 @@ impl HttpManifestChain {
         if let Some(first) = HttpManifestProvider::from_named(preferred, config) {
             providers.push(first);
         }
-        for (name, _, _) in HTTP_SOURCES {
+        for (name, _, _, _) in HTTP_SOURCES {
             if *name == preferred {
                 continue;
             }
@@ -467,6 +498,7 @@ mod tests {
             "test",
             format!("http://127.0.0.1:{port}/{{manifest_gid}}"),
             HttpResponseFormat::PlainDecimal,
+            None,
             stt_platform::WinHttpGetOptions {
                 timeouts: stt_platform::WinHttpTimeouts::default(),
                 max_body_bytes: 16,
@@ -475,6 +507,39 @@ mod tests {
 
         assert_eq!(provider.try_fetch(request()), Ok(Some(123)));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn manifestdex_sends_required_user_agent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let text = String::from_utf8_lossy(&request[..read]).into_owned();
+            assert!(
+                text.contains("User-Agent: ManifestDeX/1.0"),
+                "missing required user agent: {text}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n456")
+                .unwrap();
+        });
+        let provider = HttpManifestProvider::new_for_test(
+            "manifestdex",
+            format!("http://127.0.0.1:{port}/{{manifest_gid}}"),
+            HttpResponseFormat::PlainDecimal,
+            Some("ManifestDeX/1.0"),
+            stt_platform::WinHttpGetOptions {
+                timeouts: stt_platform::WinHttpTimeouts::default(),
+                max_body_bytes: 16,
+            },
+        );
+
+        assert_eq!(provider.try_fetch(request()), Ok(Some(456)));
+        server.join().unwrap();
+        assert_eq!(HTTP_SOURCES[0].0, "manifestdex");
     }
 
     #[test]

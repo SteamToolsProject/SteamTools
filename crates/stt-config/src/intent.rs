@@ -17,7 +17,7 @@ use crate::ConfigState;
 pub const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
 /// 允许的上游源 id (真实实现还没接, 先只认这几个名字).
-pub const MANIFEST_SOURCES: &[&str] = &["opensteamtool", "steamrun", "wudrm"];
+pub const MANIFEST_SOURCES: &[&str] = &["manifestdex", "opensteamtool", "steamrun", "wudrm"];
 
 /// 配置页允许切换的完整 Catalog 模式.
 pub const CATALOG_MODES: &[&str] = &["disabled", "custom_http", "lua", "community", "mock"];
@@ -378,7 +378,7 @@ mod tests {
 
         let fresh = HostConfig::load_from_steam_root(root.path()).unwrap();
         assert_eq!(fresh.catalog.mode, CatalogMode::CustomHttp);
-        assert_eq!(fresh.manifest.url, "opensteamtool");
+        assert_eq!(fresh.manifest.url, "manifestdex");
     }
 
     #[test]

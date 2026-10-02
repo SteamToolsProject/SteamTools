@@ -403,7 +403,8 @@ pub struct ManifestSection {
 }
 
 fn default_manifest_url() -> String {
-    "opensteamtool".into()
+    // manifest.opensteamtool.com 已 403 不可用; manifestdex 是当前实测可用的默认源.
+    "manifestdex".into()
 }
 fn default_timeout_5s() -> u32 {
     5000
@@ -427,9 +428,12 @@ impl Default for ManifestSection {
 impl ManifestSection {
     pub fn validate(&self) -> Result<()> {
         const MAX_TIMEOUT_MS: u32 = 60_000;
-        if !matches!(self.url.as_str(), "opensteamtool" | "steamrun" | "wudrm") {
+        if !matches!(
+            self.url.as_str(),
+            "manifestdex" | "opensteamtool" | "steamrun" | "wudrm"
+        ) {
             return Err(ConfigError::Invalid(
-                "manifest.url must be opensteamtool, steamrun, or wudrm".into(),
+                "manifest.url must be manifestdex, opensteamtool, steamrun, or wudrm".into(),
             ));
         }
         let timeouts = [
@@ -562,7 +566,7 @@ mod tests {
         let c = HostConfig::parse_str("").unwrap();
         assert_eq!(c.log.level, "debug");
         assert_eq!(c.catalog.mode, CatalogMode::Community);
-        assert_eq!(c.manifest.url, "opensteamtool");
+        assert_eq!(c.manifest.url, "manifestdex");
         assert_eq!(c.store_accel.egress, StoreAccelEgress::Disabled);
         assert!(c.update.enabled);
         assert_eq!(c.update.channel, "stable");

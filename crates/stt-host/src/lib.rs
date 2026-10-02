@@ -1918,7 +1918,7 @@ fn build_download_report(
 ) -> stt_steamclient::DownloadKitReport {
     let request_code = matches!(
         state.host().manifest.url.as_str(),
-        "opensteamtool" | "steamrun" | "wudrm"
+        "manifestdex" | "opensteamtool" | "steamrun" | "wudrm"
     );
     let data = state.with_rules(|rules| stt_steamclient::DownloadDataAvailability {
         manifest: rules.has_manifest_overrides(),
